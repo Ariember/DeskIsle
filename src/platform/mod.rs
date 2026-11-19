@@ -1,4 +1,5 @@
 pub mod shell;
+pub mod startup;
 pub mod taskbar;
 pub mod tray;
 
@@ -8,9 +9,16 @@ use std::collections::VecDeque;
 use std::mem::size_of;
 use windows::Win32::{
     Foundation::*,
-    Graphics::Gdi::*,
+    Graphics::{
+        Dwm::{
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+        },
+        Gdi::*,
+    },
     System::{Com::*, LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
     UI::{
+        Controls::MARGINS,
         HiDpi::*,
         Input::KeyboardAndMouse::*,
         Shell::{
@@ -20,7 +28,7 @@ use windows::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use windows::core::{Error, HSTRING, PCWSTR, Result, w};
+use windows::core::{BOOL, Error, HSTRING, PCWSTR, Result, w};
 
 pub struct Desktop;
 
@@ -50,6 +58,7 @@ impl Drop for Bar {
 }
 
 const MENU_CLASS: PCWSTR = w!("DeskIsle.Menu");
+const PANEL_CLASS: PCWSTR = w!("DeskIsle.Settings");
 
 pub fn create_bars() -> Result<(Bar, Bar)> {
     unsafe {
@@ -78,6 +87,14 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
             ..Default::default()
         };
         if RegisterClassW(&menu) == 0 {
+            return Err(Error::from_thread());
+        }
+        let panel = WNDCLASSW {
+            lpfnWndProc: Some(panel_proc),
+            lpszClassName: PANEL_CLASS,
+            ..menu
+        };
+        if RegisterClassW(&panel) == 0 {
             return Err(Error::from_thread());
         }
         let create = |title| {
@@ -234,6 +251,25 @@ pub enum MenuKey {
     Other,
 }
 
+/// Keys the settings panel responds to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PanelKey {
+    Tab {
+        back: bool,
+    },
+    /// Ctrl+Tab, Page Up and Page Down switch pages.
+    Page {
+        back: bool,
+    },
+    Up,
+    Down,
+    Left,
+    Right,
+    Select,
+    Escape,
+    Other,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Paint,
@@ -262,6 +298,15 @@ pub enum Event {
     ShellRestart,
     Tray,
     Scroll(i16),
+    /// Pointer input in the settings panel, in its client pixels.
+    PanelMove(i32, i32),
+    PanelLeave,
+    PanelClick(i32, i32),
+    PanelScroll(i16),
+    PanelKey(PanelKey),
+    /// The panel moved to a monitor with this DPI and already took the suggested size.
+    PanelDpi(u32),
+    PanelClose,
     Quit,
 }
 
@@ -276,11 +321,27 @@ impl Event {
                 | Event::MenuDismiss
         )
     }
+
+    fn for_panel(&self) -> bool {
+        matches!(
+            self,
+            Event::PanelMove(..)
+                | Event::PanelLeave
+                | Event::PanelClick(..)
+                | Event::PanelScroll(_)
+                | Event::PanelKey(_)
+                | Event::PanelDpi(_)
+                | Event::PanelClose
+        )
+    }
 }
 
 thread_local! {
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
+    /// The settings panel's caption height and the left edge of its close button, in
+    /// client pixels, for hit testing inside its window procedure.
+    static PANEL_CAPTION: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -328,6 +389,9 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::Scroll(_)
                     | Event::MenuPick(..)
                     | Event::MenuKey(_)
+                    | Event::PanelClick(..)
+                    | Event::PanelScroll(_)
+                    | Event::PanelKey(_)
             )
         {
             events.push_back(event);
@@ -472,6 +536,176 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }),
         WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => Event::MenuDismiss,
         WM_CANCELMODE | WM_CLOSE => Event::MenuDismiss,
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    };
+    queue(hwnd, event);
+    LRESULT(0)
+}
+
+/// The settings window. It has a caption style so DWM gives it a shadow, rounded corners
+/// and a place in Alt+Tab, while its client area covers the frame and DeskIsle draws it.
+pub struct PanelWindow(pub HWND);
+
+impl PanelWindow {
+    /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
+    /// height and the left edge of the close button, in client pixels.
+    pub fn create(r: Rect, caption: (i32, i32)) -> Result<Self> {
+        PANEL_CAPTION.set(caption);
+        unsafe {
+            let instance = GetModuleHandleW(None)?;
+            let hwnd = CreateWindowExW(
+                WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+                PANEL_CLASS,
+                w!("DeskIsle 设置"),
+                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )?;
+            // Cosmetic only: builds without these attributes keep square corners.
+            let dark = BOOL::from(true);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const dark).cast(),
+                size_of::<BOOL>() as u32,
+            );
+            let round = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&raw const round).cast(),
+                size_of_val(&round) as u32,
+            );
+            let margins = MARGINS {
+                cxLeftWidth: 1,
+                cxRightWidth: 1,
+                cyTopHeight: 1,
+                cyBottomHeight: 1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            Ok(Self(hwnd))
+        }
+    }
+
+    /// Shows the panel, or brings it back to the front when it is already open.
+    pub fn show(&self) {
+        unsafe {
+            let _ = ShowWindow(self.0, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(self.0);
+        }
+    }
+
+    /// Resizes the window around its current center, kept inside `work`.
+    pub fn resize(&self, width: i32, height: i32, work: Rect, caption: (i32, i32)) -> Result<()> {
+        PANEL_CAPTION.set(caption);
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(self.0, &mut r)? };
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let x = (cx - width / 2).clamp(work.x, (work.x + work.width - width).max(work.x));
+        let y = (cy - height / 2).clamp(work.y, (work.y + work.height - height).max(work.y));
+        unsafe {
+            SetWindowPos(
+                self.0,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+    }
+
+    /// The work area of the monitor showing the panel.
+    pub fn work_area(&self) -> Result<Rect> {
+        unsafe {
+            let monitor = MonitorFromWindow(self.0, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            GetMonitorInfoW(monitor, &mut info).ok()?;
+            Ok(to_rect(info.rcWork))
+        }
+    }
+}
+
+impl Drop for PanelWindow {
+    fn drop(&mut self) {
+        // Created and destroyed on the UI thread; drop input the window still queued.
+        let _ = unsafe { DestroyWindow(self.0) };
+        EVENTS.with_borrow_mut(|events| events.retain(|e| !e.for_panel()));
+    }
+}
+
+unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+    let event = match msg {
+        // The client area takes the whole window; DeskIsle draws the caption itself.
+        WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        WM_NCHITTEST => {
+            let mut point = POINT { x, y };
+            let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+            let (caption, close) = PANEL_CAPTION.get();
+            let hit = if (0..caption).contains(&point.y) && point.x < close {
+                HTCAPTION
+            } else {
+                HTCLIENT
+            };
+            return LRESULT(hit as isize);
+        }
+        WM_PAINT => {
+            // DirectComposition presents the content; nothing to paint here.
+            let _ = unsafe { ValidateRect(Some(hwnd), None) };
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE => {
+            let _ = track_leave(hwnd);
+            Event::PanelMove(x, y)
+        }
+        windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::PanelLeave,
+        WM_LBUTTONUP => Event::PanelClick(x, y),
+        WM_MOUSEWHEEL => Event::PanelScroll((wp.0 >> 16) as i16),
+        WM_KEYDOWN => {
+            let held = |key: VIRTUAL_KEY| unsafe { GetKeyState(key.0 as i32) } < 0;
+            let back = held(VK_SHIFT);
+            Event::PanelKey(match VIRTUAL_KEY(wp.0 as u16) {
+                VK_TAB if held(VK_CONTROL) => PanelKey::Page { back },
+                VK_TAB => PanelKey::Tab { back },
+                VK_PRIOR => PanelKey::Page { back: true },
+                VK_NEXT => PanelKey::Page { back: false },
+                VK_UP => PanelKey::Up,
+                VK_DOWN => PanelKey::Down,
+                VK_LEFT => PanelKey::Left,
+                VK_RIGHT => PanelKey::Right,
+                VK_RETURN | VK_SPACE => PanelKey::Select,
+                VK_ESCAPE => PanelKey::Escape,
+                _ => PanelKey::Other,
+            })
+        }
+        WM_DPICHANGED => {
+            // lParam points to the suggested rectangle for the new DPI during this call.
+            let r = unsafe { *(lp.0 as *const RECT) };
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+            Event::PanelDpi((wp.0 & 0xffff) as u32)
+        }
+        WM_CLOSE => Event::PanelClose,
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     };
     queue(hwnd, event);

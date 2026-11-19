@@ -223,6 +223,21 @@ impl Canvas {
         self.stroke(0., 0., w, h, radius, (255, 255, 255), 0.11)
     }
 
+    /// Runs `draw` with output limited to `rect`.
+    pub(super) fn clipped(
+        &self,
+        rect: D2D_RECT_F,
+        draw: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        unsafe {
+            self.ctx
+                .PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED)
+        };
+        let result = draw();
+        unsafe { self.ctx.PopAxisAlignedClip() };
+        result
+    }
+
     pub(super) fn bitmap(&self, bitmap: &IWICBitmapSource, rect: D2D_RECT_F) -> Result<()> {
         unsafe {
             let texture = self.ctx.CreateBitmapFromWicBitmap(bitmap, None)?;

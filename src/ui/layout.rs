@@ -13,6 +13,22 @@ pub struct Layout {
     pub bottom: Rect,
     pub slots: Vec<Slot>,
     pub first: usize,
+    /// Edge of each icon in pixels.
+    pub icon: i32,
+}
+
+/// The Dock's adjustable sizes in DIPs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockStyle {
+    pub icon: i32,
+    /// Distance from the bottom of the work area.
+    pub gap: i32,
+}
+
+impl Default for DockStyle {
+    fn default() -> Self {
+        Self { icon: 34, gap: 8 }
+    }
 }
 
 fn scaled(dpi: u32) -> impl Fn(i32) -> i32 {
@@ -21,19 +37,19 @@ fn scaled(dpi: u32) -> impl Fn(i32) -> i32 {
 
 impl Layout {
     /// `work` is a nonempty work area and `dpi` its effective DPI.
-    pub fn new(work: Rect, dpi: u32, count: usize, first: usize) -> Self {
+    pub fn new(work: Rect, dpi: u32, count: usize, first: usize, style: DockStyle) -> Self {
         let px = scaled(dpi);
         let inset_x = px(8).min((work.width - 1) / 2);
         let available = work.width - 2 * inset_x;
         let padding = px(6).min((available - 1) / 2);
-        let slot_width = px(52).min(available - 2 * padding);
+        let slot_width = px(style.icon + 18).min(available - 2 * padding).max(1);
         let capacity = ((available - 2 * padding) / slot_width) as usize;
         let visible = count.min(capacity);
         let first = first.min(count - visible);
 
         let width = (visible as i32 * slot_width + 2 * padding).max(1);
-        let height = work.height.min(px(64));
-        let inset = px(8).min(work.height - height);
+        let height = work.height.min(px(style.icon + 30));
+        let inset = px(style.gap).min(work.height - height);
         let bottom = Rect {
             x: work.x + (work.width - width) / 2,
             y: work.y + work.height - height - inset,
@@ -52,10 +68,15 @@ impl Layout {
                 },
             })
             .collect();
+        let icon = px(style.icon)
+            .min(slot_width)
+            .min(bottom.height - 2 * inset_y)
+            .max(1);
         Self {
             bottom,
             slots,
             first,
+            icon,
         }
     }
 
@@ -163,7 +184,7 @@ mod tests {
             height: 1032,
         };
         for dpi in [96, 120, 144, 192] {
-            let layout = Layout::new(work, dpi, 4, 0);
+            let layout = Layout::new(work, dpi, 4, 0, DockStyle::default());
             let rect = layout.bottom;
             assert!((2 * (rect.x - work.x) + rect.width - work.width).abs() <= 1);
             assert_eq!(
@@ -186,15 +207,33 @@ mod tests {
             width: 240,
             height: 600,
         };
-        let layout = Layout::new(work, 144, 16, usize::MAX);
+        let layout = Layout::new(work, 144, 16, usize::MAX, DockStyle::default());
         let last = layout.slots.last().unwrap().rect;
         assert!(layout.bottom.width <= work.width);
         assert!(layout.first > 0);
         assert_eq!(layout.hit(last.x, last.y), Some(15));
-        let layout = Layout::new(work, 144, 1, layout.first);
+        let layout = Layout::new(work, 144, 1, layout.first, DockStyle::default());
         assert_eq!(layout.first, 0);
         let first = layout.slots[0].rect;
         assert_eq!(layout.hit(first.x, first.y), Some(0));
+    }
+
+    #[test]
+    fn dock_style_sizes_slots_and_gap() {
+        let work = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let style = DockStyle { icon: 48, gap: 0 };
+        let layout = Layout::new(work, 144, 3, 0, style);
+        assert_eq!(layout.icon, 72);
+        assert_eq!(layout.slots[0].rect.width, 99);
+        assert_eq!(layout.bottom.height, 117);
+        assert_eq!(layout.bottom.y + layout.bottom.height, work.height);
+        let slot = layout.slots[2].rect;
+        assert_eq!(layout.hit(slot.x + slot.width - 1, slot.y), Some(2));
     }
 
     #[test]

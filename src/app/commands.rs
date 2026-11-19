@@ -31,6 +31,7 @@ impl Bars {
             Command::Close(id, windows) => shell::close_windows(&id, &windows).map(drop),
             Command::TaskManager => shell::execute(owner, "taskmgr.exe"),
             Command::ShowDesktop => self.tray.toggle_desktop(),
+            Command::Settings => self.open_settings(),
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
             Command::TrayActivate(index) => {
