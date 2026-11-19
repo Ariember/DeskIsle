@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
+use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::TrayHost;
 use crate::platform::{self, AppBar, Bar, Event, Monitor, shell};
 use crate::render::{DockIcon, Renderer, is_device_lost};
@@ -26,7 +27,7 @@ struct Bars {
     foreground: Option<isize>,
     monitor: Monitor,
     top_rect: Rect,
-    /// A full-screen application covers the monitor; the status bar steps aside.
+    /// Both bars step aside while a full-screen application covers their monitor.
     fullscreen: bool,
     layout: Layout,
     status: StatusLayout,
@@ -66,6 +67,13 @@ fn load_pins() -> Result<Vec<PinnedApp>> {
 }
 
 pub(crate) fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(taskbar::RESTORE_TASKBAR))
+    {
+        return taskbar::restore_on_disconnect();
+    }
+    let Some(_instance) = taskbar::claim_session()? else {
+        return Ok(());
+    };
     let _desktop = platform::Desktop::init()?;
     let (top, bottom) = platform::create_bars()?;
     let events = shell::WindowEvents::subscribe(bottom.0)?;
@@ -79,8 +87,14 @@ pub(crate) fn run() -> Result<()> {
     });
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
+    let mut native_taskbar = NativeTaskbar::default();
+    native_taskbar.hide()?;
     let monitor = platform::monitor()?;
     let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi));
+    // The shell may have announced an already full-screen app before registration.
+    // Only an application from the window snapshot qualifies (the desktop also fills the screen).
+    let fullscreen = apps.iter().any(|app| app.active)
+        && foreground.is_some_and(|id| platform::window_covers_monitor(id, monitor.bounds));
     let layout = Layout::new(monitor.work, monitor.dpi, apps.len(), 0);
     let time = platform::clock(top.0)?;
     let renderer = Some(Renderer::new(top.0, bottom.0)?);
@@ -97,7 +111,7 @@ pub(crate) fn run() -> Result<()> {
         status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0),
         monitor,
         top_rect,
-        fullscreen: false,
+        fullscreen,
         layout,
         shown: Vec::new(),
         hidden,
@@ -114,6 +128,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Paint => bars.draw()?,
             Event::Refresh => {
                 bars.events.acknowledge();
+                native_taskbar.hide()?;
                 // Explorer raises its taskbar when activated; stay first for new icons.
                 bars.tray.raise();
                 if bars.tray.update() {
@@ -128,13 +143,17 @@ pub(crate) fn run() -> Result<()> {
             Event::Display => bars.display(false)?,
             Event::AppBarMoved => bars.display(true)?,
             Event::ShellRestart => {
+                native_taskbar.hide()?;
                 bars.appbar.register();
                 bars.tray.raise();
                 bars.display(true)?;
             }
             Event::FullScreen(fullscreen) => {
                 bars.fullscreen = fullscreen;
-                bars.top.position(bars.top_rect, !fullscreen)?;
+                bars.position()?;
+                if fullscreen {
+                    bars.set_hover(None)?;
+                }
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
@@ -188,7 +207,7 @@ pub(crate) fn run() -> Result<()> {
 impl Bars {
     fn position(&self) -> Result<()> {
         self.top.position(self.top_rect, !self.fullscreen)?;
-        self.bottom.position(self.layout.bottom, true)
+        self.bottom.position(self.layout.bottom, !self.fullscreen)
     }
 
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
@@ -220,7 +239,7 @@ impl Bars {
         self.layout = layout;
         self.hover = None;
         if moved {
-            self.bottom.position(self.layout.bottom, true)?;
+            self.bottom.position(self.layout.bottom, !self.fullscreen)?;
         }
         Ok(true)
     }

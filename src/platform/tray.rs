@@ -17,6 +17,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, GUID, Result, w};
 
+use super::taskbar::explorer_tray;
 use super::{Event, TASKBAR_CREATED, queue, shell};
 
 // shellapi.h. Shell32 sends the 32-bit layout to the tray from 32- and 64-bit callers.
@@ -184,7 +185,7 @@ impl TrayHost {
     /// taskbar rectangle keeps applications that size popups from `Shell_TrayWnd` right.
     pub fn raise(&self) {
         let mut rect = RECT::default();
-        if let Some(explorer) = explorer_tray(self.hwnd) {
+        if let Some(explorer) = explorer_tray() {
             let _ = unsafe { GetWindowRect(explorer, &mut rect) };
         }
         let _ = unsafe {
@@ -346,7 +347,7 @@ impl TrayHost {
 
     /// Asks Explorer's taskbar to show the desktop, or to restore what it minimized.
     pub fn toggle_desktop(&self) -> Result<()> {
-        let Some(taskbar) = explorer_tray(self.hwnd) else {
+        let Some(taskbar) = explorer_tray() else {
             return Err(Error::new(E_FAIL, "未找到资源管理器任务栏，无法显示桌面"));
         };
         // The command Explorer's own "Show desktop" corner sends to its taskbar window.
@@ -369,30 +370,8 @@ fn owner_path(owner: isize) -> Option<PathBuf> {
     (pid != 0).then(|| shell::process_path(pid).ok()).flatten()
 }
 
-/// Explorer's own taskbar. Other tray hosts may also create `Shell_TrayWnd` windows and
-/// forward to the next one they find; sending only to the process that owns the desktop
-/// window keeps two hosts from passing a message back and forth.
-fn explorer_tray(host: HWND) -> Option<HWND> {
-    let shell = unsafe { GetShellWindow() };
-    if shell.is_invalid() {
-        return None;
-    }
-    let mut shell_pid = 0;
-    unsafe { GetWindowThreadProcessId(shell, Some(&mut shell_pid)) };
-    let mut after = None;
-    loop {
-        let hwnd = unsafe { FindWindowExW(None, after, w!("Shell_TrayWnd"), None) }.ok()?;
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-        if hwnd != host && pid != 0 && pid == shell_pid {
-            return Some(hwnd);
-        }
-        after = Some(hwnd);
-    }
-}
-
-fn forward(host: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-    let explorer = explorer_tray(host)?;
+fn forward(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let explorer = explorer_tray()?;
     let mut result = 0;
     // The system marshals WM_COPYDATA again; other forwarded messages carry no pointers.
     let sent = unsafe {
@@ -472,12 +451,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
             }
             // Appbar and icon-position requests are answered by Explorer alone.
-            forward(hwnd, msg, wp, lp).unwrap_or(LRESULT(notify as isize))
+            forward(msg, wp, lp).unwrap_or(LRESULT(notify as isize))
         }
         // Explorer's private messages to its taskbar. Registered messages are
         // broadcast, so Explorer already receives those itself.
-        WM_COMMAND | WM_USER..0xC000 => forward(hwnd, msg, wp, lp)
-            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) }),
+        WM_COMMAND | WM_USER..0xC000 => {
+            forward(msg, wp, lp).unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }

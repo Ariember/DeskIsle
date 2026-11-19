@@ -1,4 +1,5 @@
 pub mod shell;
+pub mod taskbar;
 pub mod tray;
 
 use crate::geometry::Rect;
@@ -130,6 +131,7 @@ pub fn monitor() -> Result<Monitor> {
         if work.width <= 0 || work.height <= 0 || bounds.width <= 0 || dpi == 0 {
             return Err(Error::new(E_FAIL, "显示器未提供有效的工作区或 DPI"));
         }
+        let work = taskbar::dock_work_area(bounds, work);
         Ok(Monitor { bounds, work, dpi })
     }
 }
@@ -479,6 +481,21 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 /// The window that currently has the foreground, to tell when another one takes it.
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+/// A maximized window's frame can extend outside the monitor while its client area
+/// is smaller. WINDOWINFO gives us the client rectangle in screen coordinates.
+pub fn window_covers_monitor(id: isize, bounds: Rect) -> bool {
+    let mut info = WINDOWINFO {
+        cbSize: size_of::<WINDOWINFO>() as u32,
+        ..Default::default()
+    };
+    // The foreground window from the enumeration can close before this query.
+    unsafe { GetWindowInfo(HWND(id as _), &mut info) }.is_ok()
+        && info.rcClient.left <= bounds.x
+        && info.rcClient.top <= bounds.y
+        && info.rcClient.right >= bounds.x + bounds.width
+        && info.rcClient.bottom >= bounds.y + bounds.height
 }
 
 /// Puts back events the menu loop held while it ran, ahead of anything newer.
