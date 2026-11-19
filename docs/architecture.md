@@ -2,6 +2,25 @@
 
 DeskIsle 面向 Windows 11，以独立桌面进程运行。使用 Rust stable 的 MSVC 工具链，通过 `windows` crate 调用 Win32、DirectComposition 和 D3D11。退出时释放本进程创建的资源，系统任务栏继续沿用用户设置。
 
+## 目录与模块边界
+
+首版按单个 Cargo 应用组织。下表列出各类文件的归属，开发对应功能时再创建相应路径。
+
+| 路径 | 归属 |
+| --- | --- |
+| `AGENTS.md`、`docs/` | 根目录的 `AGENTS.md` 记录贡献者工作规范。`docs/` 记录技术选型和架构决策。 |
+| `Cargo.toml`、`Cargo.lock` | 放在仓库根目录，分别声明应用依赖和锁定解析出的依赖版本。 |
+| `src/main.rs` | 程序入口。组装平台、Dock 状态和渲染器，协调启动、事件分发与退出。 |
+| `src/dock.rs` | 纯 Rust 状态与交互规则，包括应用分组、窗口选择、逻辑布局和点击命中。 |
+| `src/platform.rs` | Windows 适配，包括消息循环、Shell 调用、窗口枚举与激活，以及 DPI 和工作区查询。 |
+| `src/render.rs` | DirectComposition 与 D3D11 资源、图标纹理和动画提交。 |
+
+由入口串联三者。例如点击图标时，平台模块提供输入，Dock 模块算出目标和动作，入口调用平台模块执行。渲染器读取布局与活动状态用于绘制。Dock 模块使用普通 Rust 值表达位置和标识，Win32 句柄与 COM 接口留在平台或渲染边界。
+
+一个模块先用一个文件。以平台代码为例，当 Shell 启动和窗口跟踪各自形成独立职责时，可由 `src/platform.rs` 提供对外接口，将实现放入 `src/platform/shell.rs`、`src/platform/window_tracking.rs`。名称按职责选取，避免把无关代码聚到 `utils/` 或 `common/`。
+
+模块单测就近放在 `#[cfg(test)]` 中。需要从公开入口跨模块验证的场景放入 `tests/`。随程序分发的静态资源放入 `assets/`，需要重复执行的开发或测量脚本放入 `scripts/`。这些目录随第一个实际文件创建。
+
 ## 职责与数据流
 
 - **平台层**接收窗口、显示器和输入事件，查询窗口身份、前台状态与显示器工作区，并执行启动、还原和激活。Win32 句柄与 `unsafe` 调用集中在这一层及渲染边界。
