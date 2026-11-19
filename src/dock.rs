@@ -36,6 +36,18 @@ pub enum Action<'a> {
 }
 
 impl AppGroup {
+    /// Pinned applications stay on the Dock without windows.
+    pub fn pinned(&self) -> bool {
+        self.launch.is_some()
+    }
+
+    /// The executable that starts another instance, when its path is known.
+    pub fn executable(&self) -> Option<&Path> {
+        self.launch
+            .as_deref()
+            .or_else(|| Some(self.icon_path.as_path()).filter(|p| !p.as_os_str().is_empty()))
+    }
+
     pub fn action(&self) -> Action<'_> {
         match (self.launch.as_deref(), self.windows.as_slice()) {
             (Some(path), []) => Action::Launch(path),
@@ -168,6 +180,10 @@ pub const STATUS_HEIGHT: i32 = 30;
 pub enum StatusHit {
     Tray(usize),
     Overflow,
+    /// The active application's name.
+    Title,
+    Clock,
+    /// The mark and empty space.
     Bar,
 }
 
@@ -230,6 +246,10 @@ impl StatusLayout {
             StatusHit::Tray(slot.index)
         } else if self.overflow.is_some_and(|r| r.contains(x, y)) {
             StatusHit::Overflow
+        } else if self.clock.contains(x, y) {
+            StatusHit::Clock
+        } else if self.title.contains(x, y) {
+            StatusHit::Title
         } else {
             StatusHit::Bar
         }
@@ -335,6 +355,8 @@ mod tests {
             assert_eq!(layout.hit(last.x + last.width, 0), StatusHit::Overflow);
             assert_eq!(layout.hit(overflow.x - 1, height - 1), StatusHit::Tray(2));
             assert_eq!(layout.hit(px(20), px(10)), StatusHit::Bar);
+            assert_eq!(layout.hit(layout.title.x, px(10)), StatusHit::Title);
+            assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
             // A narrow bar moves icons into the overflow list but keeps the title area.
             let narrow = StatusLayout::new(px(400), height, dpi, 40, 40);
@@ -344,6 +366,7 @@ mod tests {
         }
         let empty = StatusLayout::new(800, 30, 96, 0, 0);
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
-        assert_eq!(empty.hit(700, 10), StatusHit::Bar);
+        assert_eq!(empty.hit(700, 10), StatusHit::Title);
+        assert_eq!(empty.hit(735, 10), StatusHit::Bar);
     }
 }

@@ -13,14 +13,12 @@ use std::mem::{offset_of, size_of};
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Error, GUID, HRESULT, Result, w};
+use windows::core::{Error, GUID, Result, w};
 
-use super::{Event, Menu, TASKBAR_CREATED, menu_label, queue, shell, track_menu};
+use super::{Event, TASKBAR_CREATED, queue, shell};
 
 // shellapi.h. Shell32 sends the 32-bit layout to the tray from 32- and 64-bit callers.
 const TRAY_SIGNATURE: u32 = 0x3475_3423;
@@ -131,11 +129,6 @@ impl TrayIcon {
             (false, _) => self.guid.is_none() && self.owner == n.owner && self.id == n.id,
         }
     }
-}
-
-pub enum TrayChoice {
-    Activate(usize),
-    Toggle(usize),
 }
 
 pub struct TrayHost {
@@ -352,63 +345,14 @@ impl TrayHost {
         Ok(false)
     }
 
-    /// Lists `listed` icons for activation and every icon in `all` as a checkbox that
-    /// reports whether it is kept on the bar.
-    pub fn menu(
-        &self,
-        owner: HWND,
-        at: POINT,
-        dpi: u32,
-        listed: &[usize],
-        all: &[(usize, bool)],
-    ) -> Result<Option<TrayChoice>> {
-        let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
-        // Declared before the menus so the bitmaps outlive them.
-        let mut bitmaps = Vec::new();
-        unsafe {
-            let menu = Menu(CreatePopupMenu()?);
-            let toggles = Menu(CreatePopupMenu()?);
-            let mut add =
-                |target: &Menu, id: usize, index: usize, flags: MENU_ITEM_FLAGS| -> Result<()> {
-                    let icon = &self.icons[index];
-                    AppendMenuW(target.0, flags, id, &menu_label(&icon.label))?;
-                    if let Some(handle) = icon.icon()
-                        && let Ok(bitmap) = icon_bitmap(handle, size)
-                    {
-                        let info = MENUITEMINFOW {
-                            cbSize: size_of::<MENUITEMINFOW>() as u32,
-                            fMask: MIIM_BITMAP,
-                            hbmpItem: bitmap.0,
-                            ..Default::default()
-                        };
-                        bitmaps.push(bitmap);
-                        SetMenuItemInfoW(target.0, id as u32, false, &info)?;
-                    }
-                    Ok(())
-                };
-            for (k, &index) in listed.iter().enumerate() {
-                add(&menu, k + 1, index, MF_STRING)?;
-            }
-            for (k, &(index, shown)) in all.iter().enumerate() {
-                let checked = if shown { MF_CHECKED } else { MF_UNCHECKED };
-                add(&toggles, listed.len() + k + 1, index, MF_STRING | checked)?;
-            }
-            if !listed.is_empty() {
-                AppendMenuW(menu.0, MF_SEPARATOR, 0, windows::core::PCWSTR::null())?;
-            }
-            AppendMenuW(
-                menu.0,
-                MF_POPUP,
-                toggles.0.0 as usize,
-                &menu_label("在状态栏显示"),
-            )?;
-            // The parent menu now destroys the submenu.
-            std::mem::forget(toggles);
-            Ok(track_menu(owner, at, &menu)?.map(|choice| match choice {
-                k if k < listed.len() => TrayChoice::Activate(listed[k]),
-                k => TrayChoice::Toggle(all[k - listed.len()].0),
-            }))
-        }
+    /// Asks Explorer's taskbar to show the desktop, or to restore what it minimized.
+    pub fn toggle_desktop(&self) -> Result<()> {
+        let Some(taskbar) = explorer_tray(self.hwnd) else {
+            return Err(Error::new(E_FAIL, "未找到资源管理器任务栏，无法显示桌面"));
+        };
+        // The command Explorer's own "Show desktop" corner sends to its taskbar window.
+        const TOGGLE_DESKTOP: usize = 407;
+        unsafe { PostMessageW(Some(taskbar), WM_COMMAND, WPARAM(TOGGLE_DESKTOP), LPARAM(0)) }
     }
 }
 
@@ -539,96 +483,18 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
-struct OwnedBitmap(HBITMAP);
-
-impl Drop for OwnedBitmap {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(self.0.into()) };
-    }
-}
-
-/// Renders `icon` into a premultiplied 32-bit bitmap for a menu item.
-fn icon_bitmap(icon: HICON, size: i32) -> Result<OwnedBitmap> {
-    unsafe {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        let bitmap = OwnedBitmap(CreateDIBSection(
-            None,
-            &info,
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        )?);
-        let dc = CreateCompatibleDC(None);
-        if dc.is_invalid() {
-            return Err(Error::from_thread());
-        }
-        let previous = SelectObject(dc, bitmap.0.into());
-        let drawn = DrawIconEx(dc, 0, 0, icon, size, size, 0, None, DI_NORMAL);
-        SelectObject(dc, previous);
-        let _ = DeleteDC(dc);
-        drawn?;
-        let _ = GdiFlush();
-        // The DIB section owns `size * size` pixels until the bitmap is deleted.
-        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), (size * size) as usize);
-        if pixels.iter().all(|p| p >> 24 == 0) {
-            // Icons without an alpha channel leave alpha at zero; make drawn pixels opaque.
-            for p in pixels.iter_mut().filter(|p| **p != 0) {
-                *p |= 0xff00_0000;
-            }
-        }
-        Ok(bitmap)
-    }
-}
-
-fn preference_path() -> Result<PathBuf> {
-    let base = std::env::var_os("APPDATA")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::new(E_FAIL, "未找到 APPDATA 目录，无法保存托盘图标设置"))?;
-    Ok(PathBuf::from(base).join("DeskIsle").join("tray-hidden.txt"))
-}
-
-fn io_error(path: &std::path::Path, error: std::io::Error) -> Error {
-    let code = error
-        .raw_os_error()
-        .map_or(E_FAIL, |c| HRESULT::from_win32(c as u32));
-    Error::new(code, format!("{}：{error}", path.display()))
-}
+const HIDDEN_FILE: &str = "tray-hidden.txt";
 
 /// Keys of tray icons the user moved off the bar. A missing file means none.
 pub fn load_hidden() -> Result<BTreeSet<String>> {
-    let path = preference_path()?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(Into::into)
-            .collect()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-        Err(e) => Err(io_error(&path, e)),
-    }
+    Ok(super::read_setting(HIDDEN_FILE)?
+        .unwrap_or_default()
+        .into_iter()
+        .collect())
 }
 
 pub fn save_hidden(hidden: &BTreeSet<String>) -> Result<()> {
-    let path = preference_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
-    }
-    let text: String = hidden.iter().map(|key| format!("{key}\n")).collect();
-    std::fs::write(&path, text).map_err(|e| io_error(&path, e))
+    super::write_setting(HIDDEN_FILE, hidden.iter().map(String::as_str))
 }
 
 #[cfg(test)]

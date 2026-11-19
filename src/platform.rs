@@ -19,7 +19,7 @@ use windows::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use windows::core::{Error, HSTRING, PCWSTR, Result, w};
+use windows::core::{Error, HRESULT, HSTRING, PCWSTR, Result, w};
 
 pub struct Desktop;
 
@@ -48,6 +48,8 @@ impl Drop for Bar {
     }
 }
 
+const MENU_CLASS: PCWSTR = w!("DeskIsle.Menu");
+
 pub fn create_bars() -> Result<(Bar, Bar)> {
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
@@ -67,6 +69,16 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
             return Err(Error::from_thread());
         }
         TASKBAR_CREATED.set(restart);
+        let menu = WNDCLASSW {
+            lpfnWndProc: Some(menu_proc),
+            hInstance: instance,
+            lpszClassName: MENU_CLASS,
+            hCursor: wc.hCursor,
+            ..Default::default()
+        };
+        if RegisterClassW(&menu) == 0 {
+            return Err(Error::from_thread());
+        }
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -220,6 +232,15 @@ pub enum Event {
     Click(HWND, i32, i32),
     RightClick(HWND, i32, i32),
     Menu(HWND),
+    /// A mouse button went down on a bar (`true` for the right button).
+    Press(HWND, bool),
+    /// Pointer input in the open menu window, in its client pixels.
+    MenuMove(i32, i32),
+    MenuLeave,
+    MenuPick(i32, i32),
+    MenuKey(u16),
+    /// The menu lost activation or Windows cancelled modes.
+    MenuDismiss,
     /// The shell may have moved other appbars or the work area.
     AppBarMoved,
     /// A full-screen application opened (`true`) or closed on the monitor.
@@ -229,6 +250,19 @@ pub enum Event {
     Tray,
     Scroll(i16),
     Quit,
+}
+
+impl Event {
+    fn for_menu(&self) -> bool {
+        matches!(
+            self,
+            Event::MenuMove(..)
+                | Event::MenuLeave
+                | Event::MenuPick(..)
+                | Event::MenuKey(_)
+                | Event::MenuDismiss
+        )
+    }
 }
 
 thread_local! {
@@ -255,6 +289,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => Event::Move(hwnd, x, y),
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave,
+        WM_LBUTTONDOWN => Event::Press(hwnd, false),
+        WM_RBUTTONDOWN => Event::Press(hwnd, true),
         WM_LBUTTONUP => Event::Click(hwnd, x, y),
         WM_RBUTTONUP => Event::RightClick(hwnd, x, y),
         WM_CONTEXTMENU => Event::Menu(hwnd),
@@ -273,7 +309,12 @@ fn queue(hwnd: HWND, event: Event) {
         if events.back() != Some(&event)
             || matches!(
                 event,
-                Event::Click(..) | Event::RightClick(..) | Event::Scroll(_)
+                Event::Click(..)
+                    | Event::RightClick(..)
+                    | Event::Press(..)
+                    | Event::Scroll(_)
+                    | Event::MenuPick(..)
+                    | Event::MenuKey(_)
             )
         {
             events.push_back(event);
@@ -332,49 +373,153 @@ pub fn clock(hwnd: HWND) -> Result<String> {
     }
 }
 
-struct Menu(HMENU);
+/// DeskIsle's own popup menu window. It takes activation so that a click anywhere else
+/// deactivates it; clicks on the bars, which never activate, arrive as [`Event::Press`].
+pub struct MenuWindow(pub HWND);
 
-impl Drop for Menu {
+impl MenuWindow {
+    /// Creates the hidden window at `r`, in screen pixels, for the renderer to bind to.
+    pub fn create(r: Rect) -> Result<Self> {
+        unsafe {
+            let instance = GetModuleHandleW(None)?;
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
+                MENU_CLASS,
+                w!("DeskIsle Menu"),
+                WS_POPUP,
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )?;
+            Ok(Self(hwnd))
+        }
+    }
+
+    /// Shows the menu above the bars and gives it the keyboard. Returns whether Windows
+    /// made it the foreground window; it may refuse when another process holds the
+    /// foreground lock, in which case the caller dismisses on the next foreground change.
+    pub fn show(&self) -> bool {
+        unsafe {
+            let _ = SetWindowPos(
+                self.0,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetForegroundWindow(self.0);
+            let _ = SetFocus(Some(self.0));
+            GetForegroundWindow() == self.0
+        }
+    }
+
+    pub fn is_foreground(&self) -> bool {
+        unsafe { GetForegroundWindow() == self.0 }
+    }
+}
+
+impl Drop for MenuWindow {
     fn drop(&mut self) {
-        // Destroying a menu also destroys the submenus attached to it.
-        let _ = unsafe { DestroyMenu(self.0) };
+        // Created and destroyed on the UI thread. Destroying an active window sends it a
+        // deactivation, which must not close the next menu.
+        let _ = unsafe { DestroyWindow(self.0) };
+        EVENTS.with_borrow_mut(|events| events.retain(|e| !e.for_menu()));
     }
 }
 
-fn menu_label(label: &str) -> HSTRING {
-    HSTRING::from(label.replace('&', "&&"))
-}
-
-pub fn popup_menu(owner: HWND, point: POINT, labels: &[String]) -> Result<Option<usize>> {
-    unsafe {
-        let menu = Menu(CreatePopupMenu()?);
-        for (i, label) in labels.iter().enumerate() {
-            AppendMenuW(menu.0, MF_STRING, i + 1, &menu_label(label))?;
+unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+    let event = match msg {
+        WM_PAINT => {
+            // DirectComposition presents the content; nothing to paint here.
+            let _ = unsafe { ValidateRect(Some(hwnd), None) };
+            return LRESULT(0);
         }
-        track_menu(owner, point, &menu)
+        WM_MOUSEMOVE => {
+            let _ = track_leave(hwnd);
+            Event::MenuMove(x, y)
+        }
+        windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
+        WM_LBUTTONUP | WM_RBUTTONUP => Event::MenuPick(x, y),
+        WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(wp.0 as u16),
+        WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => Event::MenuDismiss,
+        WM_CANCELMODE | WM_CLOSE => Event::MenuDismiss,
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    };
+    queue(hwnd, event);
+    LRESULT(0)
+}
+
+/// The window that currently has the foreground, to tell when another one takes it.
+pub fn foreground() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
+/// Puts back events the menu loop held while it ran, ahead of anything newer.
+pub fn requeue(held: Vec<Event>) {
+    EVENTS.with_borrow_mut(|events| {
+        for event in held.into_iter().rev() {
+            events.push_front(event);
+        }
+    });
+}
+
+/// The local date for the clock menu, such as "11月19日 星期四".
+pub fn date() -> (String, String) {
+    let now = unsafe { GetLocalTime() };
+    const WEEKDAYS: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
+    let weekday = WEEKDAYS[usize::from(now.wDayOfWeek) % 7];
+    (
+        format!("{}月{}日 星期{weekday}", now.wMonth, now.wDay),
+        format!("{} 年", now.wYear),
+    )
+}
+
+fn settings_path(name: &str) -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::new(E_FAIL, "未找到 APPDATA 目录，无法读写 DeskIsle 设置"))?;
+    Ok(std::path::PathBuf::from(base).join("DeskIsle").join(name))
+}
+
+fn io_error(path: &std::path::Path, error: std::io::Error) -> Error {
+    let code = error
+        .raw_os_error()
+        .map_or(E_FAIL, |c| HRESULT::from_win32(c as u32));
+    Error::new(code, format!("{}：{error}", path.display()))
+}
+
+/// Nonempty trimmed lines of a settings file under `%APPDATA%\DeskIsle`, or `None`
+/// when the user never saved one.
+fn read_setting(name: &str) -> Result<Option<Vec<String>>> {
+    let path = settings_path(name)?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(Into::into)
+                .collect(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_error(&path, e)),
     }
 }
 
-/// Shows `menu` and returns the chosen command identifier minus one.
-fn track_menu(owner: HWND, point: POINT, menu: &Menu) -> Result<Option<usize>> {
-    unsafe {
-        let _ = SetForegroundWindow(owner);
-        SetLastError(ERROR_SUCCESS);
-        let selected = TrackPopupMenu(
-            menu.0,
-            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-            point.x,
-            point.y,
-            None,
-            owner,
-            None,
-        )
-        .0;
-        if selected == 0 && GetLastError() != ERROR_SUCCESS {
-            return Err(Error::from_thread());
-        }
-        Ok((selected as usize).checked_sub(1))
+fn write_setting<'a>(name: &str, lines: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let path = settings_path(name)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
     }
+    let text: String = lines.into_iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&path, text).map_err(|e| io_error(&path, e))
 }
 
 pub fn report_error(owner: Option<HWND>, error: &Error) {

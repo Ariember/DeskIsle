@@ -107,13 +107,13 @@ unsafe extern "system" fn window_event(
 // Windows paths and window captions are counted in UTF-16 code units.
 const MAX_PATH_UNITS: usize = 32768;
 
-pub fn pins() -> Result<Vec<PinnedApp>> {
+const PINS_FILE: &str = "pins.txt";
+
+/// Explorer and Task Manager, which the Dock keeps until the user changes its pins.
+pub fn default_pins() -> Result<Vec<PinnedApp>> {
     let mut path = vec![0; MAX_PATH_UNITS];
     let mut pins = Vec::new();
-    for (filename, label) in [
-        ("explorer.exe", "文件资源管理器"),
-        ("Taskmgr.exe", "任务管理器"),
-    ] {
+    for filename in ["explorer.exe", "Taskmgr.exe"] {
         let len = unsafe {
             if filename == "explorer.exe" {
                 GetSystemWindowsDirectoryW(Some(&mut path))
@@ -128,14 +128,54 @@ pub fn pins() -> Result<Vec<PinnedApp>> {
             return Err(ERROR_INSUFFICIENT_BUFFER.into());
         }
         let exe = PathBuf::from(OsString::from_wide(&path[..len])).join(filename);
-        pins.push(PinnedApp {
-            app_id: path_id(&exe),
-            label: label.into(),
-            icon_path: exe.clone(),
-            launch: exe,
-        });
+        pins.push(pinned(exe));
     }
     Ok(pins)
+}
+
+fn pinned(exe: PathBuf) -> PinnedApp {
+    let name = exe
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let label = match name.as_str() {
+        "explorer.exe" => "文件资源管理器".into(),
+        "taskmgr.exe" => "任务管理器".into(),
+        _ => exe
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    };
+    PinnedApp {
+        app_id: path_id(&exe),
+        label,
+        icon_path: exe.clone(),
+        launch: exe,
+    }
+}
+
+/// The pinned applications the user saved, or `None` before the first change.
+pub fn load_pins() -> Result<Option<Vec<PinnedApp>>> {
+    Ok(super::read_setting(PINS_FILE)?
+        .map(|lines| lines.into_iter().map(|line| pinned(line.into())).collect()))
+}
+
+pub fn save_pins(pins: &[PinnedApp]) -> Result<()> {
+    let lines = pins
+        .iter()
+        .map(|pin| pin.launch.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    super::write_setting(PINS_FILE, lines.iter().map(String::as_str))
+}
+
+/// Pins the executable at `path`, keeping the Dock order otherwise.
+pub fn pin(pins: &mut Vec<PinnedApp>, path: &Path) {
+    let pin = pinned(path.into());
+    if !pins.iter().any(|p| p.app_id == pin.app_id) {
+        pins.push(pin);
+    }
 }
 
 fn path_id(path: &Path) -> String {
@@ -324,13 +364,19 @@ fn check_restricted_windows(path: &Path, windows: &[WindowInfo]) -> Result<()> {
 
 pub fn launch(owner: HWND, path: &Path, windows: &[WindowInfo]) -> Result<()> {
     check_restricted_windows(path, windows)?;
-    let executable = HSTRING::from(path.as_os_str());
+    execute(owner, &HSTRING::from(path.as_os_str()), None)
+}
+
+/// Opens `file` (an executable, folder or URI) the way the Shell would, with optional
+/// command-line `parameters`.
+pub fn execute(owner: HWND, file: &HSTRING, parameters: Option<&HSTRING>) -> Result<()> {
+    let parameters = parameters.map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr()));
     let status = unsafe {
         ShellExecuteW(
             Some(owner),
             w!("open"),
-            &executable,
-            PCWSTR::null(),
+            file,
+            parameters,
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )
@@ -339,10 +385,49 @@ pub fn launch(owner: HWND, path: &Path, windows: &[WindowInfo]) -> Result<()> {
     if status <= 32 {
         return Err(Error::new(
             E_FAIL,
-            format!("Shell 启动失败（返回值 {status}）"),
+            format!("Shell 打开 {file} 失败（返回值 {status}）"),
         ));
     }
     Ok(())
+}
+
+/// Opens an Explorer window with `path` selected.
+pub fn reveal(owner: HWND, path: &Path) -> Result<()> {
+    let parameters = HSTRING::from(format!("/select,\"{}\"", path.display()));
+    execute(owner, &HSTRING::from("explorer.exe"), Some(&parameters))
+}
+
+/// Asks each window of `app_id` to close, as the title bar's close button would; the
+/// application may still prompt to save. Returns how many windows accepted the request.
+pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<usize> {
+    let mut asked = 0;
+    let mut refused = None;
+    for &id in ids {
+        let hwnd = HWND(id as _);
+        // The handle may have closed or been reused since the menu opened.
+        if window_info(hwnd)?.is_none_or(|info| info.app_id != app_id) {
+            continue;
+        }
+        match unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_SYSCOMMAND,
+                WPARAM(SC_CLOSE as usize),
+                LPARAM(0),
+            )
+        } {
+            Ok(()) => asked += 1,
+            Err(error) => refused = Some(error),
+        }
+    }
+    match refused {
+        // UIPI blocks messages to elevated applications.
+        Some(error) if asked == 0 => Err(Error::new(
+            error.code(),
+            format!("无法关闭窗口，该应用可能以管理员权限运行：{error}"),
+        )),
+        _ => Ok(asked),
+    }
 }
 
 pub fn activate(app_id: &str, id: isize) -> Result<bool> {
@@ -365,14 +450,6 @@ pub fn activate(app_id: &str, id: isize) -> Result<bool> {
         }
     }
     Ok(true)
-}
-
-pub fn choose_window(owner: HWND, windows: &[WindowInfo], point: POINT) -> Result<Option<isize>> {
-    let labels = windows
-        .iter()
-        .map(|window| window.title.clone())
-        .collect::<Vec<_>>();
-    Ok(super::popup_menu(owner, point, &labels)?.map(|index| windows[index].id))
 }
 
 #[cfg(test)]

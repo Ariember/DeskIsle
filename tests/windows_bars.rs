@@ -8,11 +8,10 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetMenuBarInfo, GetMenuItemCount, GetMenuStringW,
-    GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, MENUBARINFO, MF_BYPOSITION, OBJID_CLIENT, SM_CXSCREEN, SMTO_ABORTIFHUNG,
-    SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW,
-    SystemParametersInfoW, WM_CANCELMODE, WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP, WS_EX_NOACTIVATE,
+    EnumWindows, GWL_EXSTYLE, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, SM_CXSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SystemParametersInfoW, WM_CANCELMODE,
+    WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP, WS_EX_NOACTIVATE,
 };
 use windows::core::BOOL;
 
@@ -57,17 +56,8 @@ unsafe extern "system" fn find_bar(hwnd: HWND, data: LPARAM) -> BOOL {
         match String::from_utf16_lossy(&title[..len as usize]).as_str() {
             "DeskIsle Status" => bars.status = Some(hwnd),
             "DeskIsle Dock" => bars.dock = Some(hwnd),
-            _ => {
-                let mut class = [0; 32];
-                let len = unsafe { GetClassNameW(hwnd, &mut class) };
-                if class[..len as usize]
-                    .iter()
-                    .copied()
-                    .eq("#32768".encode_utf16())
-                {
-                    bars.menu = Some(hwnd);
-                }
-            }
+            "DeskIsle Menu" => bars.menu = Some(hwnd),
+            _ => {}
         }
     }
     BOOL(1)
@@ -172,22 +162,14 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         assert!(Instant::now() < deadline, "top bar did not open its menu");
         thread::sleep(Duration::from_millis(25));
     };
-    let mut info = MENUBARINFO {
-        cbSize: size_of::<MENUBARINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe { GetMenuBarInfo(popup, OBJID_CLIENT, 0, &mut info) }.unwrap();
-    let count = unsafe { GetMenuItemCount(Some(info.hMenu)) };
-    assert!(count > 0, "empty top bar menu");
-    let last = count as u32 - 1;
-    let mut title = [0; 64];
-    let len = unsafe { GetMenuStringW(info.hMenu, last, Some(&mut title), MF_BYPOSITION) };
-    assert_eq!(
-        String::from_utf16_lossy(&title[..len as usize]),
-        "退出 DeskIsle"
-    );
+    // The status bar's own menu activates itself so clicks elsewhere dismiss it.
+    let style = unsafe { GetWindowLongW(popup, GWL_EXSTYLE) } as u32;
+    assert_eq!(style & WS_EX_NOACTIVATE.0, 0, "menu cannot take focus");
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(popup, &mut rect) }.unwrap();
+    assert!(rect.bottom > rect.top && rect.right > rect.left, "{rect:?}");
 
-    send_to_child(pid, status, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+    send_to_child(pid, popup, WM_CANCELMODE, WPARAM(0), LPARAM(0));
     let deadline = Instant::now() + Duration::from_secs(5);
     while Bars::visible_for(pid).menu.is_some() {
         assert!(Instant::now() < deadline, "top bar menu did not close");
