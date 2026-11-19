@@ -142,7 +142,7 @@ fn path_id(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
-fn process_path(pid: u32) -> Result<PathBuf> {
+pub(super) fn process_path(pid: u32) -> Result<PathBuf> {
     unsafe {
         let process = Owned::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
         let mut path = vec![0; MAX_PATH_UNITS];

@@ -17,10 +17,12 @@ use windows::Win32::{
     System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
     UI::{
         Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW},
-        WindowsAndMessaging::DestroyIcon,
+        WindowsAndMessaging::{DestroyIcon, HICON},
     },
 };
-use windows::core::{Error, HSTRING, Interface, Result, w};
+use windows::core::{Error, HSTRING, Interface, PCWSTR, Result, w};
+
+use crate::dock::StatusLayout;
 
 pub struct DockIcon<'a> {
     pub path: &'a Path,
@@ -43,7 +45,16 @@ pub struct Renderer {
     icons: Vec<IconLayer>,
     bottom_size: Option<Dimensions>,
     indicators: Vec<(i32, bool, bool)>,
-    top_state: Option<(Dimensions, String, String)>,
+    top_state: Option<TopState>,
+}
+
+#[derive(PartialEq)]
+struct TopState {
+    layout: StatusLayout,
+    dpi: u32,
+    title: String,
+    time: String,
+    stamps: Vec<u64>,
 }
 
 struct Bar {
@@ -162,49 +173,83 @@ impl Renderer {
         }
     }
 
+    /// `icons[i]` is drawn in `layout.tray[i]`; the stamp identifies its current image.
     pub fn draw_top(
         &mut self,
-        width: i32,
-        height: i32,
+        layout: &StatusLayout,
         dpi: u32,
-        active_name: &str,
+        title: &str,
         time: &str,
+        icons: &[(Option<HICON>, u64)],
     ) -> Result<()> {
-        let dimensions = (width, height, dpi);
-        if self.top_state.as_ref().is_some_and(|(size, title, clock)| {
-            *size == dimensions && title == active_name && clock == time
-        }) {
+        let state = TopState {
+            layout: layout.clone(),
+            dpi,
+            title: title.into(),
+            time: time.into(),
+            stamps: icons.iter().map(|&(_, stamp)| stamp).collect(),
+        };
+        if self.top_state.as_ref() == Some(&state) {
             return Ok(());
         }
         let s = dpi as f32 / 96.;
-        let w = width as f32 / s;
-        let h = height as f32 / s;
-        let surface = paint(&self.device, width, height, dpi, |canvas| {
-            canvas.panel(w, h, h * 0.5)?;
-            // Mark, name and clock share a baseline; the window title takes the flexible space.
-            canvas.round(12., h / 2. - 5., 16., h / 2. + 5., 2., MINT)?;
-            canvas.round(18., h / 2. - 2., 22., h / 2. + 5., 2., MINT)?;
-            canvas.text(
+        let dip = |px: i32| px as f32 / s;
+        let w = dip(layout.width);
+        let h = dip(layout.height);
+        let surface = paint(&self.device, layout.width, layout.height, dpi, |c| {
+            // Flush with the screen edge: a solid strip with a hairline toward the desktop.
+            c.round(0., 0., w, h, 0., BAR)?;
+            c.round(0., h - 1., w, h, 0., EDGE)?;
+            c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., MINT)?;
+            c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., MINT)?;
+            let t = layout.title;
+            c.text(
                 &self.write,
-                "DeskIsle",
-                canvas.rect(29., 0., 84., h),
+                title,
+                c.rect(dip(t.x), 0., dip(t.x + t.width), h),
                 13.,
                 true,
                 INK,
             )?;
-            canvas.round(88., h * 0.28, 89., h * 0.72, 0.5, EDGE)?;
-            canvas.text(
-                &self.write,
-                active_name,
-                canvas.rect(100., 0., w - 68., h),
-                12.,
-                false,
-                MUTED,
-            )?;
-            canvas.text(
+            let icon_size = (16. * s).round();
+            for (slot, &(icon, _)) in layout.tray.iter().zip(icons) {
+                let r = slot.rect;
+                let bitmap = icon.and_then(|icon| self.hicon_bitmap(icon).ok());
+                match bitmap {
+                    Some(bitmap) => unsafe {
+                        let left = (r.x as f32 + (r.width as f32 - icon_size) / 2.).round();
+                        let top = (r.y as f32 + (r.height as f32 - icon_size) / 2.).round();
+                        let texture = c.ctx.CreateBitmapFromWicBitmap(&bitmap, None)?;
+                        c.ctx.DrawBitmap(
+                            &texture,
+                            Some(&c.pixels(left, top, icon_size)),
+                            1.,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            None,
+                            None,
+                        );
+                    },
+                    // An icon without a usable image keeps its slot visible and clickable.
+                    None => {
+                        let x = dip(r.x + r.width / 2);
+                        c.round(x - 3., h / 2. - 3., x + 3., h / 2. + 3., 3., MUTED)?
+                    }
+                }
+            }
+            if let Some(r) = layout.overflow {
+                c.glyph(
+                    &self.write,
+                    "\u{E70D}",
+                    c.rect(dip(r.x), 0., dip(r.x + r.width), h),
+                    10.,
+                    MUTED,
+                )?;
+            }
+            let r = layout.clock;
+            c.text(
                 &self.write,
                 time,
-                canvas.rect(w - 54., 0., w - 7., h),
+                c.rect(dip(r.x), 0., dip(r.x + r.width), h),
                 13.,
                 true,
                 INK,
@@ -214,7 +259,7 @@ impl Renderer {
             self.top.root.SetContent(&surface)?;
             self.device.Commit()?;
         }
-        self.top_state = Some((dimensions, active_name.into(), time.into()));
+        self.top_state = Some(state);
         Ok(())
     }
 
@@ -366,12 +411,17 @@ impl Renderer {
                 return Ok(None);
             }
             // SHGFI_ICON transfers ownership. WIC copies the pixels before the icon is destroyed.
-            let copied = self.imaging.CreateBitmapFromHICON(info.hIcon);
+            let copied = self.hicon_bitmap(info.hIcon);
             DestroyIcon(info.hIcon)?;
-            Ok(Some(WICConvertBitmapSource(
-                &GUID_WICPixelFormat32bppPBGRA,
-                &copied?,
-            )?))
+            Ok(Some(copied?))
+        }
+    }
+
+    /// Copies the pixels of `icon`, which the caller keeps owning.
+    fn hicon_bitmap(&self, icon: HICON) -> Result<IWICBitmapSource> {
+        unsafe {
+            let copied = self.imaging.CreateBitmapFromHICON(icon)?;
+            WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, &copied)
         }
     }
 }
@@ -379,6 +429,7 @@ impl Renderer {
 type Rgb = (u8, u8, u8);
 const EDGE: Rgb = (71, 82, 85);
 const PANEL: Rgb = (28, 36, 39);
+const BAR: Rgb = (17, 19, 21);
 const INK: Rgb = (244, 247, 242);
 const MUTED: Rgb = (182, 197, 197);
 const MINT: Rgb = (132, 227, 191);
@@ -442,6 +493,16 @@ impl Canvas {
         }
     }
 
+    /// A square in physical pixels relative to the surface.
+    fn pixels(&self, left: f32, top: f32, size: f32) -> D2D_RECT_F {
+        D2D_RECT_F {
+            left: self.origin.x as f32 + left,
+            top: self.origin.y as f32 + top,
+            right: self.origin.x as f32 + left + size,
+            bottom: self.origin.y as f32 + top + size,
+        }
+    }
+
     fn brush(&self, (r, g, b): Rgb) -> Result<ID2D1SolidColorBrush> {
         let color = D2D1_COLOR_F {
             r: r as f32 / 255.,
@@ -476,12 +537,41 @@ impl Canvas {
         bold: bool,
         color: Rgb,
     ) -> Result<()> {
+        let font = w!("Segoe UI");
+        self.draw_text(factory, font, text, rect, size, bold, false, color)
+    }
+
+    /// Draws an icon-font glyph centered in `rect`. Windows 11 ships Segoe Fluent Icons.
+    fn glyph(
+        &self,
+        factory: &IDWriteFactory,
+        glyph: &str,
+        rect: D2D_RECT_F,
+        size: f32,
+        color: Rgb,
+    ) -> Result<()> {
+        let font = w!("Segoe Fluent Icons");
+        self.draw_text(factory, font, glyph, rect, size, false, true, color)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(
+        &self,
+        factory: &IDWriteFactory,
+        font: PCWSTR,
+        text: &str,
+        rect: D2D_RECT_F,
+        size: f32,
+        bold: bool,
+        centered: bool,
+        color: Rgb,
+    ) -> Result<()> {
         if rect.right <= rect.left || text.is_empty() {
             return Ok(());
         }
         unsafe {
             let format = factory.CreateTextFormat(
-                w!("Segoe UI"),
+                font,
                 None,
                 if bold {
                     DWRITE_FONT_WEIGHT_SEMI_BOLD
@@ -494,6 +584,9 @@ impl Canvas {
                 w!(""),
             )?;
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            if centered {
+                format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            }
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let ellipsis = factory.CreateEllipsisTrimmingSign(&format)?;
             format.SetTrimming(

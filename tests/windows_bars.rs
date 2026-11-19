@@ -9,10 +9,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetClassNameW, GetMenuBarInfo, GetMenuItemCount, GetMenuStringW,
-    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    MENUBARINFO, MF_BYPOSITION, OBJID_CLIENT, SMTO_ABORTIFHUNG, SPI_GETWORKAREA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SystemParametersInfoW, WM_CANCELMODE,
-    WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP, WS_EX_NOACTIVATE,
+    GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, MENUBARINFO, MF_BYPOSITION, OBJID_CLIENT, SM_CXSCREEN, SMTO_ABORTIFHUNG,
+    SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW,
+    SystemParametersInfoW, WM_CANCELMODE, WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP, WS_EX_NOACTIVATE,
 };
 use windows::core::BOOL;
 
@@ -84,20 +84,24 @@ fn send_to_child(pid: u32, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
 #[test]
 #[ignore = "requires an interactive Windows desktop"]
 fn bars_open_in_the_primary_work_area_and_close_together() {
+    let read_work = || {
+        let mut work = RECT::default();
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some((&raw mut work).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+            )
+        }
+        .expect("read primary work area");
+        work
+    };
     // This test thread reads physical screen coordinates on mixed-DPI desktops.
     let previous =
         unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     assert!(!previous.0.is_null(), "set test thread DPI context");
-    let mut work = RECT::default();
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some((&raw mut work).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-        )
-    }
-    .expect("read primary work area");
+    let work = read_work();
 
     let mut app = TestInstance(
         Command::new(env!("CARGO_BIN_EXE_deskisle"))
@@ -126,6 +130,16 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         let mut rect = RECT::default();
         unsafe { GetWindowRect(hwnd, &mut rect) }.unwrap();
         assert!(rect.right > rect.left && rect.bottom > rect.top, "{rect:?}");
+        if is_top {
+            // The status bar spans the primary monitor and reserves its own strip at the
+            // top, so it may sit above the work area measured before launch.
+            let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            assert_eq!((rect.left, rect.right), (0, width), "{rect:?}");
+            assert!(rect.top >= 0 && rect.top <= work.top, "{rect:?}");
+            let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+            assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "bar can take focus");
+            continue;
+        }
         assert!(
             rect.left >= work.left && rect.right <= work.right,
             "{rect:?}"
@@ -138,11 +152,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
             ((rect.left - work.left) - (work.right - rect.right)).abs() <= 1,
             "{rect:?}"
         );
-        let gap = if is_top {
-            rect.top - work.top
-        } else {
-            work.bottom - rect.bottom
-        };
+        let gap = work.bottom - rect.bottom;
         assert!(
             gap < rect.bottom - rect.top,
             "bar at wrong screen edge: {rect:?}"
@@ -193,6 +203,21 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         assert!(
             Instant::now() < deadline,
             "DeskIsle did not exit after WM_CLOSE"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Leaving releases the reserved strip.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = read_work();
+        if (now.left, now.top, now.right, now.bottom)
+            == (work.left, work.top, work.right, work.bottom)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "work area not restored after exit"
         );
         thread::sleep(Duration::from_millis(50));
     }
