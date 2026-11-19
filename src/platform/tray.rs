@@ -7,7 +7,6 @@
 //! working while DeskIsle runs and after it exits.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 use std::path::PathBuf;
@@ -481,20 +480,6 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) }),
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
-}
-
-const HIDDEN_FILE: &str = "tray-hidden.txt";
-
-/// Keys of tray icons the user moved off the bar. A missing file means none.
-pub fn load_hidden() -> Result<BTreeSet<String>> {
-    Ok(super::read_setting(HIDDEN_FILE)?
-        .unwrap_or_default()
-        .into_iter()
-        .collect())
-}
-
-pub fn save_hidden(hidden: &BTreeSet<String>) -> Result<()> {
-    super::write_setting(HIDDEN_FILE, hidden.iter().map(String::as_str))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::*;
@@ -14,7 +14,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, HSTRING, Owned, PCWSTR, PWSTR, Result, w};
 
-use crate::dock::{PinnedApp, WindowInfo};
+use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
 
 pub const WINDOWS_CHANGED: u32 = WM_APP + 1;
 
@@ -107,8 +107,6 @@ unsafe extern "system" fn window_event(
 // Windows paths and window captions are counted in UTF-16 code units.
 const MAX_PATH_UNITS: usize = 32768;
 
-const PINS_FILE: &str = "pins.txt";
-
 /// Explorer and Task Manager, which the Dock keeps until the user changes its pins.
 pub fn default_pins() -> Result<Vec<PinnedApp>> {
     let mut path = vec![0; MAX_PATH_UNITS];
@@ -131,55 +129,6 @@ pub fn default_pins() -> Result<Vec<PinnedApp>> {
         pins.push(pinned(exe));
     }
     Ok(pins)
-}
-
-fn pinned(exe: PathBuf) -> PinnedApp {
-    let name = exe
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    let label = match name.as_str() {
-        "explorer.exe" => "文件资源管理器".into(),
-        "taskmgr.exe" => "任务管理器".into(),
-        _ => exe
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
-    };
-    PinnedApp {
-        app_id: path_id(&exe),
-        label,
-        icon_path: exe.clone(),
-        launch: exe,
-    }
-}
-
-/// The pinned applications the user saved, or `None` before the first change.
-pub fn load_pins() -> Result<Option<Vec<PinnedApp>>> {
-    Ok(super::read_setting(PINS_FILE)?
-        .map(|lines| lines.into_iter().map(|line| pinned(line.into())).collect()))
-}
-
-pub fn save_pins(pins: &[PinnedApp]) -> Result<()> {
-    let lines = pins
-        .iter()
-        .map(|pin| pin.launch.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    super::write_setting(PINS_FILE, lines.iter().map(String::as_str))
-}
-
-/// Pins the executable at `path`, keeping the Dock order otherwise.
-pub fn pin(pins: &mut Vec<PinnedApp>, path: &Path) {
-    let pin = pinned(path.into());
-    if !pins.iter().any(|p| p.app_id == pin.app_id) {
-        pins.push(pin);
-    }
-}
-
-fn path_id(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase()
 }
 
 pub(super) fn process_path(pid: u32) -> Result<PathBuf> {
@@ -364,12 +313,19 @@ fn check_restricted_windows(path: &Path, windows: &[WindowInfo]) -> Result<()> {
 
 pub fn launch(owner: HWND, path: &Path, windows: &[WindowInfo]) -> Result<()> {
     check_restricted_windows(path, windows)?;
-    execute(owner, &HSTRING::from(path.as_os_str()), None)
+    execute(owner, path)
 }
 
-/// Opens `file` (an executable, folder or URI) the way the Shell would, with optional
-/// command-line `parameters`.
-pub fn execute(owner: HWND, file: &HSTRING, parameters: Option<&HSTRING>) -> Result<()> {
+/// Opens an executable, folder or URI with the Shell.
+pub fn execute(owner: HWND, target: impl AsRef<OsStr>) -> Result<()> {
+    execute_with_parameters(owner, &HSTRING::from(target.as_ref()), None)
+}
+
+fn execute_with_parameters(
+    owner: HWND,
+    file: &HSTRING,
+    parameters: Option<&HSTRING>,
+) -> Result<()> {
     let parameters = parameters.map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr()));
     let status = unsafe {
         ShellExecuteW(
@@ -394,7 +350,7 @@ pub fn execute(owner: HWND, file: &HSTRING, parameters: Option<&HSTRING>) -> Res
 /// Opens an Explorer window with `path` selected.
 pub fn reveal(owner: HWND, path: &Path) -> Result<()> {
     let parameters = HSTRING::from(format!("/select,\"{}\"", path.display()));
-    execute(owner, &HSTRING::from("explorer.exe"), Some(&parameters))
+    execute_with_parameters(owner, &HSTRING::from("explorer.exe"), Some(&parameters))
 }
 
 /// Asks each window of `app_id` to close, as the title bar's close button would; the

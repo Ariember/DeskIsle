@@ -4,7 +4,8 @@
 
 use std::path::PathBuf;
 
-use crate::dock::{AppGroup, Rect};
+use crate::dock::AppGroup;
+use crate::geometry::Rect;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Icon {

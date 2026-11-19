@@ -1,7 +1,7 @@
 pub mod shell;
 pub mod tray;
 
-use crate::dock::Rect;
+use crate::geometry::Rect;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem::size_of;
@@ -19,7 +19,7 @@ use windows::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use windows::core::{Error, HRESULT, HSTRING, PCWSTR, Result, w};
+use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
 pub struct Desktop;
 
@@ -222,6 +222,17 @@ impl Bar {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuKey {
+    Down,
+    Up,
+    Home,
+    End,
+    Select,
+    Dismiss,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Paint,
     Refresh,
@@ -238,7 +249,7 @@ pub enum Event {
     MenuMove(i32, i32),
     MenuLeave,
     MenuPick(i32, i32),
-    MenuKey(u16),
+    MenuKey(MenuKey),
     /// The menu lost activation or Windows cancelled modes.
     MenuDismiss,
     /// The shell may have moved other appbars or the work area.
@@ -448,7 +459,15 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
         WM_LBUTTONUP | WM_RBUTTONUP => Event::MenuPick(x, y),
-        WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(wp.0 as u16),
+        WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
+            VK_DOWN => MenuKey::Down,
+            VK_UP => MenuKey::Up,
+            VK_HOME => MenuKey::Home,
+            VK_END => MenuKey::End,
+            VK_RETURN | VK_SPACE => MenuKey::Select,
+            VK_ESCAPE | VK_MENU => MenuKey::Dismiss,
+            _ => MenuKey::Other,
+        }),
         WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => Event::MenuDismiss,
         WM_CANCELMODE | WM_CLOSE => Event::MenuDismiss,
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -480,46 +499,6 @@ pub fn date() -> (String, String) {
         format!("{}月{}日 星期{weekday}", now.wMonth, now.wDay),
         format!("{} 年", now.wYear),
     )
-}
-
-fn settings_path(name: &str) -> Result<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::new(E_FAIL, "未找到 APPDATA 目录，无法读写 DeskIsle 设置"))?;
-    Ok(std::path::PathBuf::from(base).join("DeskIsle").join(name))
-}
-
-fn io_error(path: &std::path::Path, error: std::io::Error) -> Error {
-    let code = error
-        .raw_os_error()
-        .map_or(E_FAIL, |c| HRESULT::from_win32(c as u32));
-    Error::new(code, format!("{}：{error}", path.display()))
-}
-
-/// Nonempty trimmed lines of a settings file under `%APPDATA%\DeskIsle`, or `None`
-/// when the user never saved one.
-fn read_setting(name: &str) -> Result<Option<Vec<String>>> {
-    let path = settings_path(name)?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(Into::into)
-                .collect(),
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error(&path, e)),
-    }
-}
-
-fn write_setting<'a>(name: &str, lines: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    let path = settings_path(name)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
-    }
-    let text: String = lines.into_iter().map(|line| format!("{line}\n")).collect();
-    std::fs::write(&path, text).map_err(|e| io_error(&path, e))
 }
 
 pub fn report_error(owner: Option<HWND>, error: &Error) {
