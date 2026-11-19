@@ -307,6 +307,7 @@ pub enum Command {
     Close(String, Vec<isize>),
     TaskManager,
     ShowDesktop,
+    Settings,
     DateTime,
     Notifications,
     TrayActivate(usize),
@@ -470,6 +471,7 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
         Some(Command::ShowDesktop),
     );
     menu.separator();
+    menu.item("设置", Icon::Glyph("\u{E713}"), Some(Command::Settings));
     menu.item(
         "退出 DeskIsle",
         Icon::Glyph("\u{E7E8}"),

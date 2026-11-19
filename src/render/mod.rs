@@ -1,5 +1,6 @@
 mod canvas;
 mod menu;
+mod panel;
 
 use std::{
     path::{Path, PathBuf},
@@ -31,6 +32,7 @@ use crate::ui::layout::StatusLayout;
 
 use self::canvas::{BAR, EDGE, INK, MINT, MUTED, paint};
 use self::menu::MenuView;
+use self::panel::PanelView;
 
 pub(crate) fn is_device_lost(error: &Error) -> bool {
     matches!(
@@ -62,6 +64,7 @@ pub struct Renderer {
     indicators: Vec<(i32, bool, bool)>,
     top_state: Option<TopState>,
     menu: Option<MenuView>,
+    panel: Option<PanelView>,
 }
 
 #[derive(PartialEq)]
@@ -101,11 +104,12 @@ struct IconLayer {
     visual: IDCompositionVisual2,
     scale: IDCompositionScaleTransform,
     hovered: bool,
+    /// The hovered scale the last animation used.
+    lift: f32,
     start_time: Instant,
     start_scale: f32,
 }
 
-const LIFTED: f32 = 1.24;
 const DURATION: f32 = 0.14;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
@@ -135,9 +139,14 @@ impl IconLayer {
         self.path == icon.path && self.label == icon.label && self.size == icon.size
     }
 
-    fn animate(&mut self, device: &IDCompositionDesktopDevice, hover: bool) -> Result<()> {
-        let old_goal = if self.hovered { LIFTED } else { 1.0 };
-        let goal = if hover { LIFTED } else { 1.0 };
+    fn animate(
+        &mut self,
+        device: &IDCompositionDesktopDevice,
+        hover: bool,
+        lift: f32,
+    ) -> Result<()> {
+        let old_goal = if self.hovered { self.lift } else { 1.0 };
+        let goal = if hover { lift } else { 1.0 };
         let remaining = (1.0 - self.start_time.elapsed().as_secs_f32() / DURATION).clamp(0., 1.);
         let from = old_goal + (self.start_scale - old_goal) * remaining.powi(3);
         unsafe {
@@ -148,6 +157,7 @@ impl IconLayer {
         self.start_time = Instant::now();
         self.start_scale = from;
         self.hovered = hover;
+        self.lift = lift;
         Ok(())
     }
 }
@@ -189,6 +199,7 @@ impl Renderer {
                 indicators: Vec::new(),
                 top_state: None,
                 menu: None,
+                panel: None,
             })
         }
     }
@@ -292,6 +303,7 @@ impl Renderer {
         dpi: u32,
         items: &[DockIcon<'_>],
         hover: Option<usize>,
+        lift: f32,
     ) -> Result<()> {
         let size = (width, height, dpi);
         let layout_changed = self.icons.len() != items.len()
@@ -357,7 +369,7 @@ impl Renderer {
         for (index, layer) in self.icons.iter_mut().enumerate() {
             let hovered = hover == Some(index);
             if layer.hovered != hovered {
-                layer.animate(&self.device, hovered)?;
+                layer.animate(&self.device, hovered, lift)?;
                 changed = true;
             }
         }
@@ -404,6 +416,7 @@ impl Renderer {
                 visual,
                 scale,
                 hovered: false,
+                lift: 1.,
                 start_time: Instant::now(),
                 start_scale: 1.,
             })

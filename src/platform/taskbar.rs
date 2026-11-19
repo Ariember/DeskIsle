@@ -78,6 +78,20 @@ impl NativeTaskbar {
         writeln!(input, "{}", self.hidden)?;
         set_visibility(hwnd, SWP_HIDEWINDOW)
     }
+
+    /// Gives the taskbar back while DeskIsle keeps running, as on exit.
+    pub fn show(&mut self) -> Result<()> {
+        if self.hidden.is_empty() {
+            return Ok(());
+        }
+        restore(&self.hidden)?;
+        self.hidden.clear();
+        if let Some(pipe) = &mut self.recovery {
+            // A blank line disarms the recovery process until the next hide.
+            writeln!(pipe)?;
+        }
+        Ok(())
+    }
 }
 
 fn set_visibility(hwnd: HWND, flag: SET_WINDOW_POS_FLAGS) -> Result<()> {

@@ -5,6 +5,7 @@ mod dock;
 mod geometry;
 mod platform;
 mod render;
+mod settings;
 mod storage;
 mod ui;
 

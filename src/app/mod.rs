@@ -1,5 +1,6 @@
 mod commands;
 mod menus;
+mod settings;
 
 use std::collections::BTreeSet;
 
@@ -9,8 +10,9 @@ use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::TrayHost;
 use crate::platform::{self, AppBar, Bar, Event, Monitor, shell};
 use crate::render::{DockIcon, Renderer, is_device_lost};
+use crate::settings::{Key, Settings};
 use crate::storage;
-use crate::ui::layout::{Layout, STATUS_HEIGHT, StatusHit, StatusLayout};
+use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout};
 use windows::core::{Error, Result};
 
 struct Bars {
@@ -18,6 +20,8 @@ struct Bars {
     // the tray host before the bar HWNDs.
     events: shell::WindowEvents,
     renderer: Option<Renderer>,
+    /// Released after the renderer, which drops the panel's composition target first.
+    panel: Option<settings::Panel>,
     appbar: AppBar,
     tray: TrayHost,
     top: Bar,
@@ -39,6 +43,9 @@ struct Bars {
     time: String,
     /// A left press on a bar dismissed the open menu; its release must not click.
     swallow_click: bool,
+    settings: Settings,
+    /// Restored after the bars are gone, on exit or when the user turns hiding off.
+    native_taskbar: NativeTaskbar,
 }
 
 fn applications(pins: &[PinnedApp]) -> Result<(Vec<AppGroup>, Option<isize>)> {
@@ -85,22 +92,30 @@ pub(crate) fn run() -> Result<()> {
         platform::report_error(None, &error);
         BTreeSet::new()
     });
+    let settings = settings::load();
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
     let mut native_taskbar = NativeTaskbar::default();
-    native_taskbar.hide()?;
+    if settings.enabled(Key::HideTaskbar) {
+        native_taskbar.hide()?;
+    }
     let monitor = platform::monitor()?;
     let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi));
     // The shell may have announced an already full-screen app before registration.
     // Only an application from the window snapshot qualifies (the desktop also fills the screen).
     let fullscreen = apps.iter().any(|app| app.active)
         && foreground.is_some_and(|id| platform::window_covers_monitor(id, monitor.bounds));
-    let layout = Layout::new(monitor.work, monitor.dpi, apps.len(), 0);
+    let style = DockStyle {
+        icon: settings.icon_size(),
+        gap: settings.dock_gap(),
+    };
+    let layout = Layout::new(monitor.work, monitor.dpi, apps.len(), 0, style);
     let time = platform::clock(top.0)?;
     let renderer = Some(Renderer::new(top.0, bottom.0)?);
     let mut bars = Bars {
         events,
         renderer,
+        panel: None,
         appbar,
         tray,
         top,
@@ -118,6 +133,8 @@ pub(crate) fn run() -> Result<()> {
         hover: None,
         time,
         swallow_click: false,
+        settings,
+        native_taskbar,
     };
     bars.restatus();
     bars.draw()?;
@@ -128,7 +145,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Paint => bars.draw()?,
             Event::Refresh => {
                 bars.events.acknowledge();
-                native_taskbar.hide()?;
+                bars.hide_taskbar()?;
                 // Explorer raises its taskbar when activated; stay first for new icons.
                 bars.tray.raise();
                 if bars.tray.update() {
@@ -143,7 +160,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Display => bars.display(false)?,
             Event::AppBarMoved => bars.display(true)?,
             Event::ShellRestart => {
-                native_taskbar.hide()?;
+                bars.hide_taskbar()?;
                 bars.appbar.register();
                 bars.tray.raise();
                 bars.display(true)?;
@@ -199,12 +216,27 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::RightClick(owner, x, y) if bars.context_menu(owner, x, y)? => return Ok(()),
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
+            event @ (Event::PanelMove(..)
+            | Event::PanelLeave
+            | Event::PanelClick(..)
+            | Event::PanelScroll(_)
+            | Event::PanelKey(_)
+            | Event::PanelDpi(_)
+            | Event::PanelClose) => bars.panel_event(event)?,
             _ => {}
         }
     }
 }
 
 impl Bars {
+    /// Hides Explorer's taskbar again, unless the user keeps it.
+    fn hide_taskbar(&mut self) -> Result<()> {
+        if self.settings.enabled(Key::HideTaskbar) {
+            self.native_taskbar.hide()?;
+        }
+        Ok(())
+    }
+
     fn position(&self) -> Result<()> {
         self.top.position(self.top_rect, !self.fullscreen)?;
         self.bottom.position(self.layout.bottom, !self.fullscreen)
@@ -227,11 +259,18 @@ impl Bars {
         self.relayout(self.layout.first)?;
         self.position()?;
         self.time = platform::clock(self.top.0)?;
-        self.draw()
+        self.draw()?;
+        self.relayout_panel()
     }
 
     fn relayout(&mut self, first: usize) -> Result<bool> {
-        let layout = Layout::new(self.monitor.work, self.monitor.dpi, self.apps.len(), first);
+        let layout = Layout::new(
+            self.monitor.work,
+            self.monitor.dpi,
+            self.apps.len(),
+            first,
+            self.dock_style(),
+        );
         if self.layout == layout {
             return Ok(false);
         }
@@ -319,7 +358,8 @@ impl Bars {
                     Renderer::new(self.top.0, self.bottom.0)
                         .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
                 );
-                self.draw_frame()
+                self.draw_frame()?;
+                self.paint_panel()
             }
             result => result,
         }
@@ -357,7 +397,7 @@ impl Bars {
                     label: &app.label,
                     center_x: r.x + r.width / 2,
                     center_y: r.y + r.height / 2,
-                    size: (34 * dpi as i32 / 96).min(r.width).min(r.height).max(1),
+                    size: self.layout.icon,
                     running: !app.windows.is_empty(),
                     active: app.active,
                 }
@@ -369,6 +409,7 @@ impl Bars {
             .iter()
             .position(|slot| Some(slot.index) == self.hover);
         let bottom = self.layout.bottom;
-        renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover)
+        let lift = self.settings.hover_scale();
+        renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, lift)
     }
 }

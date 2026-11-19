@@ -3,6 +3,7 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, HRESULT, Result};
 
 use crate::dock::{PinnedApp, pinned};
+use crate::settings::Settings;
 
 const PINS_FILE: &str = "pins.txt";
 
@@ -32,6 +33,41 @@ pub fn load_hidden() -> Result<BTreeSet<String>> {
 
 pub fn save_hidden(hidden: &BTreeSet<String>) -> Result<()> {
     write_setting(HIDDEN_FILE, hidden.iter().map(String::as_str))
+}
+
+const SETTINGS_FILE: &str = "settings.ini";
+
+/// Settings the user saved, or `None` before the first change. Lines read
+/// `id = value`; `#` starts a comment. Invalid lines keep their defaults and are
+/// returned as messages for the caller to show.
+pub fn load_settings() -> Result<Option<(Settings, Vec<String>)>> {
+    let Some(lines) = read_setting(SETTINGS_FILE)? else {
+        return Ok(None);
+    };
+    let mut settings = Settings::default();
+    let mut problems = Vec::new();
+    for line in lines.iter().filter(|line| !line.starts_with('#')) {
+        let result = match line.split_once('=') {
+            Some((id, value)) => settings.set_text(id.trim(), value.trim()),
+            None => Err(format!("无法识别的设置行“{line}”，已忽略")),
+        };
+        if let Err(problem) = result {
+            problems.push(problem);
+        }
+    }
+    Ok(Some((settings, problems)))
+}
+
+pub fn save_settings(settings: &Settings) -> Result<()> {
+    let lines = settings
+        .file_entries()
+        .map(|(id, value)| format!("{id} = {value}"))
+        .collect::<Vec<_>>();
+    write_setting(
+        SETTINGS_FILE,
+        std::iter::once("# DeskIsle 设置，可在设置面板中修改")
+            .chain(lines.iter().map(String::as_str)),
+    )
 }
 
 fn settings_path(name: &str) -> Result<std::path::PathBuf> {
