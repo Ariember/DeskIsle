@@ -15,8 +15,12 @@ pub enum Icon {
     Symbol(Symbol),
     /// The Shell icon of a file.
     File(PathBuf),
-    /// The current image of a tray icon, by index into the tray host's list.
-    Tray(usize),
+    /// The current image of a tray icon, by index into the tray host's list, on a
+    /// circle that turns solid while `on`.
+    Tray {
+        index: usize,
+        on: bool,
+    },
     /// Marks a window of an application; the foreground window is highlighted.
     Window {
         active: bool,
@@ -36,7 +40,10 @@ pub struct Item<C> {
     pub icon: Icon,
     /// `None` shows the item without letting the user choose it.
     pub command: Option<C>,
-    pub checked: Option<bool>,
+    /// Chosen by clicking the leading icon instead of the rest of the row.
+    pub icon_command: Option<C>,
+    /// Chosen by a right click on the row or the menu key while it is focused.
+    pub context: Option<C>,
     pub danger: bool,
 }
 
@@ -131,7 +138,8 @@ impl<C> Menu<C> {
             detail: String::new(),
             icon,
             command,
-            checked: None,
+            icon_command: None,
+            context: None,
             danger: false,
         }));
         match self.entries.last_mut() {
@@ -159,9 +167,19 @@ impl<C> Menu<C> {
         }
     }
 
-    /// The command of part `part` of a tile row, the player, or a slider's icon.
+    /// The right-click command of an item.
+    pub fn context_command(&self, index: usize) -> Option<&C> {
+        match self.entries.get(index)? {
+            Entry::Item(item) => item.context.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The command of part `part` of a tile row, the player, a slider's icon, or an
+    /// item's leading icon.
     pub fn part_command(&self, index: usize, part: usize) -> Option<&C> {
         match self.entries.get(index)? {
+            Entry::Item(item) if part == 0 => item.icon_command.as_ref(),
             Entry::Tiles(tiles) => tiles.get(part)?.command.as_ref(),
             Entry::Player { buttons, .. } => buttons.get(part)?.1.as_ref(),
             Entry::Slider(slider) if part == 0 => slider.button.as_ref(),
@@ -183,8 +201,14 @@ impl<C> Menu<C> {
         let mut controls = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
             let parts = match entry {
-                Entry::Item(item) if item.command.is_some() => {
-                    controls.push(Focus::Item(index));
+                Entry::Item(item) => {
+                    // The leading icon comes first, as it is drawn.
+                    if item.icon_command.is_some() {
+                        controls.push(Focus::Part(index, 0));
+                    }
+                    if item.command.is_some() {
+                        controls.push(Focus::Item(index));
+                    }
                     continue;
                 }
                 Entry::Slider(slider) => {
@@ -239,7 +263,10 @@ pub const PLAYER_BUTTON: f32 = 34.;
 pub const BLOCK_INSET: f32 = 6.;
 /// Horizontal room before the label for icons and window marks.
 pub const ICON_COLUMN: f32 = 34.;
-pub const CHECK_COLUMN: f32 = 28.;
+/// Diameter of the round backing every icon of a menu row sits on, and its distance
+/// from the start of the row.
+pub const ICON_BADGE: f32 = 24.;
+pub const ICON_INSET: f32 = 8.;
 pub const TEXT_INSET: f32 = 12.;
 pub const LABEL_SIZE: f32 = 13.;
 pub const DETAIL_SIZE: f32 = 12.;
@@ -266,7 +293,8 @@ pub enum Hit {
     /// A header, separator, disabled item or the panel padding.
     Inert,
     Item(usize),
-    /// Part of a tile row, the player or a slider's icon, with an enabled command.
+    /// Part of a tile row, the player, a slider's icon or an item's leading icon, with
+    /// an enabled command.
     Part(usize, usize),
     /// The track of an available slider, with the value at the pointer.
     Slider(usize, u8),
@@ -277,6 +305,15 @@ pub enum Focus {
     Item(usize),
     Part(usize, usize),
     Slider(usize),
+}
+
+impl Focus {
+    /// The entry the focus is in.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Item(i) | Self::Part(i, _) | Self::Slider(i) => i,
+        }
+    }
 }
 
 impl Hit {
@@ -300,7 +337,6 @@ pub struct MenuLayout {
     pub rows: Vec<(f32, f32)>,
     /// Reserved for leading icons when at least one item uses one.
     pub icon_column: f32,
-    pub checks: bool,
 }
 
 impl MenuLayout {
@@ -309,15 +345,6 @@ impl MenuLayout {
         if matches!(menu.entries.last(), Some(Entry::Separator)) {
             menu.entries.pop();
         }
-        let checks = menu.entries.iter().any(|e| {
-            matches!(
-                e,
-                Entry::Item(Item {
-                    checked: Some(_),
-                    ..
-                })
-            )
-        });
         let icon_column = if menu
             .entries
             .iter()
@@ -386,9 +413,6 @@ impl MenuLayout {
             rows.push((y, y + height));
             y += height;
         }
-        if checks {
-            content += CHECK_COLUMN;
-        }
         let max = menu.max_width.max(1.);
         let min = menu.min_width.min(max);
         let panel = (content + 2. * PADDING).ceil().clamp(min, max);
@@ -398,7 +422,6 @@ impl MenuLayout {
             height: y + PADDING + SHADOW,
             rows,
             icon_column,
-            checks,
         }
     }
 
@@ -419,6 +442,21 @@ impl MenuLayout {
     pub fn row(&self, index: usize) -> (f32, f32, f32, f32) {
         let (top, bottom) = self.rows[index];
         (SHADOW + PADDING, top, self.width - SHADOW - PADDING, bottom)
+    }
+
+    /// The round backing of the leading icon in entry `index`'s row.
+    pub fn icon_badge(&self, index: usize) -> (f32, f32, f32, f32) {
+        let (left, top, _, bottom) = self.row(index);
+        let (x, y) = (left + ICON_INSET + ICON_BADGE / 2., (top + bottom) / 2.);
+        let r = ICON_BADGE / 2.;
+        (x - r, y - r, x + r, y + r)
+    }
+
+    /// Where the leading icon of entry `index` takes clicks of its own: the badge with
+    /// the rest of the row's height and the gap around it.
+    fn icon_target(&self, index: usize) -> (f32, f32, f32, f32) {
+        let (left, top, _, bottom) = self.row(index);
+        (left, top, left + 2. * ICON_INSET + ICON_BADGE, bottom)
     }
 
     /// The area of a slider, tile row or player inside entry `index`'s row.
@@ -491,6 +529,9 @@ impl MenuLayout {
             None => Hit::Inert,
         };
         match &menu.entries[index] {
+            Entry::Item(item) if item.icon_command.is_some() && inside(self.icon_target(index)) => {
+                Hit::Part(index, 0)
+            }
             Entry::Item(item) if item.command.is_some() => Hit::Item(index),
             Entry::Tiles(tiles) => (0..tiles.len())
                 .find(|&i| inside(self.tile(index, i, tiles.len())))
@@ -523,6 +564,10 @@ impl MenuLayout {
             Focus::Part(i, p) => match &menu.entries[i] {
                 Entry::Tiles(tiles) => self.tile(i, p, tiles.len()),
                 Entry::Player { buttons, .. } => self.player_button(i, p, buttons.len()),
+                Entry::Item(_) => {
+                    let (l, t, r, b) = self.icon_target(i);
+                    (l, t, r - ICON_INSET / 2., b)
+                }
                 Entry::Slider(_) => {
                     let (l, t, _, b) = self.block(i);
                     (l - 2., t, l + TRACK_HEIGHT + 2., b)
@@ -591,7 +636,11 @@ pub enum Command {
     Settings,
     DateTime,
     Notifications,
+    /// Same as a left click on the tray icon in the status bar.
     TrayActivate(usize),
+    /// Same as a right click on it: the application shows its own menu.
+    TrayMenu(usize),
+    /// Keeps the tray icon on the status bar or moves it into the overflow menu.
     TrayToggle(usize),
     /// Opens a settings page or another URI with the Shell.
     Open(&'static str),
@@ -849,34 +898,26 @@ pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
 pub struct TrayEntry<'a> {
     pub index: usize,
     pub label: &'a str,
-    /// Placed on the status bar right now.
-    pub on_bar: bool,
-    /// The user keeps it on the bar when there is room.
+    /// The user keeps it on the status bar; it still overflows when there is no room.
     pub kept: bool,
 }
 
-/// Icons that are not on the bar for activation, then every icon as a toggle.
+/// Every application tray icon. A row clicks the icon as the status bar does, with
+/// either button. Its leading icon sits on a solid circle while the user keeps it on
+/// the bar, and clicking that icon toggles the choice.
 pub fn tray_menu(icons: &[TrayEntry<'_>]) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    if icons.iter().any(|i| !i.on_bar) {
-        menu.label("其他图标");
-        for icon in icons.iter().filter(|i| !i.on_bar) {
-            menu.item(
-                icon.label,
-                Icon::Tray(icon.index),
-                Some(Command::TrayActivate(icon.index)),
-            );
-        }
-        menu.separator();
-    }
-    menu.label("在状态栏显示");
     for icon in icons {
-        menu.item(
+        let item = menu.item(
             icon.label,
-            Icon::Tray(icon.index),
-            Some(Command::TrayToggle(icon.index)),
-        )
-        .checked = Some(icon.kept);
+            Icon::Tray {
+                index: icon.index,
+                on: icon.kept,
+            },
+            Some(Command::TrayActivate(icon.index)),
+        );
+        item.icon_command = Some(Command::TrayToggle(icon.index));
+        item.context = Some(Command::TrayMenu(icon.index));
     }
     menu
 }
@@ -989,24 +1030,69 @@ mod tests {
             TrayEntry {
                 index: 0,
                 label: "a",
-                on_bar: true,
                 kept: true,
             },
             TrayEntry {
                 index: 3,
                 label: "b",
-                on_bar: false,
                 kept: false,
             },
         ];
+        let menu = tray_menu(&icons);
+        // One row per icon, whether or not it is on the bar, with no checkmarks.
         assert_eq!(
-            commands(&tray_menu(&icons)),
-            [
-                Command::TrayActivate(3),
-                Command::TrayToggle(0),
-                Command::TrayToggle(3)
-            ]
+            commands(&menu),
+            [Command::TrayActivate(0), Command::TrayActivate(3)]
         );
+        assert_eq!(menu.part_command(0, 0), Some(&Command::TrayToggle(0)));
+        assert_eq!(menu.context_command(1), Some(&Command::TrayMenu(3)));
+        assert!(matches!(
+            menu.entries[..],
+            [
+                Entry::Item(Item {
+                    icon: Icon::Tray { index: 0, on: true },
+                    ..
+                }),
+                Entry::Item(Item {
+                    icon: Icon::Tray {
+                        index: 3,
+                        on: false
+                    },
+                    ..
+                })
+            ]
+        ));
+    }
+
+    #[test]
+    fn tray_rows_split_their_icon_from_the_rest_of_the_row() {
+        let icons = [TrayEntry {
+            index: 2,
+            label: "a",
+            kept: true,
+        }];
+        for dpi in [96, 120, 144, 192] {
+            let mut menu = tray_menu(&icons);
+            let layout = MenuLayout::new(&mut menu, dpi, measure);
+            let px = |dip: f32| (dip * layout.scale).round() as i32;
+            let (l, t, r, b) = layout.icon_badge(0);
+            let y = px((t + b) / 2.);
+            // The badge and the gap around it toggle the icon, the label clicks it.
+            assert_eq!(layout.hit(&menu, px((l + r) / 2.), y), Hit::Part(0, 0));
+            assert_eq!(
+                layout.hit(&menu, px(SHADOW + PADDING) + 1, y),
+                Hit::Part(0, 0)
+            );
+            assert_eq!(layout.hit(&menu, px(r + ICON_INSET + 2.), y), Hit::Item(0));
+            assert_eq!(layout.hit(&menu, px(layout.width / 2.), y), Hit::Item(0));
+            // The keyboard reaches the icon before its row.
+            assert_eq!(menu.step(None, true), Some(Focus::Part(0, 0)));
+            assert_eq!(
+                menu.step(Some(Focus::Part(0, 0)), true),
+                Some(Focus::Item(0))
+            );
+            assert_eq!(Focus::Part(0, 0).index(), 0);
+        }
     }
 
     #[test]

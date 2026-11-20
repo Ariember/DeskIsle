@@ -177,6 +177,8 @@ pub(crate) fn run() -> Result<()> {
     bars.restatus();
     bars.draw()?;
     bars.position()?;
+    // Applications answer at once; the loop below receives their icons.
+    bars.tray.request_icons()?;
     loop {
         match platform::next_event()? {
             Event::Quit => return Ok(()),

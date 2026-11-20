@@ -299,6 +299,8 @@ pub enum MenuKey {
     Home,
     End,
     Select,
+    /// The menu key or Shift+F10 asks for the focused row's own menu.
+    Context,
     Dismiss,
     Other,
 }
@@ -342,7 +344,10 @@ pub enum Event {
     /// The left button went down in the menu, which may start dragging a slider.
     MenuPress(i32, i32),
     MenuLeave,
+    /// The left button was released in the menu.
     MenuPick(i32, i32),
+    /// The right button was released in the menu.
+    MenuContext(i32, i32),
     MenuKey(MenuKey),
     /// The menu lost activation or Windows cancelled modes.
     MenuDismiss,
@@ -384,6 +389,7 @@ impl Event {
                 | Event::MenuPress(..)
                 | Event::MenuLeave
                 | Event::MenuPick(..)
+                | Event::MenuContext(..)
                 | Event::MenuKey(_)
                 | Event::MenuDismiss
         )
@@ -467,6 +473,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::Press(..)
                     | Event::Scroll(..)
                     | Event::MenuPick(..)
+                    | Event::MenuContext(..)
                     | Event::MenuPress(..)
                     | Event::MenuKey(_)
                     | Event::PanelClick(..)
@@ -630,7 +637,8 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
         WM_LBUTTONDOWN => Event::MenuPress(x, y),
-        WM_LBUTTONUP | WM_RBUTTONUP => Event::MenuPick(x, y),
+        WM_LBUTTONUP => Event::MenuPick(x, y),
+        WM_RBUTTONUP => Event::MenuContext(x, y),
         WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
             VK_DOWN => MenuKey::Down,
             VK_UP => MenuKey::Up,
@@ -641,6 +649,8 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             VK_HOME => MenuKey::Home,
             VK_END => MenuKey::End,
             VK_RETURN | VK_SPACE => MenuKey::Select,
+            VK_APPS => MenuKey::Context,
+            VK_F10 if (unsafe { GetKeyState(VK_SHIFT.0 as i32) }) < 0 => MenuKey::Context,
             VK_ESCAPE | VK_MENU => MenuKey::Dismiss,
             _ => MenuKey::Other,
         }),

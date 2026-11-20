@@ -20,9 +20,12 @@ use super::{Renderer, ease};
 const MENU_RADIUS: f32 = 12.;
 const HIGHLIGHT_RADIUS: f32 = MENU_RADIUS - menu::PADDING;
 /// Diameter of the round backing every icon of a menu row sits on.
-const ICON_BADGE: f32 = 24.;
+const ICON_BADGE: f32 = menu::ICON_BADGE;
 /// How much of its round backing an icon covers.
 const BADGE_ICON: f32 = 0.58;
+/// A tray icon's image inside its round backing. Application images fill their
+/// square, so they are drawn a little larger than DeskIsle's line icons.
+const TRAY_BADGE_ICON: f32 = 16.;
 /// The icon at the start of a slider's track.
 const SLIDER_ICON: f32 = 15.;
 /// Marks a window in an application's list; filled for the foreground window.
@@ -309,16 +312,43 @@ impl Renderer {
         )
     }
 
-    /// An icon in a circle, filled with the accent when `on`.
-    fn badge(&self, c: &Canvas, symbol: Symbol, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
+    /// A circle of `size` centered on `x`, `y`: filled with the accent when `on`,
+    /// otherwise a faint wash.
+    fn backing(c: &Canvas, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
         let r = size / 2.;
         if on {
-            c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)?;
+            c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)
         } else {
-            c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)?;
+            c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)
         }
+    }
+
+    /// An icon in a circle, filled with the accent when `on`.
+    fn badge(&self, c: &Canvas, symbol: Symbol, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
+        Self::backing(c, x, y, size, on)?;
         let ink = if on { c.p.on_accent } else { c.p.ink };
         c.symbol(symbol, x, y, size * BADGE_ICON, ink, 1.)
+    }
+
+    /// A tray icon's image in a circle, filled with the accent while it is `on` the
+    /// status bar. Missing images leave the circle alone.
+    fn tray_badge(&self, c: &Canvas, icon: Option<HICON>, x: f32, y: f32, on: bool) -> Result<()> {
+        Self::backing(c, x, y, ICON_BADGE, on)?;
+        let Some(bitmap) = icon.and_then(|icon| self.hicon_bitmap(icon).ok()) else {
+            return Ok(());
+        };
+        // Snap to whole pixels so small icons stay sharp.
+        let px = |v: f32| (v * c.scale).round() / c.scale;
+        let (l, t) = (x - TRAY_BADGE_ICON / 2., y - TRAY_BADGE_ICON / 2.);
+        c.bitmap(
+            &bitmap,
+            c.rect(
+                px(l),
+                px(t),
+                px(l + TRAY_BADGE_ICON),
+                px(t + TRAY_BADGE_ICON),
+            ),
+        )
     }
 
     /// The icon of a command row on a faint circle of its own `tint`, so a destructive
@@ -349,7 +379,9 @@ impl Renderer {
         let (row_left, _, row_right, _) = layout.row(0);
         let (top, bottom) = layout.rows[index];
         let middle = (top + bottom) / 2.;
-        let icon_x = row_left + 8. + 12.;
+        // Every row's leading icon sits where the layout takes its clicks.
+        let (badge_left, _, badge_right, _) = layout.icon_badge(index);
+        let icon_x = (badge_left + badge_right) / 2.;
         match entry {
             Entry::Label(text) => {
                 let area = Area::new(row_left + 8., top + 4., row_right - 8., bottom);
@@ -480,6 +512,9 @@ impl Renderer {
                     Icon::Window { active } => {
                         self.badge(c, WINDOW_SYMBOL, icon_x, middle, ICON_BADGE, *active)?;
                     }
+                    Icon::Tray { index, on } => {
+                        self.tray_badge(c, tray(*index), icon_x, middle, *on)?;
+                    }
                     icon => {
                         let size = 18.;
                         self.paint_icon(
@@ -492,13 +527,8 @@ impl Renderer {
                         )?;
                     }
                 }
-                let check = if layout.checks {
-                    menu::CHECK_COLUMN
-                } else {
-                    0.
-                };
                 let label_left = row_left + 8. + layout.icon_column;
-                let label_right = row_right - menu::TEXT_INSET - check;
+                let label_right = row_right - menu::TEXT_INSET;
                 let detail_width = if item.detail.is_empty() {
                     0.
                 } else {
@@ -526,12 +556,7 @@ impl Renderer {
                     },
                     c.p.muted,
                     0.75 * alpha,
-                )?;
-                if item.checked == Some(true) {
-                    let x = row_right - menu::TEXT_INSET - menu::CHECK_COLUMN / 2.;
-                    c.symbol(Symbol::Check, x, middle, 14., c.p.accent, 1.)?;
-                }
-                Ok(())
+                )
             }
         }
     }
@@ -548,7 +573,7 @@ impl Renderer {
     ) -> Result<bool> {
         let bitmap = match icon {
             Icon::File(path) => self.shell_icon(path).ok().flatten(),
-            Icon::Tray(index) => tray(*index).and_then(|icon| self.hicon_bitmap(icon).ok()),
+            Icon::Tray { index, .. } => tray(*index).and_then(|icon| self.hicon_bitmap(icon).ok()),
             Icon::Symbol(symbol) => {
                 // Round like every other icon backing in the menus.
                 let r = size / 2.;

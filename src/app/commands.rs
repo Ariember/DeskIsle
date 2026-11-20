@@ -44,7 +44,11 @@ impl Bars {
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
             Command::TrayActivate(index) => {
-                self.tray_activate(index, false, self.tray_overflow_anchor()?)?;
+                self.tray_activate(index, false, self.tray_anchor(index)?)?;
+                return Ok(false);
+            }
+            Command::TrayMenu(index) => {
+                self.tray_activate(index, true, self.tray_anchor(index)?)?;
                 return Ok(false);
             }
             Command::Open(uri) => shell::execute(owner, uri),

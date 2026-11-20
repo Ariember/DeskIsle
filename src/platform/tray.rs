@@ -14,6 +14,7 @@ mod placement;
 pub(super) use menu::window_event as menu_event;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 use std::path::PathBuf;
@@ -186,6 +187,8 @@ pub struct TrayHost {
     icons: Vec<TrayIcon>,
     next_stamp: u64,
     activation: Option<PendingActivation>,
+    /// Owner windows already asked to add their icons again since the last broadcast.
+    asked: HashSet<isize>,
 }
 
 struct PendingActivation {
@@ -243,17 +246,21 @@ impl TrayHost {
                 icons: Vec::new(),
                 next_stamp: 0,
                 activation: None,
+                asked: HashSet::new(),
             };
             host.raise();
-            // Applications add their icons again on TaskbarCreated, now through this host.
-            // UIPI keeps the broadcast from elevated processes; their icons appear on their
-            // next update.
-            host.request_icons()?;
+            // The UI loop asks applications for their icons once it can answer them.
             Ok(host)
         }
     }
 
-    pub fn request_icons(&self) -> Result<()> {
+    /// Asks every application to add its icons again, now through this host. Call once
+    /// the UI loop runs: applications answer at once, and `Shell_NotifyIcon` gives up on
+    /// a host that does not reply in time, leaving the icon with Explorer alone. UIPI
+    /// keeps the broadcast from elevated processes; their icons appear on their next
+    /// update.
+    pub fn request_icons(&mut self) -> Result<()> {
+        self.asked.clear();
         unsafe { SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0)) }
     }
 
@@ -436,6 +443,13 @@ impl TrayHost {
                     self.icons.push(icon);
                 }
                 true
+            }
+            // An update without an image for an icon this host never saw: the owner added
+            // it before DeskIsle, or its answer to the broadcast was lost. Many apps only
+            // change their tooltip afterwards, so ask them to add the icon again.
+            (NIM_MODIFY, None) => {
+                ask_to_register(&mut self.asked, &n);
+                false
             }
             _ => false,
         }
@@ -683,6 +697,20 @@ fn click_callbacks(
     })
 }
 
+/// Posts TaskbarCreated to the owner of `n`, once per owner until the next broadcast.
+/// Applications answer it by adding their icons again, as after an Explorer restart.
+/// Windows' own indicators are left alone.
+fn ask_to_register(asked: &mut HashSet<isize>, n: &Notify) {
+    let owner = HWND(n.owner as _);
+    let guid = (n.flags & NIF_GUID != 0).then_some(n.guid);
+    if filter::is_system_indicator(guid, owner) || !asked.insert(n.owner) {
+        return;
+    }
+    // A closed owner or one UIPI protects cannot be asked; its icon appears on its next
+    // update with an image, as before.
+    let _ = unsafe { PostMessageW(Some(owner), TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0)) };
+}
+
 fn owner_path(owner: isize) -> Option<PathBuf> {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(HWND(owner as _), Some(&mut pid)) };
@@ -802,6 +830,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn updates_for_unknown_icons_ask_their_owner_to_add_them_once() -> Result<()> {
+        // A message-only owner keeps the request inside this test's thread queue.
+        let owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )?
+        };
+        let message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        TASKBAR_CREATED.set(message);
+        let update = Notify {
+            received: Instant::now(),
+            balloon: false,
+            message: NIM_MODIFY,
+            owner: owner.0 as isize,
+            id: 3,
+            flags: NIF_TIP,
+            callback: 0,
+            icon: None,
+            tip: "\u{2191} 943 B/s".into(),
+            state: 0,
+            state_mask: 0,
+            version: 0,
+            guid: GUID::zeroed(),
+        };
+        let received = || {
+            let mut msg = MSG::default();
+            let mut count = 0;
+            while unsafe { PeekMessageW(&mut msg, Some(owner), message, message, PM_REMOVE) }
+                .as_bool()
+            {
+                count += 1;
+            }
+            count
+        };
+        let mut asked = HashSet::new();
+        // Tooltip updates arrive every second; the owner is asked only once.
+        ask_to_register(&mut asked, &update);
+        ask_to_register(&mut asked, &update);
+        assert_eq!(received(), 1);
+        // A new broadcast round starts over.
+        asked.clear();
+        ask_to_register(&mut asked, &update);
+        assert_eq!(received(), 1);
+        unsafe { DestroyWindow(owner)? };
+        Ok(())
+    }
+
+    #[test]
     fn unhandled_left_click_completes_double_click_before_requesting_menu() -> Result<()> {
         use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
         struct Apartment;
@@ -839,6 +926,7 @@ mod tests {
             icons: Vec::new(),
             next_stamp: 0,
             activation: None,
+            asked: HashSet::new(),
         };
         let registration = || Notify {
             received: Instant::now(),

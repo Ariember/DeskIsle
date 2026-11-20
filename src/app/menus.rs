@@ -71,21 +71,7 @@ impl Bars {
     }
 
     pub(super) fn tray_menu(&mut self) -> Result<bool> {
-        let on_bar = &self.shown[..self.status.tray.len()];
-        let entries = self
-            .tray
-            .icons()
-            .iter()
-            .enumerate()
-            .filter(|(_, icon)| icon.visible())
-            .map(|(index, icon)| TrayEntry {
-                index,
-                label: &icon.label,
-                on_bar: on_bar.contains(&index),
-                kept: !self.hidden.contains(&icon.key),
-            })
-            .collect::<Vec<_>>();
-        let menu = menu::tray_menu(&entries);
+        let menu = self.tray_list();
         let anchor = self.tray_overflow_anchor()?;
         // The button flips to a collapse arrow while the menu is open.
         self.overflow_open = true;
@@ -96,6 +82,36 @@ impl Bars {
         match choice? {
             Some(command) => self.run_command(command),
             None => Ok(false),
+        }
+    }
+
+    /// Every visible application tray icon, on the bar or not.
+    fn tray_list(&self) -> Menu<Command> {
+        let entries = self
+            .tray
+            .icons()
+            .iter()
+            .enumerate()
+            .filter(|(_, icon)| icon.visible())
+            .map(|(index, icon)| TrayEntry {
+                index,
+                label: &icon.label,
+                kept: !self.hidden.contains(&icon.key),
+            })
+            .collect::<Vec<_>>();
+        menu::tray_menu(&entries)
+    }
+
+    /// Where a click on tray icon `index` happens: its slot on the status bar, or the
+    /// overflow button while the icon is not on the bar.
+    pub(super) fn tray_anchor(&self, index: usize) -> Result<Anchor> {
+        let on_bar = &self.shown[..self.status.tray.len()];
+        match on_bar.binary_search(&index) {
+            Ok(slot) => {
+                let rect = self.status.tray[slot].rect;
+                Ok(self.top_anchor(rect.x + rect.width / 2))
+            }
+            Err(_) => self.tray_overflow_anchor(),
         }
     }
 
@@ -223,6 +239,8 @@ impl Bars {
             let mut target = hover;
             let mut chosen = None;
             let mut slide = None;
+            // The menu's entries, rebuilt in place after a change it keeps open for.
+            let mut rebuilt = None;
             match platform::next_event()? {
                 Event::MenuPress(x, y) => {
                     if let Hit::Slider(index, value) = layout.hit(&menu, x, y) {
@@ -242,7 +260,7 @@ impl Bars {
                 },
                 Event::MenuLeave if drag.is_none() => target = None,
                 // Releasing a slider, even outside the menu, only ends the drag.
-                Event::MenuPick(x, _) if drag.is_some() => {
+                Event::MenuPick(x, _) | Event::MenuContext(x, _) if drag.is_some() => {
                     let index = drag.take().expect("dragging");
                     window.release();
                     slide = Some((index, layout.slider_value(index, x), true));
@@ -256,6 +274,20 @@ impl Bars {
                         .and_then(|focus| menu.focused_command(focus))
                         .cloned();
                 }
+                // A row with a menu of its own opens that menu, as the same click on the
+                // status bar does; anywhere else a right click picks like a left one.
+                Event::MenuContext(x, y) => match layout.hit(&menu, x, y) {
+                    Hit::Outside => break None,
+                    hit => {
+                        chosen = hit
+                            .focus()
+                            .and_then(|focus| {
+                                menu.context_command(focus.index())
+                                    .or_else(|| menu.focused_command(focus))
+                            })
+                            .cloned();
+                    }
+                },
                 Event::MenuKey(key) => match key {
                     MenuKey::Down => target = menu.step(hover, true),
                     MenuKey::Up => target = menu.step(hover, false),
@@ -280,6 +312,10 @@ impl Bars {
                     }
                     MenuKey::Select => {
                         chosen = hover.and_then(|focus| menu.focused_command(focus).cloned())
+                    }
+                    MenuKey::Context => {
+                        chosen =
+                            hover.and_then(|focus| menu.context_command(focus.index()).cloned())
                     }
                     MenuKey::Dismiss => break None,
                     _ => {}
@@ -328,6 +364,14 @@ impl Bars {
                     }
                     refresh_flyout = true;
                 }
+                // The overflow menu stays open so several icons can be toggled in a row.
+                (Some(Command::TrayToggle(index)), _) => {
+                    if let Err(error) = self.tray_toggle(index) {
+                        failure = Some(error);
+                        break None;
+                    }
+                    rebuilt = Some(self.tray_list());
+                }
                 (Some(command), _) => break Some(command),
                 (None, _) => {}
             }
@@ -335,7 +379,11 @@ impl Bars {
                 && drag.is_none()
                 && let Some(item) = flyout
             {
-                menu = self.flyout_menu(item);
+                rebuilt = Some(self.flyout_menu(item));
+                refresh_flyout = false;
+            }
+            if let Some(next) = rebuilt {
+                menu = next;
                 layout = self.menu_layout(&mut menu);
                 window.place(layout.place(anchor, self.monitor.bounds));
                 target = target.filter(|&focus| match focus {
@@ -347,7 +395,6 @@ impl Bars {
                     failure = Some(error);
                     break None;
                 }
-                refresh_flyout = false;
             }
             if target != hover {
                 let danger = matches!(target, Some(Focus::Item(i)) if matches!(&menu.entries[i], menu::Entry::Item(item) if item.danger));
