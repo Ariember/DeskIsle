@@ -114,7 +114,7 @@ impl Bars {
         }
         let dpi = self.monitor.dpi;
         let mut state = PanelState::default();
-        let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work.height);
+        let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work);
         let window = PanelWindow::create(
             layout.place(self.monitor.work),
             layout.caption_pixels(),
@@ -167,7 +167,7 @@ impl Bars {
             return Ok(());
         };
         let work = panel.window.work_area()?;
-        let layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work.height);
+        let layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work);
         if layout == panel.layout {
             return Ok(());
         }
@@ -261,6 +261,7 @@ impl Bars {
                     }
                 }
                 Key::Autostart => startup::set(enabled),
+                Key::Preview(_) => Ok(()),
             };
             if let Err(error) = result {
                 platform::report_error(Some(self.settings_owner()), &error);

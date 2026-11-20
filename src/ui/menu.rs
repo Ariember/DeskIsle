@@ -297,6 +297,8 @@ pub struct MenuLayout {
     pub height: f32,
     /// Top and bottom of each entry, aligned with `Menu::entries`.
     pub rows: Vec<(f32, f32)>,
+    /// Reserved for leading icons when at least one item uses one.
+    pub icon_column: f32,
     pub checks: bool,
 }
 
@@ -315,6 +317,15 @@ impl MenuLayout {
                 })
             )
         });
+        let icon_column = if menu
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Item(item) if item.icon != Icon::None))
+        {
+            ICON_COLUMN
+        } else {
+            0.
+        };
         let mut content: f32 = 0.;
         let mut rows = Vec::with_capacity(menu.entries.len());
         let mut y = SHADOW + PADDING;
@@ -330,7 +341,7 @@ impl MenuLayout {
                 }
                 Entry::Item(item) => {
                     let mut width =
-                        TEXT_INSET + ICON_COLUMN + measure(&item.label, LABEL_SIZE, false);
+                        TEXT_INSET + icon_column + measure(&item.label, LABEL_SIZE, false);
                     if !item.detail.is_empty() {
                         width += 24. + measure(&item.detail, DETAIL_SIZE, false);
                     }
@@ -385,6 +396,7 @@ impl MenuLayout {
             width: panel + 2. * SHADOW,
             height: y + PADDING + SHADOW,
             rows,
+            icon_column,
             checks,
         }
     }
@@ -764,6 +776,7 @@ pub fn mark_menu() -> Menu<Command> {
         Some(Command::Open("ms-settings:about")),
     );
     menu.separator();
+    menu.item("管理面板", Icon::Glyph("\u{E80F}"), Some(Command::Settings));
     menu.item(
         "系统偏好设置",
         Icon::Glyph("\u{E713}"),
@@ -779,6 +792,11 @@ pub fn mark_menu() -> Menu<Command> {
         "任务管理器",
         Icon::Glyph("\u{E9D9}"),
         Some(Command::TaskManager),
+    );
+    menu.item(
+        "显示桌面",
+        Icon::Glyph("\u{E7F4}"),
+        Some(Command::ShowDesktop),
     );
     menu.separator();
     menu.item("睡眠", Icon::Glyph("\u{E708}"), Some(Command::Sleep));
@@ -980,9 +998,11 @@ mod tests {
             commands(&menu),
             [
                 Command::Open("ms-settings:about"),
+                Command::Settings,
                 Command::Open("ms-settings:"),
                 Command::Open("ms-windows-store:"),
                 Command::TaskManager,
+                Command::ShowDesktop,
                 Command::Sleep,
                 Command::Restart,
                 Command::ShutDown,
@@ -1002,7 +1022,7 @@ mod tests {
         }
         let layout = MenuLayout::new(&mut menu, 96, measure);
         assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
-        assert_eq!(layout.rows.len(), 13);
+        assert_eq!(layout.rows.len(), 15);
     }
 
     #[test]

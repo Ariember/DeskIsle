@@ -3,22 +3,26 @@
 //! renderer and the window in the platform layer.
 
 use crate::geometry::Rect;
-use crate::settings::{self, Adjust, Control, Key, SCHEMA, SECTIONS, Section, Settings};
+use crate::settings::{
+    self, Adjust, Control, Key, PreviewKey, SCHEMA, SECTIONS, Section, Settings,
+};
 
-pub const WIDTH: f32 = 680.;
-pub const HEIGHT: f32 = 480.;
+pub const WIDTH: f32 = 720.;
+pub const HEIGHT: f32 = 560.;
+const MIN_WIDTH: f32 = 600.;
 const MIN_HEIGHT: f32 = 260.;
 pub const CAPTION: f32 = 48.;
 const CLOSE_WIDTH: f32 = 46.;
 const NAV_LEFT: f32 = 12.;
 const NAV_RIGHT: f32 = 196.;
-const NAV_ITEM: f32 = 38.;
+const NAV_ITEM: f32 = 34.;
 const NAV_GAP: f32 = 4.;
 const CONTENT_LEFT: f32 = 212.;
 const CONTENT_RIGHT: f32 = 20.;
 const FOOTER: f32 = 60.;
-pub const PAGE_TITLE: f32 = 46.;
 const CARD: f32 = 68.;
+const MONITOR_CARD: f32 = 78.;
+const MONITOR_INSET: f32 = 72.;
 const CARD_GAP: f32 = 8.;
 const CONTROL_INSET: f32 = 16.;
 const SWITCH_WIDTH: f32 = 40.;
@@ -96,6 +100,16 @@ pub struct Row {
     /// The card behind the row, already moved by the scroll offset.
     pub card: Area,
     pub part: Part,
+    pub detail: Option<Detail>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Detail {
+    pub key: Key,
+    pub label: &'static str,
+    pub part: Part,
+    /// Alongside a checkbox. The label and box activate the same setting.
+    pub label_area: Option<Area>,
 }
 
 /// Keyboard intents, translated from keys by the platform layer.
@@ -176,7 +190,11 @@ impl PanelState {
                     Nav::Increase => Adjust::Step(1),
                     _ => Adjust::Toggle,
                 };
-                Some(Action::Change(row.key, adjust))
+                let key = match (&row.detail, nav) {
+                    (Some(detail), Nav::Decrease | Nav::Increase) => detail.key,
+                    _ => row.key,
+                };
+                Some(Action::Change(key, adjust))
             }
             _ => None,
         }
@@ -192,24 +210,24 @@ pub struct PanelLayout {
     pub close: Area,
     pub nav: Vec<(Area, Section)>,
     pub page: usize,
-    /// The page title, moved with the content.
+    /// The page title in the fixed caption.
     pub title: Area,
     /// Content scrolls inside this area and is clipped to it.
     pub view: Area,
     pub rows: Vec<Row>,
     pub reset: Area,
     pub max_scroll: f32,
+    pub scroll_thumb: Option<Area>,
     pub focus: Option<usize>,
     pub hover: Option<Action>,
 }
 
 impl PanelLayout {
-    /// `max_height` is the tallest window that fits the work area, in pixels. Clamps
-    /// `state` to the new layout.
-    pub fn new(state: &mut PanelState, settings: &Settings, dpi: u32, max_height: i32) -> Self {
+    /// Fits the window to its monitor's work area and clamps the current page's scroll.
+    pub fn new(state: &mut PanelState, settings: &Settings, dpi: u32, work: Rect) -> Self {
         let scale = dpi as f32 / 96.;
-        let width = WIDTH;
-        let height = (max_height as f32 / scale)
+        let width = (work.width as f32 / scale).clamp(MIN_WIDTH, WIDTH).floor();
+        let height = (work.height as f32 / scale)
             .clamp(MIN_HEIGHT, HEIGHT)
             .floor();
         let close = Area::new(width - CLOSE_WIDTH, 0., width, CAPTION - 8.);
@@ -225,28 +243,46 @@ impl PanelLayout {
         let section = SECTIONS[state.page];
         let view = Area::new(
             CONTENT_LEFT,
-            CAPTION,
+            CAPTION + 12.,
             width - CONTENT_RIGHT,
             height - FOOTER,
         );
-        let specs: Vec<_> = SCHEMA.iter().filter(|s| s.section == section).collect();
-        let content = PAGE_TITLE + specs.len() as f32 * (CARD + CARD_GAP);
+        let mut rows = Vec::new();
+        let mut top = view.top;
+        for spec in SCHEMA
+            .iter()
+            .filter(|s| s.section == section && detail_parent(s.key).is_none())
+        {
+            let detail = SCHEMA
+                .iter()
+                .find(|s| detail_parent(s.key) == Some(spec.key));
+            let height = if detail.is_some() { MONITOR_CARD } else { CARD };
+            let card = Area::new(view.left, top, view.right, top + height);
+            rows.push((spec, detail, card));
+            top = card.bottom + CARD_GAP;
+        }
+        let content = top - view.top;
         let max_scroll = (content - (view.bottom - view.top)).max(0.);
         state.scroll = state.scroll.clamp(0., max_scroll);
-        state.focus = state.focus.filter(|&i| i < specs.len());
-        let top = view.top - state.scroll;
-        let rows = specs
-            .iter()
-            .enumerate()
-            .map(|(i, spec)| {
-                let card_top = top + PAGE_TITLE + i as f32 * (CARD + CARD_GAP);
-                let card = Area::new(view.left, card_top, view.right, card_top + CARD);
+        let scroll_thumb = (max_scroll > 0.).then(|| {
+            let track = view.bottom - view.top;
+            let thumb = (track * track / content).max(18.);
+            let y = view.top + (track - thumb) * state.scroll / max_scroll;
+            Area::new(view.right + 6., y, view.right + 10., y + thumb)
+        });
+        state.focus = state.focus.filter(|&i| i < rows.len());
+        let rows = rows
+            .into_iter()
+            .map(|(spec, detail, mut card)| {
+                card.top -= state.scroll;
+                card.bottom -= state.scroll;
                 Row {
                     key: spec.key,
                     label: spec.label,
                     help: spec.help,
                     card,
                     part: part(spec, settings.get(spec.key), card),
+                    detail: detail.map(|s| detail_control(s, settings.get(s.key), card)),
                 }
             })
             .collect();
@@ -258,7 +294,7 @@ impl PanelLayout {
             close,
             nav,
             page: state.page,
-            title: Area::new(view.left, top, view.right, top + PAGE_TITLE),
+            title: Area::new(view.left, 0., close.left, CAPTION),
             view,
             rows,
             reset: Area::new(
@@ -268,6 +304,7 @@ impl PanelLayout {
                 reset_top + CONTROL_HEIGHT,
             ),
             max_scroll,
+            scroll_thumb,
             focus: state.focus,
             hover: state.hover,
         }
@@ -316,8 +353,30 @@ impl PanelLayout {
             return None;
         }
         let row = self.rows.iter().find(|row| row.card.contains(x, y))?;
+        if let Some(detail) = &row.detail {
+            match &detail.part {
+                Part::Switch { area, .. }
+                    if area.contains(x, y)
+                        || detail.label_area.is_some_and(|a| a.contains(x, y)) =>
+                {
+                    return Some(Action::Change(detail.key, Adjust::Toggle));
+                }
+                Part::Segments { options, .. } => {
+                    if let Some(i) = options.iter().position(|(area, _)| area.contains(x, y)) {
+                        return Some(Action::Change(detail.key, Adjust::Pick(i)));
+                    }
+                }
+                _ => {}
+            }
+        }
         let adjust = match &row.part {
-            // The whole card flips a switch, as in Windows Settings.
+            // In composite cards the space around the style buttons is neutral.
+            Part::Switch { area, .. }
+                if row.detail.is_some() && !area.contains(x, y) && y >= row.card.middle() =>
+            {
+                return None;
+            }
+            // The whole card flips a standalone switch, as in Windows Settings.
             Part::Switch { .. } => Adjust::Toggle,
             Part::Stepper {
                 minus,
@@ -339,6 +398,50 @@ impl PanelLayout {
             }
         };
         Some(Action::Change(row.key, adjust))
+    }
+}
+
+/// These controls share a card with the monitor they configure.
+fn detail_parent(key: Key) -> Option<Key> {
+    use PreviewKey::*;
+    Some(Key::Preview(match key {
+        Key::Preview(CpuStyle) => Cpu,
+        Key::Preview(GpuTemperature) => Temperature,
+        Key::Preview(MemoryStyle) => Memory,
+        Key::Preview(DiskStyle) => Disk,
+        _ => return None,
+    }))
+}
+
+fn detail_control(spec: &settings::Spec, value: i32, card: Area) -> Detail {
+    let left = card.left + MONITOR_INSET;
+    let bottom = card.bottom - 10.;
+    let area = Area::new(left, bottom - 24., left + 24., bottom);
+    let part = match spec.control {
+        Control::Toggle => Part::Switch {
+            area,
+            on: value != 0,
+        },
+        Control::Choice(choices) => Part::Segments {
+            options: choices
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| {
+                    let x = left + i as f32 * 32.;
+                    (Area::new(x, area.top, x + 28., bottom), choice.label)
+                })
+                .collect(),
+            selected: value as usize,
+        },
+        Control::Stepper { .. } => unreachable!("monitor details are toggles or styles"),
+    };
+    let label_area = matches!(part, Part::Switch { .. })
+        .then(|| Area::new(area.right, area.top, area.right + 44., bottom));
+    Detail {
+        key: spec.key,
+        label: spec.label,
+        part,
+        label_area,
     }
 }
 
@@ -394,7 +497,12 @@ pub fn text_area(row: &Row) -> Area {
         Part::Segments { options, .. } => options.first().map_or(row.card.right, |o| o.0.left),
     };
     Area::new(
-        row.card.left + CONTROL_INSET,
+        row.card.left
+            + if row.detail.is_some() {
+                MONITOR_INSET
+            } else {
+                CONTROL_INSET
+            },
         row.card.top,
         control_left - CONTROL_INSET,
         row.card.bottom,
@@ -404,6 +512,15 @@ pub fn text_area(row: &Row) -> Area {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn work(height: i32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 2400,
+            height,
+        }
+    }
 
     fn center(area: Area, scale: f32) -> (i32, i32) {
         (
@@ -429,7 +546,7 @@ mod tests {
                     page,
                     ..PanelState::default()
                 };
-                let layout = PanelLayout::new(&mut state, &settings, dpi, 4000);
+                let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
                 let s = layout.scale;
                 let (x, y) = center(layout.nav[page].0, s);
                 assert_eq!(layout.hit(x, y), Some(Action::Page(page)));
@@ -440,8 +557,8 @@ mod tests {
                 for row in &layout.rows {
                     let change = |adjust| Some(Action::Change(row.key, adjust));
                     match &row.part {
-                        Part::Switch { .. } => {
-                            let (x, y) = center(row.card, s);
+                        Part::Switch { area, .. } => {
+                            let (x, y) = center(*area, s);
                             assert_eq!(layout.hit(x, y), change(Adjust::Toggle));
                         }
                         Part::Stepper {
@@ -473,7 +590,7 @@ mod tests {
     fn limits_disable_stepper_buttons() {
         let mut settings = Settings::default();
         settings.set(Key::IconSize, 56);
-        let layout = PanelLayout::new(&mut dock_page(), &settings, 96, 4000);
+        let layout = PanelLayout::new(&mut dock_page(), &settings, 96, work(4000));
         let row = layout.rows.iter().find(|r| r.key == Key::IconSize).unwrap();
         let Part::Stepper {
             plus, minus, text, ..
@@ -493,13 +610,20 @@ mod tests {
         let settings = Settings::default();
         let mut state = dock_page();
         // At 2x, 520 pixels leave the minimum height, too short for every card.
-        let layout = PanelLayout::new(&mut state, &settings, 192, 520);
+        let work = Rect {
+            width: 1280,
+            ..work(520)
+        };
+        let layout = PanelLayout::new(&mut state, &settings, 192, work);
         assert_eq!(layout.height, MIN_HEIGHT);
+        assert_eq!(layout.pixels().0, work.width);
+        let caption = layout.title;
+        assert_eq!(layout.scroll_thumb.unwrap().top, layout.view.top);
         assert!(layout.max_scroll > 0.);
         let last = layout.rows.len() - 1;
         assert_eq!(state.key(Nav::Previous, &layout), None);
         assert_eq!(state.focus, Some(last));
-        let layout = PanelLayout::new(&mut state, &settings, 192, 520);
+        let layout = PanelLayout::new(&mut state, &settings, 192, work);
         assert!(layout.rows[last].card.bottom <= layout.view.bottom + 0.01);
         assert_eq!(
             state.key(Nav::Increase, &layout),
@@ -513,7 +637,9 @@ mod tests {
         assert_eq!(state.scroll, layout.max_scroll);
 
         // Rows hidden under the caption or footer are not clickable.
-        let layout = PanelLayout::new(&mut state, &settings, 192, 520);
+        let layout = PanelLayout::new(&mut state, &settings, 192, work);
+        assert_eq!(caption, layout.title);
+        assert!((layout.scroll_thumb.unwrap().bottom - layout.view.bottom).abs() < 0.01);
         let first = layout.rows[0].card;
         assert!(first.bottom < layout.view.top);
         assert_eq!(layout.hit(800, (first.middle() * 2.) as i32), None);
@@ -523,7 +649,7 @@ mod tests {
     fn pages_wrap_and_reset_focus() {
         let settings = Settings::default();
         let mut state = PanelState::default();
-        let layout = PanelLayout::new(&mut state, &settings, 96, 4000);
+        let layout = PanelLayout::new(&mut state, &settings, 96, work(4000));
         state.key(Nav::Next, &layout);
         assert_eq!(state.focus, Some(0));
         let last = SECTIONS.len() - 1;
@@ -533,8 +659,56 @@ mod tests {
         );
         state.open_page(last);
         assert_eq!(state.focus, None);
-        let layout = PanelLayout::new(&mut state, &settings, 96, 4000);
+        let layout = PanelLayout::new(&mut state, &settings, 96, work(4000));
         assert_eq!(state.key(Nav::NextPage, &layout), Some(Action::Page(0)));
         assert_eq!(state.key(Nav::Activate, &layout), None);
+    }
+
+    #[test]
+    fn monitor_styles_and_gpu_checkbox_adjust_their_own_values() {
+        let mut state = PanelState::default();
+        state.open_page(
+            SECTIONS
+                .iter()
+                .position(|&s| s == Section::Monitor)
+                .unwrap(),
+        );
+        let layout = PanelLayout::new(&mut state, &Settings::default(), 144, work(2000));
+        for (index, row) in layout.rows.iter().enumerate() {
+            let Some(detail) = &row.detail else { continue };
+            let action_at = |area: Area| {
+                let (x, y) = center(area, layout.scale);
+                layout.hit(x, y)
+            };
+            match &detail.part {
+                Part::Segments { options, .. } => {
+                    for (i, &(area, _)) in options.iter().enumerate() {
+                        assert_eq!(
+                            action_at(area),
+                            Some(Action::Change(detail.key, Adjust::Pick(i)))
+                        );
+                    }
+                    let (_, y) = center(options[0].0, layout.scale);
+                    let gap = ((options[0].0.right + options[1].0.left) / 2. * layout.scale) as i32;
+                    assert_eq!(layout.hit(gap, y), None);
+                }
+                Part::Switch { area, .. } => {
+                    assert_eq!(detail.key, Key::Preview(PreviewKey::GpuTemperature));
+                    let toggle = Some(Action::Change(detail.key, Adjust::Toggle));
+                    assert_eq!(action_at(*area), toggle);
+                    assert_eq!(action_at(detail.label_area.unwrap()), toggle);
+                }
+                _ => panic!("unexpected monitor control"),
+            }
+            state.focus = Some(index);
+            assert_eq!(
+                state.key(Nav::Activate, &layout),
+                Some(Action::Change(row.key, Adjust::Toggle))
+            );
+            assert_eq!(
+                state.key(Nav::Increase, &layout),
+                Some(Action::Change(detail.key, Adjust::Step(1)))
+            );
+        }
     }
 }

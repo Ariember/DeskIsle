@@ -12,6 +12,23 @@ pub enum Key {
     HoverZoom,
     HideTaskbar,
     Autostart,
+    Preview(PreviewKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewKey {
+    ClockFormat,
+    ClockDate,
+    ClockWeekday,
+    Highlight,
+    Cpu,
+    CpuStyle,
+    Temperature,
+    GpuTemperature,
+    Memory,
+    MemoryStyle,
+    Disk,
+    DiskStyle,
 }
 
 /// A page of the settings panel, in navigation order.
@@ -20,9 +37,17 @@ pub enum Section {
     Appearance,
     Dock,
     System,
+    Clock,
+    Monitor,
 }
 
-pub const SECTIONS: &[Section] = &[Section::Appearance, Section::Dock, Section::System];
+pub const SECTIONS: &[Section] = &[
+    Section::Appearance,
+    Section::Dock,
+    Section::System,
+    Section::Clock,
+    Section::Monitor,
+];
 
 impl Section {
     pub fn title(self) -> &'static str {
@@ -30,6 +55,8 @@ impl Section {
             Section::Appearance => "外观",
             Section::Dock => "Dock",
             Section::System => "系统行为",
+            Section::Clock => "时间",
+            Section::Monitor => "监控",
         }
     }
 
@@ -39,7 +66,13 @@ impl Section {
             Section::Appearance => "\u{E790}",
             Section::Dock => "\u{E771}",
             Section::System => "\u{E770}",
+            Section::Clock => "\u{E823}",
+            Section::Monitor => "\u{E950}",
         }
+    }
+
+    pub fn is_preview(self) -> bool {
+        matches!(self, Self::Clock | Self::Monitor)
     }
 }
 
@@ -72,6 +105,8 @@ pub enum Store {
     File,
     /// The system keeps the value; the app layer reads it at startup and writes it on change.
     System,
+    /// UI preview for this run of DeskIsle.
+    Session,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +160,57 @@ pub const THEMES: &[Choice] = &[
         label: "深色",
     },
 ];
+
+const CLOCK_FORMATS: &[Choice] = &[
+    Choice {
+        id: "24h",
+        label: "24 小时",
+    },
+    Choice {
+        id: "12h",
+        label: "12 小时",
+    },
+];
+
+const MONITOR_STYLES: &[Choice] = &[
+    Choice {
+        id: "bar",
+        label: "条形",
+    },
+    Choice {
+        id: "ring",
+        label: "环形",
+    },
+    Choice {
+        id: "graph",
+        label: "曲线",
+    },
+    Choice {
+        id: "number",
+        label: "数值",
+    },
+];
+
+const fn preview(
+    key: PreviewKey,
+    id: &'static str,
+    section: Section,
+    label: &'static str,
+    help: &'static str,
+    control: Control,
+    default: i32,
+) -> Spec {
+    Spec {
+        key: Key::Preview(key),
+        id,
+        section,
+        label,
+        help,
+        control,
+        default,
+        store: Store::Session,
+    }
+}
 
 pub const SCHEMA: &[Spec] = &[
     Spec {
@@ -197,6 +283,114 @@ pub const SCHEMA: &[Spec] = &[
         default: 0,
         store: Store::System,
     },
+    preview(
+        PreviewKey::ClockFormat,
+        "clock.format",
+        Section::Clock,
+        "时间格式",
+        "顶部栏时钟的小时制",
+        Control::Choice(CLOCK_FORMATS),
+        0,
+    ),
+    preview(
+        PreviewKey::ClockDate,
+        "clock.date",
+        Section::Clock,
+        "显示日期",
+        "在时间旁显示月份和日期",
+        Control::Toggle,
+        1,
+    ),
+    preview(
+        PreviewKey::ClockWeekday,
+        "clock.weekday",
+        Section::Clock,
+        "显示星期",
+        "在日期旁显示星期几",
+        Control::Toggle,
+        0,
+    ),
+    preview(
+        PreviewKey::Highlight,
+        "monitor.highlight",
+        Section::Monitor,
+        "高占用提醒",
+        "资源占用过高时高亮显示",
+        Control::Toggle,
+        0,
+    ),
+    preview(
+        PreviewKey::Cpu,
+        "monitor.cpu",
+        Section::Monitor,
+        "CPU",
+        "",
+        Control::Toggle,
+        1,
+    ),
+    preview(
+        PreviewKey::CpuStyle,
+        "monitor.cpu_style",
+        Section::Monitor,
+        "显示样式",
+        "",
+        Control::Choice(MONITOR_STYLES),
+        3,
+    ),
+    preview(
+        PreviewKey::Temperature,
+        "monitor.temperature",
+        Section::Monitor,
+        "核心温度",
+        "",
+        Control::Toggle,
+        0,
+    ),
+    preview(
+        PreviewKey::GpuTemperature,
+        "monitor.gpu_temperature",
+        Section::Monitor,
+        "GPU",
+        "",
+        Control::Toggle,
+        0,
+    ),
+    preview(
+        PreviewKey::Memory,
+        "monitor.memory",
+        Section::Monitor,
+        "内存",
+        "",
+        Control::Toggle,
+        1,
+    ),
+    preview(
+        PreviewKey::MemoryStyle,
+        "monitor.memory_style",
+        Section::Monitor,
+        "显示样式",
+        "",
+        Control::Choice(MONITOR_STYLES),
+        0,
+    ),
+    preview(
+        PreviewKey::Disk,
+        "monitor.disk",
+        Section::Monitor,
+        "磁盘",
+        "",
+        Control::Toggle,
+        0,
+    ),
+    preview(
+        PreviewKey::DiskStyle,
+        "monitor.disk_style",
+        Section::Monitor,
+        "显示样式",
+        "",
+        Control::Choice(MONITOR_STYLES),
+        2,
+    ),
 ];
 
 pub fn spec(key: Key) -> &'static Spec {
@@ -443,5 +637,20 @@ mod tests {
             read.set_text(id, text).unwrap();
         }
         assert_eq!(read, settings);
+    }
+
+    #[test]
+    fn monitor_preview_keeps_style_when_toggled_and_stays_out_of_the_file() {
+        let mut settings = Settings::default();
+        let saved: Vec<_> = settings.file_entries().collect();
+        let cpu = Key::Preview(PreviewKey::Cpu);
+        let style = Key::Preview(PreviewKey::CpuStyle);
+        settings.adjust(style, Adjust::Pick(1));
+        settings.adjust(cpu, Adjust::Toggle);
+        assert!(!settings.enabled(cpu));
+        assert_eq!(settings.get(style), 1);
+        assert_eq!(settings.file_entries().collect::<Vec<_>>(), saved);
+        settings.set_text("monitor.cpu_style", "graph").unwrap();
+        assert_eq!(settings.get(style), 1);
     }
 }
