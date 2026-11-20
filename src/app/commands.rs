@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::Bars;
 use crate::dock::{self, Action, group_apps};
-use crate::platform::{self, shell};
+use crate::platform::{self, power, shell};
 use crate::storage;
 use crate::ui::layout::{StatusHit, SystemItem};
 use crate::ui::menu::{self, Command};
@@ -35,6 +35,11 @@ impl Bars {
             Command::Close(id, windows) => shell::close_windows(&id, &windows).map(drop),
             Command::TaskManager => shell::execute(owner, "taskmgr.exe"),
             Command::ShowDesktop => self.tray.toggle_desktop(),
+            Command::Sleep => power::sleep(owner),
+            Command::Restart => power::restart(),
+            Command::ShutDown => power::shut_down(),
+            Command::SignOut => power::sign_out(),
+            Command::Lock => power::lock(),
             Command::Settings => self.open_settings(),
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),

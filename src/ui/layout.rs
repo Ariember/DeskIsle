@@ -121,7 +121,9 @@ pub enum StatusHit {
     /// The active application's name.
     Title,
     Clock,
-    /// The mark and empty space.
+    /// The DeskIsle mark at the leading edge.
+    Mark,
+    /// Empty space.
     Bar,
 }
 
@@ -130,6 +132,8 @@ pub enum StatusHit {
 pub struct StatusLayout {
     pub width: i32,
     pub height: i32,
+    /// The DeskIsle mark, before the title.
+    pub mark: Rect,
     pub title: Rect,
     /// `index` refers to the shown tray icons in display order.
     pub tray: Vec<Slot>,
@@ -194,10 +198,14 @@ impl StatusLayout {
             })
             .collect();
         let title_x = px(34).min(tray_start);
+        // The mark's ring is drawn 18 DIPs from the leading edge.
+        let mark_x = px(4).min(title_x);
+        let mark = cell(mark_x, (px(32).min(title_x) - mark_x).max(0));
         let title = cell(title_x, (tray_start - px(12) - title_x).max(0));
         Self {
             width,
             height,
+            mark,
             title,
             tray,
             overflow,
@@ -215,6 +223,8 @@ impl StatusLayout {
             StatusHit::System(item)
         } else if self.clock.contains(x, y) {
             StatusHit::Clock
+        } else if self.mark.contains(x, y) {
+            StatusHit::Mark
         } else if self.title.contains(x, y) {
             StatusHit::Title
         } else {
@@ -232,6 +242,7 @@ impl StatusLayout {
                 found.map(|&(_, rect)| rect)
             }
             StatusHit::Clock => Some(self.clock),
+            StatusHit::Mark => Some(self.mark),
             StatusHit::Title | StatusHit::Bar => None,
         }
     }
@@ -327,7 +338,9 @@ mod tests {
             assert_eq!(layout.hit(last.x, 0), StatusHit::Tray(2));
             assert_eq!(layout.hit(last.x + last.width, 0), StatusHit::Overflow);
             assert_eq!(layout.hit(overflow.x - 1, height - 1), StatusHit::Tray(2));
-            assert_eq!(layout.hit(px(20), px(10)), StatusHit::Bar);
+            assert_eq!(layout.hit(px(18), px(10)), StatusHit::Mark);
+            assert_eq!(layout.hit(px(2), px(10)), StatusHit::Bar);
+            assert_eq!(layout.hit(px(33), px(10)), StatusHit::Bar);
             assert_eq!(layout.hit(layout.title.x, px(10)), StatusHit::Title);
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
@@ -355,6 +368,7 @@ mod tests {
             .unwrap();
         assert_eq!(target, control);
         assert_eq!(layout.target(StatusHit::Clock), Some(layout.clock));
+        assert_eq!(layout.target(StatusHit::Mark), Some(layout.mark));
         assert_eq!(layout.target(StatusHit::Bar), None);
     }
 }

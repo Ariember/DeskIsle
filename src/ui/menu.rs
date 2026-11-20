@@ -567,6 +567,14 @@ pub enum Command {
     Close(String, Vec<isize>),
     TaskManager,
     ShowDesktop,
+    /// Sleeps the computer, then returns once it wakes.
+    Sleep,
+    /// Restarting, shutting down and signing out let applications keep unsaved work.
+    Restart,
+    ShutDown,
+    SignOut,
+    /// Locks the screen.
+    Lock,
     Settings,
     DateTime,
     Notifications,
@@ -688,8 +696,8 @@ pub fn window_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
     menu
 }
 
-/// Empty space on either bar and the status bar mark: every application, a few system
-/// tools, and quitting DeskIsle.
+/// Empty space on either bar and a right click on the status bar mark: every
+/// application, a few system tools, and quitting DeskIsle.
 pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     let running = apps.iter().filter(|a| !a.windows.is_empty()).count();
@@ -743,6 +751,45 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
         Some(Command::Quit),
     )
     .danger = true;
+    menu
+}
+
+/// A click on the status bar mark: this computer, Windows settings and tools, then
+/// power and session commands. Those that end the session are marked as dangerous.
+pub fn mark_menu() -> Menu<Command> {
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
+    menu.item(
+        "关于本机",
+        Icon::Glyph("\u{E946}"),
+        Some(Command::Open("ms-settings:about")),
+    );
+    menu.separator();
+    menu.item(
+        "系统偏好设置",
+        Icon::Glyph("\u{E713}"),
+        Some(Command::Open("ms-settings:")),
+    );
+    menu.item(
+        "应用商店",
+        Icon::Glyph("\u{E719}"),
+        Some(Command::Open("ms-windows-store:")),
+    );
+    menu.separator();
+    menu.item(
+        "任务管理器",
+        Icon::Glyph("\u{E9D9}"),
+        Some(Command::TaskManager),
+    );
+    menu.separator();
+    menu.item("睡眠", Icon::Glyph("\u{E708}"), Some(Command::Sleep));
+    menu.item("重新启动", Icon::Glyph("\u{E72C}"), Some(Command::Restart))
+        .danger = true;
+    menu.item("关机", Icon::Glyph("\u{E7E8}"), Some(Command::ShutDown))
+        .danger = true;
+    menu.separator();
+    menu.item("锁定屏幕", Icon::Glyph("\u{E72E}"), Some(Command::Lock));
+    menu.item("注销", Icon::Glyph("\u{E748}"), Some(Command::SignOut))
+        .danger = true;
     menu
 }
 
@@ -924,6 +971,38 @@ mod tests {
                 Command::TrayToggle(3)
             ]
         );
+    }
+
+    #[test]
+    fn mark_menu_lists_system_tools_then_power_and_session() {
+        let mut menu = mark_menu();
+        assert_eq!(
+            commands(&menu),
+            [
+                Command::Open("ms-settings:about"),
+                Command::Open("ms-settings:"),
+                Command::Open("ms-windows-store:"),
+                Command::TaskManager,
+                Command::Sleep,
+                Command::Restart,
+                Command::ShutDown,
+                Command::Lock,
+                Command::SignOut,
+            ]
+        );
+        // Only the commands that end the session are drawn as dangerous.
+        for entry in &menu.entries {
+            if let Entry::Item(item) = entry {
+                let ends = matches!(
+                    item.command,
+                    Some(Command::Restart | Command::ShutDown | Command::SignOut)
+                );
+                assert_eq!(item.danger, ends, "{}", item.label);
+            }
+        }
+        let layout = MenuLayout::new(&mut menu, 96, measure);
+        assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
+        assert_eq!(layout.rows.len(), 13);
     }
 
     #[test]

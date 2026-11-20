@@ -32,7 +32,9 @@ impl Bars {
                     }
                     None => self.bar_menu(),
                 },
-                StatusHit::Bar => self.bar_menu(),
+                // A left click on the mark opens the system menu; a right click keeps
+                // DeskIsle's own menu with Settings and Quit.
+                StatusHit::Mark | StatusHit::Bar => self.bar_menu(),
             };
         }
         if owner != self.bottom.0 {
@@ -52,6 +54,13 @@ impl Bars {
         let menu = menu::bar_menu(&self.apps);
         let anchor = self.cursor_anchor()?;
         self.show_menu(menu, anchor)
+    }
+
+    /// The system menu, below the status bar mark.
+    pub(super) fn mark_menu(&mut self) -> Result<bool> {
+        let mark = self.status.mark;
+        let anchor = self.top_anchor(mark.x + mark.width / 2);
+        self.show_menu(menu::mark_menu(), anchor)
     }
 
     pub(super) fn clock_menu(&mut self) -> Result<bool> {
