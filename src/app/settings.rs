@@ -16,6 +16,15 @@ pub(super) struct Panel {
     state: PanelState,
     layout: PanelLayout,
     dpi: u32,
+    /// Whether the sidebar is painted translucent over the acrylic backdrop.
+    glass: bool,
+}
+
+/// The sidebar shows its backdrop only where DWM draws acrylic: the build supports it and
+/// transparency effects are on. Otherwise the opaque sidebar looks better than the flat
+/// fill DWM substitutes. An unreadable preference counts as off.
+fn glass(window: &PanelWindow) -> bool {
+    window.backdrop() && display::transparency().unwrap_or(false)
 }
 
 /// Settings saved by the user, falling back to defaults with a message when the file
@@ -80,23 +89,27 @@ impl Bars {
         dark(&self.settings)
     }
 
-    /// Switches the palette after the theme setting or Windows' app mode changed. The
-    /// bars repaint on their next draw; the open panel repaints here.
+    /// Switches the palette after the theme setting or Windows' app mode changed, and the
+    /// panel's sidebar after transparency effects were switched; Windows announces both
+    /// as a setting change. The bars repaint on their next draw; the panel repaints here.
     pub(super) fn apply_theme(&mut self) -> Result<()> {
         let dark = self.dark();
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        if !renderer.set_dark(dark) {
+        let repalette = renderer.set_dark(dark);
+        let Some(panel) = self.panel.as_mut() else {
+            return Ok(());
+        };
+        let glass = glass(&panel.window);
+        if !repalette && glass == panel.glass {
             return Ok(());
         }
-        match &self.panel {
-            Some(panel) => {
-                panel.window.set_dark(dark);
-                self.draw_panel()
-            }
-            None => Ok(()),
+        panel.glass = glass;
+        if repalette {
+            panel.window.set_dark(dark);
         }
+        self.draw_panel()
     }
 
     /// Message boxes belong to the panel while it is open.
@@ -118,9 +131,11 @@ impl Bars {
         let window = PanelWindow::create(
             layout.place(self.monitor.work),
             layout.caption_pixels(),
+            layout.sidebar_pixels(),
             self.dark(),
         )?;
         self.panel = Some(Panel {
+            glass: glass(&window),
             window,
             state,
             layout,
@@ -149,7 +164,7 @@ impl Bars {
         let (Some(panel), Some(renderer)) = (&self.panel, self.renderer.as_mut()) else {
             return Ok(());
         };
-        renderer.draw_panel(panel.window.0, &panel.layout, panel.dpi)
+        renderer.draw_panel(panel.window.0, &panel.layout, panel.dpi, panel.glass)
     }
 
     fn draw_panel(&mut self) -> Result<()> {
@@ -173,9 +188,13 @@ impl Bars {
         }
         if layout.pixels() != panel.layout.pixels() || layout.scale != panel.layout.scale {
             let (width, height) = layout.pixels();
-            panel
-                .window
-                .resize(width, height, work, layout.caption_pixels())?;
+            panel.window.resize(
+                width,
+                height,
+                work,
+                layout.caption_pixels(),
+                layout.sidebar_pixels(),
+            )?;
         }
         panel.layout = layout;
         self.draw_panel()

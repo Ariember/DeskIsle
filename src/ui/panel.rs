@@ -11,26 +11,34 @@ pub const WIDTH: f32 = 720.;
 pub const HEIGHT: f32 = 560.;
 const MIN_WIDTH: f32 = 600.;
 const MIN_HEIGHT: f32 = 260.;
-pub const CAPTION: f32 = 48.;
-const CLOSE_WIDTH: f32 = 46.;
-const NAV_LEFT: f32 = 12.;
-const NAV_RIGHT: f32 = 196.;
-const NAV_ITEM: f32 = 34.;
-const NAV_GAP: f32 = 4.;
-const CONTENT_LEFT: f32 = 212.;
-const CONTENT_RIGHT: f32 = 20.;
-const FOOTER: f32 = 60.;
-const CARD: f32 = 68.;
-const MONITOR_CARD: f32 = 78.;
+pub const CAPTION: f32 = 52.;
+/// The window buttons sit at the caption's top left, as in macOS: close, then the
+/// minimize and zoom lights the panel draws disabled. This is the close light's center.
+const LIGHT_X: f32 = 20.;
+/// Distance between the centers of neighboring window lights.
+pub const LIGHT_GAP: f32 = 20.;
+/// Half the close light's hit square, a little larger than the 12 DIP light.
+const LIGHT_HIT: f32 = 8.;
+const NAV_LEFT: f32 = 10.;
+const NAV_RIGHT: f32 = 192.;
+/// The sidebar's right edge, where the content area begins.
+pub const SIDEBAR: f32 = NAV_RIGHT + 8.;
+const NAV_ITEM: f32 = 32.;
+const NAV_GAP: f32 = 2.;
+const CONTENT_LEFT: f32 = 220.;
+const CONTENT_RIGHT: f32 = 24.;
+const FOOTER: f32 = 56.;
+/// Rows of a page stack into one grouped list without gaps.
+const CARD: f32 = 60.;
+const MONITOR_CARD: f32 = 76.;
 const MONITOR_INSET: f32 = 72.;
-const CARD_GAP: f32 = 8.;
 const CONTROL_INSET: f32 = 16.;
 const SWITCH_WIDTH: f32 = 40.;
-const SWITCH_HEIGHT: f32 = 20.;
-const STEP_BUTTON: f32 = 32.;
-const STEP_VALUE: f32 = 64.;
+const SWITCH_HEIGHT: f32 = 22.;
+const STEP_BUTTON: f32 = 28.;
+const STEP_VALUE: f32 = 60.;
 const SEGMENT: f32 = 56.;
-const CONTROL_HEIGHT: f32 = 32.;
+const CONTROL_HEIGHT: f32 = 28.;
 const RESET_WIDTH: f32 = 112.;
 /// Content moved per wheel notch, in DIPs.
 const SCROLL_STEP: f32 = 48.;
@@ -207,6 +215,7 @@ pub struct PanelLayout {
     pub scale: f32,
     pub width: f32,
     pub height: f32,
+    /// The close light's hit square; the other window lights follow at `LIGHT_GAP`.
     pub close: Area,
     pub nav: Vec<(Area, Section)>,
     pub page: usize,
@@ -230,12 +239,18 @@ impl PanelLayout {
         let height = (work.height as f32 / scale)
             .clamp(MIN_HEIGHT, HEIGHT)
             .floor();
-        let close = Area::new(width - CLOSE_WIDTH, 0., width, CAPTION - 8.);
+        let mid = CAPTION / 2.;
+        let close = Area::new(
+            LIGHT_X - LIGHT_HIT,
+            mid - LIGHT_HIT,
+            LIGHT_X + LIGHT_HIT,
+            mid + LIGHT_HIT,
+        );
         let nav = SECTIONS
             .iter()
             .enumerate()
             .map(|(i, &section)| {
-                let top = CAPTION + 8. + i as f32 * (NAV_ITEM + NAV_GAP);
+                let top = CAPTION + 4. + i as f32 * (NAV_ITEM + NAV_GAP);
                 (Area::new(NAV_LEFT, top, NAV_RIGHT, top + NAV_ITEM), section)
             })
             .collect();
@@ -243,7 +258,7 @@ impl PanelLayout {
         let section = SECTIONS[state.page];
         let view = Area::new(
             CONTENT_LEFT,
-            CAPTION + 12.,
+            CAPTION + 8.,
             width - CONTENT_RIGHT,
             height - FOOTER,
         );
@@ -259,7 +274,7 @@ impl PanelLayout {
             let height = if detail.is_some() { MONITOR_CARD } else { CARD };
             let card = Area::new(view.left, top, view.right, top + height);
             rows.push((spec, detail, card));
-            top = card.bottom + CARD_GAP;
+            top = card.bottom;
         }
         let content = top - view.top;
         let max_scroll = (content - (view.bottom - view.top)).max(0.);
@@ -294,7 +309,7 @@ impl PanelLayout {
             close,
             nav,
             page: state.page,
-            title: Area::new(view.left, 0., close.left, CAPTION),
+            title: Area::new(view.left, 0., view.right, CAPTION),
             view,
             rows,
             reset: Area::new(
@@ -318,12 +333,19 @@ impl PanelLayout {
         )
     }
 
-    /// The draggable caption: its height and where the close button begins, in pixels.
-    pub fn caption_pixels(&self) -> (i32, i32) {
+    /// The draggable caption: its height and the left and right edges of the close
+    /// light, which stays clickable, in pixels.
+    pub fn caption_pixels(&self) -> (i32, i32, i32) {
         (
             (CAPTION * self.scale).round() as i32,
             (self.close.left * self.scale).round() as i32,
+            (self.close.right * self.scale).round() as i32,
         )
+    }
+
+    /// The sidebar's width in client pixels, where the window shows its backdrop.
+    pub fn sidebar_pixels(&self) -> i32 {
+        (SIDEBAR * self.scale).round() as i32
     }
 
     /// Centers the window in `work`, in screen pixels.
@@ -552,6 +574,12 @@ mod tests {
                 assert_eq!(layout.hit(x, y), Some(Action::Page(page)));
                 let (x, y) = center(layout.close, s);
                 assert_eq!(layout.hit(x, y), Some(Action::Close));
+                // The window must not treat the close light as part of the drag caption.
+                let (caption, left, right) = layout.caption_pixels();
+                assert!(y < caption && (left..right).contains(&x));
+                assert!(layout.nav[0].0.top >= CAPTION);
+                // The backdrop region covers the whole sidebar and none of the content.
+                assert!(layout.nav[page].0.right < SIDEBAR && layout.view.left > SIDEBAR);
                 let (x, y) = center(layout.reset, s);
                 assert_eq!(layout.hit(x, y), Some(Action::Reset));
                 for row in &layout.rows {
@@ -641,8 +669,9 @@ mod tests {
         assert_eq!(caption, layout.title);
         assert!((layout.scroll_thumb.unwrap().bottom - layout.view.bottom).abs() < 0.01);
         let first = layout.rows[0].card;
-        assert!(first.bottom < layout.view.top);
-        assert_eq!(layout.hit(800, (first.middle() * 2.) as i32), None);
+        assert!(first.top < layout.view.top);
+        let hidden = (first.top + layout.view.top) / 2.;
+        assert_eq!(layout.hit(800, (hidden * 2.) as i32), None);
     }
 
     #[test]

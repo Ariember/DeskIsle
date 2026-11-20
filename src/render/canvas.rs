@@ -16,6 +16,8 @@ pub(super) type Rgb = (u8, u8, u8);
 /// so the same alphas read on both light and dark surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
+    /// Whether this is the dark appearance, for surfaces that pick their own tones.
+    pub(super) dark: bool,
     pub(super) bar: Rgb,
     pub(super) panel: Rgb,
     pub(super) panel_top: Rgb,
@@ -34,6 +36,7 @@ impl Palette {
     pub fn new(dark: bool) -> Self {
         if dark {
             Self {
+                dark,
                 bar: (16, 16, 16),
                 panel: (26, 26, 26),
                 panel_top: (40, 40, 40),
@@ -47,6 +50,7 @@ impl Palette {
             }
         } else {
             Self {
+                dark,
                 bar: (246, 246, 246),
                 panel: (238, 238, 238),
                 panel_top: (252, 252, 252),

@@ -54,6 +54,29 @@ pub fn system_dark() -> Result<bool> {
     Ok(light == 0)
 }
 
+/// Whether "Transparency effects" is on in Personalization > Colors. Windows treats a
+/// missing value as on.
+pub fn transparency() -> Result<bool> {
+    let mut enabled = 1u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PERSONALIZE,
+            w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut enabled).cast()),
+            Some(&mut size),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(true);
+    }
+    status.ok()?;
+    Ok(enabled != 0)
+}
+
 /// Switches Windows and its apps between light and dark mode, as the Personalization
 /// page does, then tells running applications to repaint.
 pub fn set_system_dark(dark: bool) -> Result<()> {

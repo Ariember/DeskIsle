@@ -17,8 +17,9 @@ use windows::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{
-            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+            DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -405,9 +406,9 @@ impl Event {
 thread_local! {
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
-    /// The settings panel's caption height and the left edge of its close button, in
-    /// client pixels, for hit testing inside its window procedure.
-    static PANEL_CAPTION: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// The settings panel's caption height and the left and right edges of its close
+    /// button, in client pixels, for hit testing inside its window procedure.
+    static PANEL_CAPTION: Cell<(i32, i32, i32)> = const { Cell::new((0, 0, 0)) };
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -653,12 +654,14 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 /// The settings window. It has a caption style so DWM gives it a shadow, rounded corners
 /// and a place in Alt+Tab, while its client area covers the frame and DeskIsle draws it.
-pub struct PanelWindow(pub HWND);
+/// The second field records whether DWM accepted the acrylic backdrop for the sidebar.
+pub struct PanelWindow(pub HWND, bool);
 
 impl PanelWindow {
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
-    /// height and the left edge of the close button, in client pixels.
-    pub fn create(r: Rect, caption: (i32, i32), dark: bool) -> Result<Self> {
+    /// height and the left and right edges of the close button, and `sidebar` the
+    /// sidebar's width, in client pixels.
+    pub fn create(r: Rect, caption: (i32, i32, i32), sidebar: i32, dark: bool) -> Result<Self> {
         PANEL_CAPTION.set(caption);
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -676,7 +679,18 @@ impl PanelWindow {
                 Some(instance.into()),
                 None,
             )?;
-            let window = Self(hwnd);
+            // Acrylic blurs whatever lies behind the window, like the vibrancy of a macOS
+            // sidebar. Builds before Windows 11 22H2 reject the attribute, and the
+            // renderer then paints over the sidebar opaquely.
+            let backdrop = DWMSBT_TRANSIENTWINDOW;
+            let glass = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                (&raw const backdrop).cast(),
+                size_of_val(&backdrop) as u32,
+            )
+            .is_ok();
+            let window = Self(hwnd, glass);
             window.set_dark(dark);
             // Cosmetic only: builds without this attribute keep square corners.
             let round = DWMWCP_ROUND;
@@ -686,15 +700,29 @@ impl PanelWindow {
                 (&raw const round).cast(),
                 size_of_val(&round) as u32,
             );
-            let margins = MARGINS {
-                cxLeftWidth: 1,
-                cxRightWidth: 1,
-                cyTopHeight: 1,
-                cyBottomHeight: 1,
-            };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            window.extend_frame(sidebar);
             Ok(window)
         }
+    }
+
+    /// Whether DWM draws the acrylic backdrop under the sidebar. With transparency
+    /// effects off, DWM shows a flat fill there instead.
+    pub fn backdrop(&self) -> bool {
+        self.1
+    }
+
+    /// DWM draws the backdrop only where the frame extends into the client area. It
+    /// extends under the sidebar alone: across the whole window DWM would also draw its
+    /// own caption buttons over the top right corner.
+    fn extend_frame(&self, sidebar: i32) {
+        let margins = MARGINS {
+            cxLeftWidth: if self.1 { sidebar.max(1) } else { 1 },
+            cxRightWidth: 1,
+            cyTopHeight: 1,
+            cyBottomHeight: 1,
+        };
+        // Cosmetic only: without it the window keeps the DWM frame's default look.
+        let _ = unsafe { DwmExtendFrameIntoClientArea(self.0, &margins) };
     }
 
     /// Matches the frame DWM draws around the panel, such as its border, to the palette.
@@ -720,8 +748,16 @@ impl PanelWindow {
     }
 
     /// Resizes the window around its current center, kept inside `work`.
-    pub fn resize(&self, width: i32, height: i32, work: Rect, caption: (i32, i32)) -> Result<()> {
+    pub fn resize(
+        &self,
+        width: i32,
+        height: i32,
+        work: Rect,
+        caption: (i32, i32, i32),
+        sidebar: i32,
+    ) -> Result<()> {
         PANEL_CAPTION.set(caption);
+        self.extend_frame(sidebar);
         let mut r = RECT::default();
         unsafe { GetWindowRect(self.0, &mut r)? };
         let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
@@ -766,12 +802,15 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
     let event = match msg {
         // The client area takes the whole window; DeskIsle draws the caption itself.
-        WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        // Both forms must keep the window rectangle: CreateWindowEx sends the one without
+        // `wParam`, and the system caption would stay until the next frame change.
+        WM_NCCALCSIZE => return LRESULT(0),
         WM_NCHITTEST => {
             let mut point = POINT { x, y };
             let _ = unsafe { ScreenToClient(hwnd, &mut point) };
-            let (caption, close) = PANEL_CAPTION.get();
-            let hit = if (0..caption).contains(&point.y) && point.x < close {
+            let (caption, close_left, close_right) = PANEL_CAPTION.get();
+            let on_close = (close_left..close_right).contains(&point.x);
+            let hit = if (0..caption).contains(&point.y) && !on_close {
                 HTCAPTION
             } else {
                 HTCLIENT
