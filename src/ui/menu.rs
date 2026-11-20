@@ -20,6 +20,11 @@ pub enum Icon {
     Window {
         active: bool,
     },
+    /// A glyph in a circle that fills in when the option is on or selected.
+    Choice {
+        glyph: &'static str,
+        on: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +39,34 @@ pub struct Item<C> {
     pub danger: bool,
 }
 
+/// A value the user drags, such as the volume. The coordinator applies the value while
+/// the menu stays open.
+#[derive(Clone, Debug)]
+pub struct Slider<C> {
+    pub target: SliderTarget,
+    /// Percent, or `None` when the feature is unavailable.
+    pub value: Option<u8>,
+    pub glyph: &'static str,
+    /// Chosen by clicking the glyph at the start of the track, such as muting.
+    pub button: Option<C>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderTarget {
+    Volume,
+    Brightness,
+}
+
+/// One of several quick toggles that share a row.
+#[derive(Clone, Debug)]
+pub struct Tile<C> {
+    pub glyph: &'static str,
+    pub title: String,
+    pub detail: String,
+    pub on: bool,
+    pub command: Option<C>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Entry<C> {
     Header {
@@ -42,19 +75,36 @@ pub enum Entry<C> {
         icon: Icon,
     },
     Item(Item<C>),
+    /// A small heading above a group.
+    Label(String),
+    Slider(Slider<C>),
+    Tiles(Vec<Tile<C>>),
+    /// What is playing, with buttons at the trailing edge.
+    Player {
+        title: String,
+        detail: String,
+        buttons: Vec<(&'static str, Option<C>)>,
+    },
     Separator,
 }
 
 #[derive(Clone, Debug)]
 pub struct Menu<C> {
     pub entries: Vec<Entry<C>>,
+    /// The narrowest the panel gets, in DIPs.
+    pub min_width: f32,
 }
 
 impl<C> Menu<C> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            min_width: MIN_WIDTH,
         }
+    }
+
+    pub fn label(&mut self, text: impl Into<String>) {
+        self.entries.push(Entry::Label(text.into()));
     }
 
     pub fn header(&mut self, title: impl Into<String>, subtitle: impl Into<String>, icon: Icon) {
@@ -88,7 +138,10 @@ impl<C> Menu<C> {
     /// Separates groups. Leading and repeated separators are dropped, and a trailing
     /// one is removed by [`MenuLayout::new`].
     pub fn separator(&mut self) {
-        if matches!(self.entries.last(), Some(Entry::Item(_))) {
+        if !matches!(
+            self.entries.last(),
+            None | Some(Entry::Separator | Entry::Header { .. } | Entry::Label(_))
+        ) {
             self.entries.push(Entry::Separator);
         }
     }
@@ -97,6 +150,16 @@ impl<C> Menu<C> {
     pub fn command(&self, index: usize) -> Option<&C> {
         match self.entries.get(index)? {
             Entry::Item(item) => item.command.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The command of part `part` of a tile row, the player, or a slider's glyph.
+    pub fn part_command(&self, index: usize, part: usize) -> Option<&C> {
+        match self.entries.get(index)? {
+            Entry::Tiles(tiles) => tiles.get(part)?.command.as_ref(),
+            Entry::Player { buttons, .. } => buttons.get(part)?.1.as_ref(),
+            Entry::Slider(slider) if part == 0 => slider.button.as_ref(),
             _ => None,
         }
     }
@@ -131,6 +194,16 @@ pub const PADDING: f32 = 5.;
 pub const ITEM_HEIGHT: f32 = 32.;
 pub const HEADER_HEIGHT: f32 = 52.;
 const SEPARATOR_HEIGHT: f32 = 9.;
+pub const LABEL_HEIGHT: f32 = 26.;
+pub const SLIDER_HEIGHT: f32 = 40.;
+/// The slider's pill-shaped track, centered in its row.
+pub const TRACK_HEIGHT: f32 = 26.;
+pub const TILE_HEIGHT: f32 = 60.;
+pub const TILE_GAP: f32 = 8.;
+pub const PLAYER_HEIGHT: f32 = 56.;
+pub const PLAYER_BUTTON: f32 = 34.;
+/// Inset of sliders, tiles and the player from the panel's padding.
+pub const BLOCK_INSET: f32 = 6.;
 /// Horizontal room before the label for icons and window marks.
 pub const ICON_COLUMN: f32 = 34.;
 pub const CHECK_COLUMN: f32 = 28.;
@@ -159,6 +232,10 @@ pub enum Hit {
     /// A header, separator, disabled item or the panel padding.
     Inert,
     Item(usize),
+    /// Part of a tile row, the player or a slider's glyph, with an enabled command.
+    Part(usize, usize),
+    /// The track of an available slider, with the value at the pointer.
+    Slider(usize, u8),
 }
 
 /// A menu's geometry in DIPs, with the panel inset by [`SHADOW`] inside the window.
@@ -209,6 +286,38 @@ impl MenuLayout {
                     content = content.max(width + TEXT_INSET);
                     ITEM_HEIGHT
                 }
+                Entry::Label(text) => {
+                    let width = measure(text, DETAIL_SIZE, true);
+                    content = content.max(TEXT_INSET + width + TEXT_INSET);
+                    LABEL_HEIGHT
+                }
+                Entry::Slider(_) => {
+                    content = content.max(220.);
+                    SLIDER_HEIGHT
+                }
+                Entry::Tiles(tiles) => {
+                    let widest = tiles
+                        .iter()
+                        .map(|t| {
+                            measure(&t.title, DETAIL_SIZE, true).max(measure(&t.detail, 11., false))
+                        })
+                        .fold(0., f32::max);
+                    let n = tiles.len() as f32;
+                    let row = n * (46. + widest + 10.) + (n - 1.).max(0.) * TILE_GAP;
+                    content = content.max(row + 2. * BLOCK_INSET);
+                    TILE_HEIGHT
+                }
+                Entry::Player {
+                    title,
+                    detail,
+                    buttons,
+                } => {
+                    let text =
+                        measure(title, LABEL_SIZE, true).max(measure(detail, DETAIL_SIZE, false));
+                    let controls = buttons.len() as f32 * PLAYER_BUTTON;
+                    content = content.max(2. * BLOCK_INSET + 50. + text.min(180.) + controls + 12.);
+                    PLAYER_HEIGHT
+                }
                 Entry::Separator => SEPARATOR_HEIGHT,
             };
             rows.push((y, y + height));
@@ -217,7 +326,9 @@ impl MenuLayout {
         if checks {
             content += CHECK_COLUMN;
         }
-        let panel = (content + 2. * PADDING).ceil().clamp(MIN_WIDTH, MAX_WIDTH);
+        let panel = (content + 2. * PADDING)
+            .ceil()
+            .clamp(menu.min_width.min(MAX_WIDTH), MAX_WIDTH);
         Self {
             scale: dpi as f32 / 96.,
             width: panel + 2. * SHADOW,
@@ -246,15 +357,95 @@ impl MenuLayout {
         (SHADOW + PADDING, top, self.width - SHADOW - PADDING, bottom)
     }
 
+    /// The area of a slider, tile row or player inside entry `index`'s row.
+    pub fn block(&self, index: usize) -> (f32, f32, f32, f32) {
+        let (left, top, right, bottom) = self.row(index);
+        (
+            left + BLOCK_INSET,
+            top + 4.,
+            right - BLOCK_INSET,
+            bottom - 4.,
+        )
+    }
+
+    /// The pill track of the slider in entry `index`.
+    pub fn track(&self, index: usize) -> (f32, f32, f32, f32) {
+        let (left, _, right, _) = self.block(index);
+        let (top, bottom) = self.rows[index];
+        let middle = (top + bottom) / 2.;
+        (
+            left,
+            middle - TRACK_HEIGHT / 2.,
+            right,
+            middle + TRACK_HEIGHT / 2.,
+        )
+    }
+
+    /// The slider value under client pixel `x`, along the stretch of the track the
+    /// knob's center can reach.
+    pub fn slider_value(&self, index: usize, x: i32) -> u8 {
+        let (left, _, right, _) = self.track(index);
+        let half = TRACK_HEIGHT / 2.;
+        let (start, end) = (left + half, right - half);
+        let t = ((x as f32 / self.scale - start) / (end - start)).clamp(0., 1.);
+        (t * 100.).round() as u8
+    }
+
+    /// Tile `part` of `count` tiles sharing entry `index`'s row.
+    pub fn tile(&self, index: usize, part: usize, count: usize) -> (f32, f32, f32, f32) {
+        let (left, top, right, bottom) = self.block(index);
+        let count = count.max(1) as f32;
+        let width = (right - left - (count - 1.) * TILE_GAP) / count;
+        let l = left + part as f32 * (width + TILE_GAP);
+        (l, top, l + width, bottom)
+    }
+
+    /// Button `part` of `count` buttons at the trailing edge of the player.
+    pub fn player_button(&self, index: usize, part: usize, count: usize) -> (f32, f32, f32, f32) {
+        let (_, top, right, bottom) = self.block(index);
+        let middle = (top + bottom) / 2.;
+        let l = right - 8. - (count - part) as f32 * PLAYER_BUTTON;
+        let half = PLAYER_BUTTON / 2.;
+        (l, middle - half, l + PLAYER_BUTTON, middle + half)
+    }
+
     /// `x` and `y` are client pixels of the menu window.
     pub fn hit<C>(&self, menu: &Menu<C>, x: i32, y: i32) -> Hit {
+        let pixel_x = x;
         let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
         let (left, top, right, bottom) = self.panel();
         if !(left..right).contains(&x) || !(top..bottom).contains(&y) {
             return Hit::Outside;
         }
-        match self.rows.iter().position(|&(t, b)| (t..b).contains(&y)) {
-            Some(index) if menu.enabled(index) => Hit::Item(index),
+        let Some(index) = self.rows.iter().position(|&(t, b)| (t..b).contains(&y)) else {
+            return Hit::Inert;
+        };
+        let inside =
+            |(l, t, r, b): (f32, f32, f32, f32)| (l..r).contains(&x) && (t..b).contains(&y);
+        let part = |part: usize| match menu.part_command(index, part) {
+            Some(_) => Hit::Part(index, part),
+            None => Hit::Inert,
+        };
+        match &menu.entries[index] {
+            Entry::Item(_) if menu.enabled(index) => Hit::Item(index),
+            Entry::Tiles(tiles) => (0..tiles.len())
+                .find(|&i| inside(self.tile(index, i, tiles.len())))
+                .map_or(Hit::Inert, part),
+            Entry::Player { buttons, .. } => (0..buttons.len())
+                .find(|&i| inside(self.player_button(index, i, buttons.len())))
+                .map_or(Hit::Inert, part),
+            Entry::Slider(slider) => {
+                let track = self.track(index);
+                if !inside(track) {
+                    Hit::Inert
+                } else if slider.button.is_some() && x < track.0 + TRACK_HEIGHT {
+                    Hit::Part(index, 0)
+                } else if slider.value.is_some() {
+                    Hit::Slider(index, self.slider_value(index, pixel_x))
+                } else {
+                    Hit::Inert
+                }
+            }
             _ => Hit::Inert,
         }
     }
@@ -312,6 +503,10 @@ pub enum Command {
     Notifications,
     TrayActivate(usize),
     TrayToggle(usize),
+    /// Opens a settings page or another URI with the Shell.
+    Open(&'static str),
+    /// Changes a system feature from a status bar flyout, which stays open.
+    System(crate::ui::system::SystemCommand),
     Quit,
 }
 

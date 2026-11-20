@@ -1,3 +1,8 @@
+pub mod audio;
+pub mod display;
+pub mod media;
+pub mod network;
+pub mod power;
 pub mod shell;
 pub mod startup;
 pub mod taskbar;
@@ -303,6 +308,8 @@ pub enum Event {
     Press(HWND, bool),
     /// Pointer input in the open menu window, in its client pixels.
     MenuMove(i32, i32),
+    /// The left button went down in the menu, which may start dragging a slider.
+    MenuPress(i32, i32),
     MenuLeave,
     MenuPick(i32, i32),
     MenuKey(MenuKey),
@@ -315,6 +322,10 @@ pub enum Event {
     /// Explorer started again and expects appbars and tray icons to register.
     ShellRestart,
     Tray,
+    /// The default output's volume or mute changed.
+    Audio,
+    /// The power source or battery charge changed.
+    Power,
     Scroll(i16),
     /// Pointer input in the settings panel, in its client pixels.
     PanelMove(i32, i32),
@@ -333,6 +344,7 @@ impl Event {
         matches!(
             self,
             Event::MenuMove(..)
+                | Event::MenuPress(..)
                 | Event::MenuLeave
                 | Event::MenuPick(..)
                 | Event::MenuKey(_)
@@ -374,6 +386,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         shell::WINDOWS_CHANGED => Event::Refresh,
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => Event::Display,
+        WM_POWERBROADCAST if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize => Event::Power,
+        audio::AUDIO_CHANGED => Event::Audio,
         m if m != 0 && m == TASKBAR_CREATED.get() => Event::ShellRestart,
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),
@@ -406,6 +420,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::Press(..)
                     | Event::Scroll(_)
                     | Event::MenuPick(..)
+                    | Event::MenuPress(..)
                     | Event::MenuKey(_)
                     | Event::PanelClick(..)
                     | Event::PanelScroll(_)
@@ -518,6 +533,31 @@ impl MenuWindow {
     pub fn is_foreground(&self) -> bool {
         unsafe { GetForegroundWindow() == self.0 }
     }
+
+    /// Keeps pointer input coming while a slider is dragged outside the menu.
+    pub fn capture(&self) {
+        unsafe { SetCapture(self.0) };
+    }
+
+    pub fn release(&self) {
+        let _ = unsafe { ReleaseCapture() };
+    }
+
+    /// Moves and resizes the menu after its content changed, in screen pixels.
+    pub fn place(&self, r: Rect) {
+        // A failed move leaves the old size; the next rebuild tries again.
+        let _ = unsafe {
+            SetWindowPos(
+                self.0,
+                Some(HWND_TOPMOST),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                SWP_NOACTIVATE,
+            )
+        };
+    }
 }
 
 impl Drop for MenuWindow {
@@ -542,6 +582,7 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             Event::MenuMove(x, y)
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
+        WM_LBUTTONDOWN => Event::MenuPress(x, y),
         WM_LBUTTONUP | WM_RBUTTONUP => Event::MenuPick(x, y),
         WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
             VK_DOWN => MenuKey::Down,
@@ -567,7 +608,7 @@ pub struct PanelWindow(pub HWND);
 impl PanelWindow {
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
     /// height and the left edge of the close button, in client pixels.
-    pub fn create(r: Rect, caption: (i32, i32)) -> Result<Self> {
+    pub fn create(r: Rect, caption: (i32, i32), dark: bool) -> Result<Self> {
         PANEL_CAPTION.set(caption);
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -585,14 +626,9 @@ impl PanelWindow {
                 Some(instance.into()),
                 None,
             )?;
-            // Cosmetic only: builds without these attributes keep square corners.
-            let dark = BOOL::from(true);
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&raw const dark).cast(),
-                size_of::<BOOL>() as u32,
-            );
+            let window = Self(hwnd);
+            window.set_dark(dark);
+            // Cosmetic only: builds without this attribute keep square corners.
             let round = DWMWCP_ROUND;
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -607,8 +643,22 @@ impl PanelWindow {
                 cyBottomHeight: 1,
             };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-            Ok(Self(hwnd))
+            Ok(window)
         }
+    }
+
+    /// Matches the frame DWM draws around the panel, such as its border, to the palette.
+    pub fn set_dark(&self, dark: bool) {
+        let dark = BOOL::from(dark);
+        // Cosmetic only: older builds ignore the attribute.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.0,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const dark).cast(),
+                size_of::<BOOL>() as u32,
+            )
+        };
     }
 
     /// Shows the panel, or brings it back to the front when it is already open.

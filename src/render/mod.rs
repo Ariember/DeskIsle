@@ -28,9 +28,10 @@ use windows::Win32::{
 };
 use windows::core::{Error, HSTRING, Interface, Result};
 
-use crate::ui::layout::StatusLayout;
+use crate::ui::layout::{StatusLayout, SystemItem};
+use crate::ui::system::Mark;
 
-use self::canvas::{BAR, EDGE, INK, MINT, MUTED, paint};
+use self::canvas::{Palette, Text, paint};
 use self::menu::MenuView;
 use self::panel::PanelView;
 
@@ -65,6 +66,7 @@ pub struct Renderer {
     top_state: Option<TopState>,
     menu: Option<MenuView>,
     panel: Option<PanelView>,
+    palette: Palette,
 }
 
 #[derive(PartialEq)]
@@ -74,6 +76,8 @@ struct TopState {
     title: String,
     time: String,
     stamps: Vec<u64>,
+    marks: Vec<Mark>,
+    open: Option<SystemItem>,
 }
 
 struct Bar {
@@ -164,7 +168,7 @@ impl IconLayer {
 
 impl Renderer {
     /// Both HWNDs belong to this UI thread and outlive the renderer.
-    pub fn new(top: HWND, bottom: HWND) -> Result<Self> {
+    pub fn new(top: HWND, bottom: HWND, dark: bool) -> Result<Self> {
         unsafe {
             let create = |driver| -> Result<ID3D11Device> {
                 let mut device = None;
@@ -200,8 +204,24 @@ impl Renderer {
                 top_state: None,
                 menu: None,
                 panel: None,
+                palette: Palette::new(dark),
             })
         }
+    }
+
+    /// Switches between the light and dark palette. Returns whether it changed; the bars
+    /// repaint on their next draw, and the caller repaints the open settings panel.
+    pub fn set_dark(&mut self, dark: bool) -> bool {
+        let palette = Palette::new(dark);
+        if self.palette == palette {
+            return false;
+        }
+        self.palette = palette;
+        self.top_state = None;
+        self.bottom_size = None;
+        // Icon layers hold fallback tiles painted in the old colors.
+        self.icons.clear();
+        true
     }
 
     pub fn check_device(&self) -> Result<()> {
@@ -215,6 +235,9 @@ impl Renderer {
     }
 
     /// `icons[i]` is drawn in `layout.tray[i]`; the stamp identifies its current image.
+    /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the control
+    /// whose flyout is `open`.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_top(
         &mut self,
         layout: &StatusLayout,
@@ -222,6 +245,8 @@ impl Renderer {
         title: &str,
         time: &str,
         icons: &[(Option<HICON>, u64)],
+        marks: &[Mark],
+        open: Option<SystemItem>,
     ) -> Result<()> {
         let state = TopState {
             layout: layout.clone(),
@@ -229,6 +254,8 @@ impl Renderer {
             title: title.into(),
             time: time.into(),
             stamps: icons.iter().map(|&(_, stamp)| stamp).collect(),
+            marks: marks.to_vec(),
+            open,
         };
         if self.top_state.as_ref() == Some(&state) {
             return Ok(());
@@ -237,57 +264,102 @@ impl Renderer {
         let dip = |px: i32| px as f32 / s;
         let w = dip(layout.width);
         let h = dip(layout.height);
-        let surface = paint(&self.device, layout.width, layout.height, dpi, |c| {
-            // Flush with the screen edge: a solid strip with a hairline toward the desktop.
-            c.round(0., 0., w, h, 0., BAR)?;
-            c.round(0., h - 1., w, h, 0., EDGE)?;
-            c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., MINT)?;
-            c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., MINT)?;
-            let t = layout.title;
-            c.text(
-                &self.write,
-                title,
-                c.rect(dip(t.x), 0., dip(t.x + t.width), h),
-                13.,
-                true,
-                INK,
-            )?;
-            let icon_size = (16. * s).round();
-            for (slot, &(icon, _)) in layout.tray.iter().zip(icons) {
-                let r = slot.rect;
-                let bitmap = icon.and_then(|icon| self.hicon_bitmap(icon).ok());
-                match bitmap {
-                    Some(bitmap) => {
-                        let left = (r.x as f32 + (r.width as f32 - icon_size) / 2.).round();
-                        let top = (r.y as f32 + (r.height as f32 - icon_size) / 2.).round();
-                        c.bitmap(&bitmap, c.pixels(left, top, icon_size))?;
-                    }
-                    // An icon without a usable image keeps its slot visible and clickable.
-                    None => {
-                        let x = dip(r.x + r.width / 2);
-                        c.round(x - 3., h / 2. - 3., x + 3., h / 2. + 3., 3., MUTED)?
+        let surface = paint(
+            &self.device,
+            self.palette,
+            layout.width,
+            layout.height,
+            dpi,
+            |c| {
+                // Flush with the screen edge: a solid strip with a hairline toward the desktop.
+                c.round(0., 0., w, h, 0., c.p.bar)?;
+                c.round(0., h - 1., w, h, 0., c.p.edge)?;
+                c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., c.p.accent)?;
+                c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., c.p.accent)?;
+                let t = layout.title;
+                c.text(
+                    &self.write,
+                    title,
+                    c.rect(dip(t.x), 0., dip(t.x + t.width), h),
+                    13.,
+                    true,
+                    c.p.ink,
+                )?;
+                let icon_size = (16. * s).round();
+                for (slot, &(icon, _)) in layout.tray.iter().zip(icons) {
+                    let r = slot.rect;
+                    let bitmap = icon.and_then(|icon| self.hicon_bitmap(icon).ok());
+                    match bitmap {
+                        Some(bitmap) => {
+                            let left = (r.x as f32 + (r.width as f32 - icon_size) / 2.).round();
+                            let top = (r.y as f32 + (r.height as f32 - icon_size) / 2.).round();
+                            c.bitmap(&bitmap, c.pixels(left, top, icon_size))?;
+                        }
+                        // An icon without a usable image keeps its slot visible and clickable.
+                        None => {
+                            let x = dip(r.x + r.width / 2);
+                            c.round(x - 3., h / 2. - 3., x + 3., h / 2. + 3., 3., c.p.muted)?
+                        }
                     }
                 }
-            }
-            if let Some(r) = layout.overflow {
-                c.glyph(
+                if let Some(r) = layout.overflow {
+                    c.glyph(
+                        &self.write,
+                        "\u{E70D}",
+                        c.rect(dip(r.x), 0., dip(r.x + r.width), h),
+                        10.,
+                        c.p.muted,
+                    )?;
+                }
+                for (&(item, r), mark) in layout.system.iter().zip(marks) {
+                    let (l, right) = (dip(r.x), dip(r.x + r.width));
+                    if open == Some(item) {
+                        c.fill(l + 1., 3., right - 1., h - 3., 6., c.p.line, 0.14)?;
+                    }
+                    match *mark {
+                        Mark::Glyph { glyph, dim } => c.draw_text(
+                            &self.write,
+                            glyph,
+                            c.rect(l, 0., right, h),
+                            Text {
+                                size: 15.,
+                                glyph: true,
+                                align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                                ..Text::default()
+                            },
+                            c.p.ink,
+                            if dim { 0.4 } else { 1. },
+                        )?,
+                        Mark::Switches => {
+                            // Two small switches, the upper one on.
+                            let x = (l + right) / 2.;
+                            let y = h / 2.;
+                            for (top, on) in [(y - 6., true), (y + 1., false)] {
+                                c.stroke(x - 7., top, x + 7., top + 5.5, 2.75, c.p.ink, 1.)?;
+                                let knob = if on { x + 4.25 } else { x - 4.25 };
+                                c.round(
+                                    knob - 1.75,
+                                    top + 1.,
+                                    knob + 1.75,
+                                    top + 4.5,
+                                    1.75,
+                                    c.p.ink,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                let r = layout.clock;
+                c.text(
                     &self.write,
-                    "\u{E70D}",
+                    time,
                     c.rect(dip(r.x), 0., dip(r.x + r.width), h),
-                    10.,
-                    MUTED,
-                )?;
-            }
-            let r = layout.clock;
-            c.text(
-                &self.write,
-                time,
-                c.rect(dip(r.x), 0., dip(r.x + r.width), h),
-                13.,
-                true,
-                INK,
-            )
-        })?;
+                    13.,
+                    true,
+                    c.p.ink,
+                )
+            },
+        )?;
         unsafe {
             self.top.root.SetContent(&surface)?;
             self.device.Commit()?;
@@ -317,15 +389,15 @@ impl Renderer {
             let s = dpi as f32 / 96.;
             let w = width as f32 / s;
             let h = height as f32 / s;
-            let surface = paint(&self.device, width, height, dpi, |c| {
+            let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
                 c.panel(w, h, 18.)?;
                 for icon in items.iter().filter(|i| i.running) {
                     let x = icon.center_x as f32 / s;
                     let half = if icon.active { 5. } else { 2. };
                     if icon.active {
                         // A soft wash behind the foreground application's icon.
-                        c.fill(x - 21., 5., x + 21., h - 4., 11., MINT, 0.07)?;
-                        c.fill(x - 9., h - 9.5, x + 9., h - 3.5, 3., MINT, 0.18)?;
+                        c.fill(x - 21., 5., x + 21., h - 4., 11., c.p.accent, 0.07)?;
+                        c.fill(x - 9., h - 9.5, x + 9., h - 3.5, 3., c.p.accent, 0.18)?;
                     }
                     c.round(
                         x - half,
@@ -333,7 +405,7 @@ impl Renderer {
                         x + half,
                         h - 5.,
                         1.5,
-                        if icon.active { MINT } else { MUTED },
+                        if icon.active { c.p.accent } else { c.p.muted },
                     )?;
                 }
                 Ok(())
@@ -381,12 +453,12 @@ impl Renderer {
 
     fn icon(&self, item: &DockIcon<'_>) -> Result<IconLayer> {
         let size = item.size as f32;
-        let surface = paint(&self.device, item.size, item.size, 96, |c| {
+        let surface = paint(&self.device, self.palette, item.size, item.size, 96, |c| {
             if let Some(bitmap) = self.shell_icon(item.path)? {
                 c.bitmap(&bitmap, c.rect(0., 0., size, size))?;
             } else {
                 // Shell can lose access to an executable after enumeration. Keep its slot identifiable.
-                c.round(0., 0., size, size, size * 0.26, EDGE)?;
+                c.round(0., 0., size, size, size * 0.26, c.p.edge)?;
                 let initial = item.label.chars().next().unwrap_or('?').to_string();
                 c.text(
                     &self.write,
@@ -394,7 +466,7 @@ impl Renderer {
                     c.rect(size * 0.24, 0., size, size),
                     size * 0.56,
                     true,
-                    INK,
+                    c.p.ink,
                 )?;
             }
             Ok(())

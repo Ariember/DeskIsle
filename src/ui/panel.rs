@@ -40,7 +40,7 @@ pub struct Area {
 }
 
 impl Area {
-    fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+    pub fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
         Self {
             left,
             top,
@@ -412,6 +412,14 @@ mod tests {
         )
     }
 
+    /// The state with the Dock page open, which has every kind of control.
+    fn dock_page() -> PanelState {
+        PanelState {
+            page: SECTIONS.iter().position(|&s| s == Section::Dock).unwrap(),
+            ..PanelState::default()
+        }
+    }
+
     #[test]
     fn every_control_hits_its_own_setting_at_each_scale() {
         let settings = Settings::default();
@@ -465,7 +473,7 @@ mod tests {
     fn limits_disable_stepper_buttons() {
         let mut settings = Settings::default();
         settings.set(Key::IconSize, 56);
-        let layout = PanelLayout::new(&mut PanelState::default(), &settings, 96, 4000);
+        let layout = PanelLayout::new(&mut dock_page(), &settings, 96, 4000);
         let row = layout.rows.iter().find(|r| r.key == Key::IconSize).unwrap();
         let Part::Stepper {
             plus, minus, text, ..
@@ -483,7 +491,7 @@ mod tests {
     #[test]
     fn short_work_area_scrolls_the_focused_row_into_view() {
         let settings = Settings::default();
-        let mut state = PanelState::default();
+        let mut state = dock_page();
         // At 2x, 520 pixels leave the minimum height, too short for every card.
         let layout = PanelLayout::new(&mut state, &settings, 192, 520);
         assert_eq!(layout.height, MIN_HEIGHT);

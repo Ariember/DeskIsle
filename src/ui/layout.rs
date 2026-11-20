@@ -91,10 +91,22 @@ impl Layout {
 /// Height of the full-width status bar in DIPs.
 pub const STATUS_HEIGHT: i32 = 30;
 
+/// A system control on the status bar, between the tray and the clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemItem {
+    Network,
+    Display,
+    Battery,
+    Sound,
+    /// Quick toggles and sliders for several features at once.
+    Control,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusHit {
     Tray(usize),
     Overflow,
+    System(SystemItem),
     /// The active application's name.
     Title,
     Clock,
@@ -112,13 +124,24 @@ pub struct StatusLayout {
     pub tray: Vec<Slot>,
     /// Lists every tray icon, so it appears whenever any icon exists.
     pub overflow: Option<Rect>,
+    /// System controls in display order.
+    pub system: Vec<(SystemItem, Rect)>,
     pub clock: Rect,
 }
 
 impl StatusLayout {
     /// `shown` counts the tray icons the user keeps on the bar. Icons that do not fit
     /// stay reachable through the overflow button.
-    pub fn new(width: i32, height: i32, dpi: u32, shown: usize, total: usize) -> Self {
+    /// `system` lists the system controls to show, in display order; they always fit
+    /// before tray icons do.
+    pub fn new(
+        width: i32,
+        height: i32,
+        dpi: u32,
+        shown: usize,
+        total: usize,
+        system: &[SystemItem],
+    ) -> Self {
         let px = scaled(dpi);
         let width = width.max(1);
         let height = height.max(1);
@@ -131,8 +154,14 @@ impl StatusLayout {
         let clock_width = px(48).min(width);
         let clock = cell((width - px(10) - clock_width).max(0), clock_width);
         let slot = px(28).max(1);
-        let overflow = (total > 0).then(|| cell((clock.x - px(4) - slot).max(0), slot));
-        let tray_end = overflow.map_or(clock.x, |r| r.x);
+        let system_start = (clock.x - px(4) - system.len() as i32 * slot).max(0);
+        let system = system
+            .iter()
+            .enumerate()
+            .map(|(i, &item)| (item, cell(system_start + i as i32 * slot, slot)))
+            .collect::<Vec<_>>();
+        let overflow = (total > 0).then(|| cell((system_start - px(6) - slot).max(0), slot));
+        let tray_end = overflow.map_or(system_start, |r| r.x);
         // Keep room for the mark and the active application's name.
         let title_min = px(220);
         let capacity = ((tray_end - title_min).max(0) / slot) as usize;
@@ -152,6 +181,7 @@ impl StatusLayout {
             title,
             tray,
             overflow,
+            system,
             clock,
         }
     }
@@ -161,6 +191,8 @@ impl StatusLayout {
             StatusHit::Tray(slot.index)
         } else if self.overflow.is_some_and(|r| r.contains(x, y)) {
             StatusHit::Overflow
+        } else if let Some(&(item, _)) = self.system.iter().find(|(_, r)| r.contains(x, y)) {
+            StatusHit::System(item)
         } else if self.clock.contains(x, y) {
             StatusHit::Clock
         } else if self.title.contains(x, y) {
@@ -241,12 +273,21 @@ mod tests {
         for dpi in [96, 144, 192] {
             let px = scaled(dpi);
             let (width, height) = (px(1920), px(STATUS_HEIGHT));
-            let layout = StatusLayout::new(width, height, dpi, 3, 5);
+            let system = [SystemItem::Network, SystemItem::Sound, SystemItem::Control];
+            let layout = StatusLayout::new(width, height, dpi, 3, 5, &system);
             assert_eq!(layout.tray.len(), 3);
             let overflow = layout.overflow.unwrap();
             let last = layout.tray[2].rect;
             assert!(last.x + last.width <= overflow.x);
-            assert!(overflow.x + overflow.width <= layout.clock.x);
+            let (first, sound) = (layout.system[0].1, layout.system[1].1);
+            assert!(overflow.x + overflow.width <= first.x);
+            let (_, control) = layout.system[2];
+            assert!(control.x + control.width <= layout.clock.x);
+            assert_eq!(layout.hit(sound.x, 0), StatusHit::System(SystemItem::Sound));
+            assert_eq!(
+                layout.hit(sound.x - 1, 0),
+                StatusHit::System(SystemItem::Network)
+            );
             assert!(layout.clock.x + layout.clock.width <= width);
             assert!(layout.title.x + layout.title.width < layout.tray[0].rect.x);
             assert_eq!(layout.hit(last.x, 0), StatusHit::Tray(2));
@@ -257,12 +298,12 @@ mod tests {
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
             // A narrow bar moves icons into the overflow list but keeps the title area.
-            let narrow = StatusLayout::new(px(400), height, dpi, 40, 40);
+            let narrow = StatusLayout::new(px(520), height, dpi, 40, 40, &system);
             assert!(narrow.tray.len() < 40);
             assert!(narrow.tray[0].rect.x >= px(220));
             assert!(narrow.overflow.is_some());
         }
-        let empty = StatusLayout::new(800, 30, 96, 0, 0);
+        let empty = StatusLayout::new(800, 30, 96, 0, 0, &[]);
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
         assert_eq!(empty.hit(700, 10), StatusHit::Title);
         assert_eq!(empty.hit(735, 10), StatusHit::Bar);

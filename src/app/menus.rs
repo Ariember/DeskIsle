@@ -1,8 +1,9 @@
 use super::Bars;
-use crate::platform::{self, Event, MenuKey, MenuWindow};
+use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
-use crate::ui::layout::StatusHit;
-use crate::ui::menu::{self, Anchor, Command, Hit, Menu, MenuLayout, TrayEntry};
+use crate::ui::layout::{StatusHit, SystemItem};
+use crate::ui::menu::{self, Anchor, Command, Hit, Menu, MenuLayout, SliderTarget, TrayEntry};
+use crate::ui::system::volume_glyph;
 use windows::Win32::Foundation::HWND;
 use windows::core::{Error, Result};
 
@@ -17,6 +18,7 @@ impl Bars {
                     Ok(false)
                 }
                 StatusHit::Overflow => self.tray_menu(),
+                StatusHit::System(item) => self.flyout(item),
                 StatusHit::Clock => self.clock_menu(),
                 StatusHit::Title => match self.apps.iter().position(|app| app.active) {
                     Some(index) => {
@@ -80,7 +82,7 @@ impl Bars {
     }
 
     /// Below the status bar at client `x`.
-    fn top_anchor(&self, x: i32) -> Anchor {
+    pub(super) fn top_anchor(&self, x: i32) -> Anchor {
         Anchor {
             x: self.top_rect.x + x,
             y: self.top_rect.y + self.top_rect.height,
@@ -134,29 +136,52 @@ impl Bars {
 
     /// Shows `menu`, then carries out the chosen command. Returns whether to quit.
     fn show_menu(&mut self, menu: Menu<Command>, anchor: Anchor) -> Result<bool> {
-        match self.popup(menu, anchor)? {
+        match self.popup(menu, anchor, None)? {
             Some(command) => self.run_command(command),
             None => Ok(false),
         }
     }
 
+    fn menu_layout(&mut self, menu: &mut Menu<Command>) -> MenuLayout {
+        let renderer = self.renderer.as_mut().expect("renderer bound to bars");
+        MenuLayout::new(menu, self.monitor.dpi, |text, size, bold| {
+            renderer.measure(text, size, bold)
+        })
+    }
+
+    /// Binds and paints `menu` into its window; a failed paint releases the target.
+    fn paint_menu(
+        &mut self,
+        window: &MenuWindow,
+        menu: &Menu<Command>,
+        layout: &MenuLayout,
+        animate: bool,
+    ) -> Result<()> {
+        let renderer = self.renderer.as_mut().expect("renderer bound to bars");
+        let tray = &self.tray;
+        let resolve = |index: usize| tray.icons().get(index).and_then(|icon| icon.icon());
+        let result =
+            renderer.open_menu(window.0, menu, layout, self.monitor.dpi, &resolve, animate);
+        if result.is_err() {
+            renderer.close_menu();
+        }
+        result
+    }
+
     /// Runs the menu until the user chooses, dismisses or clicks elsewhere. Bar events
     /// that arrive meanwhile are held and handled afterwards in their original order.
+    ///
+    /// A `flyout` stays open for its system commands: each runs here, and the flyout is
+    /// rebuilt in place from fresh state. Its sliders apply while they are dragged.
     pub(super) fn popup(
         &mut self,
         mut menu: Menu<Command>,
         anchor: Anchor,
+        flyout: Option<SystemItem>,
     ) -> Result<Option<Command>> {
-        let dpi = self.monitor.dpi;
-        let renderer = self.renderer.as_mut().expect("renderer bound to bars");
-        let layout = MenuLayout::new(&mut menu, dpi, |text, size, bold| {
-            renderer.measure(text, size, bold)
-        });
+        let mut layout = self.menu_layout(&mut menu);
         let window = MenuWindow::create(layout.place(anchor, self.monitor.bounds))?;
-        let tray = &self.tray;
-        let resolve = |index: usize| tray.icons().get(index).and_then(|icon| icon.icon());
-        if let Err(error) = renderer.open_menu(window.0, &menu, &layout, dpi, &resolve) {
-            renderer.close_menu();
+        if let Err(error) = self.paint_menu(&window, &menu, &layout, true) {
             drop(window);
             return self.recover(error).map(|()| None);
         }
@@ -165,21 +190,56 @@ impl Bars {
         let mut hover: Option<usize> = None;
         let mut held = Vec::new();
         let mut failure = None;
+        // The slider entry being dragged.
+        let mut drag: Option<usize> = None;
         let choice = loop {
             let mut target = hover;
+            let mut chosen = None;
             match platform::next_event()? {
-                // The shadow margin belongs to the window but not to the menu.
-                Event::MenuPick(x, y) if layout.hit(&menu, x, y) == Hit::Outside => break None,
-                Event::MenuMove(x, y) => {
-                    target = match layout.hit(&menu, x, y) {
-                        Hit::Item(index) => Some(index),
-                        _ => None,
+                Event::MenuPress(x, y) => {
+                    if let Hit::Slider(index, value) = layout.hit(&menu, x, y) {
+                        window.capture();
+                        drag = Some(index);
+                        target = None;
+                        if let Err(error) = self.slide(&window, &mut menu, index, value, false) {
+                            failure = Some(error);
+                            break None;
+                        }
                     }
                 }
-                Event::MenuLeave => target = None,
+                Event::MenuMove(x, y) => match drag {
+                    Some(index) => {
+                        let value = layout.slider_value(index, x);
+                        if let Err(error) = self.slide(&window, &mut menu, index, value, false) {
+                            failure = Some(error);
+                            break None;
+                        }
+                    }
+                    None => {
+                        target = match layout.hit(&menu, x, y) {
+                            Hit::Item(index) => Some(index),
+                            _ => None,
+                        }
+                    }
+                },
+                Event::MenuLeave if drag.is_none() => target = None,
+                // Releasing a slider, even outside the menu, only ends the drag.
+                Event::MenuPick(x, _) if drag.is_some() => {
+                    let index = drag.take().expect("dragging");
+                    window.release();
+                    let value = layout.slider_value(index, x);
+                    if let Err(error) = self.slide(&window, &mut menu, index, value, true) {
+                        failure = Some(error);
+                        break None;
+                    }
+                }
+                // The shadow margin belongs to the window but not to the menu.
+                Event::MenuPick(x, y) if layout.hit(&menu, x, y) == Hit::Outside => break None,
                 Event::MenuPick(x, y) => {
-                    if let Hit::Item(index) = layout.hit(&menu, x, y) {
-                        break menu.command(index).cloned();
+                    chosen = match layout.hit(&menu, x, y) {
+                        Hit::Item(index) => menu.command(index).cloned(),
+                        Hit::Part(index, part) => menu.part_command(index, part).cloned(),
+                        _ => None,
                     }
                 }
                 Event::MenuKey(key) => match key {
@@ -188,9 +248,7 @@ impl Bars {
                     MenuKey::Home => target = menu.step(None, true),
                     MenuKey::End => target = menu.step(None, false),
                     MenuKey::Select => {
-                        if let Some(index) = hover {
-                            break menu.command(index).cloned();
-                        }
+                        chosen = hover.and_then(|index| menu.command(index).cloned())
                     }
                     MenuKey::Dismiss => break None,
                     _ => {}
@@ -213,7 +271,27 @@ impl Bars {
                         break None;
                     }
                 }
+                // A dragged volume slider sends one per step; the latest state is enough.
+                event @ (Event::Audio | Event::Power) if held.contains(&event) => {}
                 event => held.push(event),
+            }
+            match (chosen, flyout) {
+                (Some(Command::System(command)), Some(item)) => {
+                    if let Err(error) = self.system_command(command) {
+                        platform::report_error(Some(window.0), &error);
+                    }
+                    menu = self.flyout_menu(item);
+                    layout = self.menu_layout(&mut menu);
+                    window.place(layout.place(anchor, self.monitor.bounds));
+                    hover = None;
+                    if let Err(error) = self.paint_menu(&window, &menu, &layout, false) {
+                        failure = Some(error);
+                        break None;
+                    }
+                    continue;
+                }
+                (Some(command), _) => break Some(command),
+                (None, _) => {}
             }
             if target != hover {
                 let danger = target.is_some_and(
@@ -237,6 +315,40 @@ impl Bars {
             self.recover(error)?;
         }
         Ok(choice)
+    }
+
+    /// Moves slider `index` of `menu` to `value` and applies it: the volume follows the
+    /// pointer, while brightness, which talks to the monitor, applies on release. Returns
+    /// only drawing errors; a refused change is reported over the menu.
+    fn slide(
+        &mut self,
+        window: &MenuWindow,
+        menu: &mut Menu<Command>,
+        index: usize,
+        value: u8,
+        done: bool,
+    ) -> Result<()> {
+        let Some(menu::Entry::Slider(slider)) = menu.entries.get_mut(index) else {
+            return Ok(());
+        };
+        let changed = slider.value != Some(value);
+        slider.value = Some(value);
+        let applied = match slider.target {
+            SliderTarget::Volume if changed => {
+                slider.glyph = volume_glyph(value, false);
+                audio::set_volume(value)
+            }
+            SliderTarget::Brightness if done => display::set_brightness(value),
+            _ => Ok(()),
+        };
+        if changed {
+            let renderer = self.renderer.as_mut().expect("renderer bound to bars");
+            renderer.menu_slider(index, slider)?;
+        }
+        if let Err(error) = applied {
+            platform::report_error(Some(window.0), &error);
+        }
+        Ok(())
     }
 
     /// Rebuilds the graphics device after it was lost, or reports another menu failure.

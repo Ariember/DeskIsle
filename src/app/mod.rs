@@ -1,6 +1,7 @@
 mod commands;
 mod menus;
 mod settings;
+mod system;
 
 use std::collections::BTreeSet;
 
@@ -8,11 +9,12 @@ use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::TrayHost;
-use crate::platform::{self, AppBar, Bar, Event, Monitor, shell};
+use crate::platform::{self, AppBar, Bar, Event, Monitor, audio, shell};
 use crate::render::{DockIcon, Renderer, is_device_lost};
 use crate::settings::{Key, Settings};
 use crate::storage;
-use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout};
+use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem};
+use crate::ui::system::SystemStatus;
 use windows::core::{Error, Result};
 
 struct Bars {
@@ -43,6 +45,12 @@ struct Bars {
     /// A left press on a bar dismissed the open menu; its release must not click.
     swallow_click: bool,
     settings: Settings,
+    /// What the status bar's system controls show.
+    system: SystemStatus,
+    /// Notifies the status bar of volume changes on the default output.
+    audio_watch: Option<audio::AudioWatch>,
+    /// The system control whose flyout is open, highlighted on the bar.
+    open_flyout: Option<SystemItem>,
     /// Restored after the bars are gone, on exit or when the user turns hiding off.
     native_taskbar: NativeTaskbar,
 }
@@ -111,7 +119,7 @@ pub(crate) fn run() -> Result<()> {
     };
     let layout = Layout::new(monitor.work, monitor.dpi, apps.len(), 0, style);
     let time = platform::clock(top.0)?;
-    let renderer = Some(Renderer::new(top.0, bottom.0)?);
+    let renderer = Some(Renderer::new(top.0, bottom.0, settings::dark(&settings))?);
     let mut bars = Bars {
         events,
         renderer,
@@ -123,7 +131,7 @@ pub(crate) fn run() -> Result<()> {
         pins,
         apps,
         foreground,
-        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0),
+        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0, &[]),
         monitor,
         top_rect,
         fullscreen,
@@ -134,8 +142,12 @@ pub(crate) fn run() -> Result<()> {
         time,
         swallow_click: false,
         settings,
+        system: system::status(),
+        audio_watch: None,
+        open_flyout: None,
         native_taskbar,
     };
+    bars.watch_audio();
     bars.restatus();
     bars.draw()?;
     bars.position()?;
@@ -176,7 +188,11 @@ pub(crate) fn run() -> Result<()> {
                     bars.time = time;
                     bars.draw()?;
                 }
+                // Network changes have no notification here; the minute tick catches them.
+                bars.refresh_system()?;
             }
+            Event::Audio => bars.refresh_audio()?,
+            Event::Power => bars.refresh_power()?,
             Event::Move(hwnd, x, y) if hwnd == bars.bottom.0 => {
                 platform::track_leave(hwnd)?;
                 bars.set_hover(bars.layout.hit(x, y))?;
@@ -200,6 +216,7 @@ pub(crate) fn run() -> Result<()> {
                         false
                     }
                     StatusHit::Overflow => bars.tray_menu()?,
+                    StatusHit::System(item) => bars.flyout(item)?,
                     StatusHit::Clock => bars.clock_menu()?,
                     StatusHit::Title | StatusHit::Bar => bars.bar_menu()?,
                 };
@@ -260,6 +277,8 @@ impl Bars {
         self.relayout(self.layout.first)?;
         self.position()?;
         self.time = platform::clock(self.top.0)?;
+        // Windows announces a change of its app mode as a setting change.
+        self.apply_theme()?;
         self.draw()?;
         self.relayout_panel()
     }
@@ -297,6 +316,7 @@ impl Bars {
             self.monitor.dpi,
             self.shown.len(),
             visible,
+            &self.system.items(),
         );
     }
 
@@ -356,7 +376,7 @@ impl Bars {
                 // Release the previous targets before binding a new device to these HWNDs.
                 self.renderer.take();
                 self.renderer = Some(
-                    Renderer::new(self.top.0, self.bottom.0)
+                    Renderer::new(self.top.0, self.bottom.0, self.dark())
                         .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
                 );
                 self.draw_frame()?;
@@ -385,7 +405,21 @@ impl Bars {
                 (icon.icon(), icon.stamp)
             })
             .collect::<Vec<_>>();
-        renderer.draw_top(&self.status, dpi, active, &self.time, &tray)?;
+        let marks = self
+            .status
+            .system
+            .iter()
+            .map(|&(item, _)| self.system.mark(item))
+            .collect::<Vec<_>>();
+        renderer.draw_top(
+            &self.status,
+            dpi,
+            active,
+            &self.time,
+            &tray,
+            &marks,
+            self.open_flyout,
+        )?;
         let icons = self
             .layout
             .slots

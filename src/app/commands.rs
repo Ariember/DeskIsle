@@ -38,6 +38,8 @@ impl Bars {
                 self.tray_activate(index, false)?;
                 return Ok(false);
             }
+            Command::Open(uri) => shell::execute(owner, uri),
+            Command::System(command) => self.system_command(command),
             Command::TrayToggle(index) => {
                 self.tray_toggle(index)?;
                 return Ok(false);
@@ -81,7 +83,7 @@ impl Bars {
                     Some(index) => self.icon_anchor(index),
                     None => self.cursor_anchor()?,
                 };
-                if let Some(Command::Window(id, window)) = self.popup(menu, anchor)? {
+                if let Some(Command::Window(id, window)) = self.popup(menu, anchor, None)? {
                     shell::activate(&id, window)?;
                 }
             }

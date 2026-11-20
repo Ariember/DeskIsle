@@ -11,23 +11,67 @@ use windows::Win32::{
 use windows::core::{Result, w};
 
 pub(super) type Rgb = (u8, u8, u8);
-pub(super) const EDGE: Rgb = (71, 82, 85);
-pub(super) const PANEL: Rgb = (24, 30, 33);
-pub(super) const PANEL_TOP: Rgb = (38, 47, 51);
-pub(super) const DANGER: Rgb = (255, 140, 128);
-pub(super) const BAR: Rgb = (17, 19, 21);
-pub(super) const INK: Rgb = (244, 247, 242);
-pub(super) const MUTED: Rgb = (182, 197, 197);
-pub(super) const MINT: Rgb = (132, 227, 191);
+
+/// Monochrome colors for one appearance. Washes and hairlines use `line` at low alpha,
+/// so the same alphas read on both light and dark surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub(super) bar: Rgb,
+    pub(super) panel: Rgb,
+    pub(super) panel_top: Rgb,
+    pub(super) edge: Rgb,
+    pub(super) ink: Rgb,
+    pub(super) muted: Rgb,
+    /// Selection, active state and switched-on controls.
+    pub(super) accent: Rgb,
+    /// Text and knobs drawn on an `accent` fill.
+    pub(super) on_accent: Rgb,
+    pub(super) line: Rgb,
+    pub(super) danger: Rgb,
+}
+
+impl Palette {
+    pub fn new(dark: bool) -> Self {
+        if dark {
+            Self {
+                bar: (16, 16, 16),
+                panel: (26, 26, 26),
+                panel_top: (40, 40, 40),
+                edge: (66, 66, 66),
+                ink: (244, 244, 244),
+                muted: (168, 168, 168),
+                accent: (244, 244, 244),
+                on_accent: (18, 18, 18),
+                line: (255, 255, 255),
+                danger: (255, 128, 116),
+            }
+        } else {
+            Self {
+                bar: (246, 246, 246),
+                panel: (238, 238, 238),
+                panel_top: (252, 252, 252),
+                edge: (204, 204, 204),
+                ink: (22, 22, 22),
+                muted: (102, 102, 102),
+                accent: (22, 22, 22),
+                on_accent: (250, 250, 250),
+                line: (0, 0, 0),
+                danger: (196, 43, 28),
+            }
+        }
+    }
+}
 
 pub(super) struct Canvas {
     ctx: ID2D1DeviceContext,
+    pub(super) p: Palette,
     origin: POINT,
     pub(super) scale: f32,
 }
 
 pub(super) fn paint(
     device: &IDCompositionDesktopDevice,
+    palette: Palette,
     width: i32,
     height: i32,
     dpi: u32,
@@ -56,6 +100,7 @@ pub(super) fn paint(
         ctx.Clear(Some(&D2D1_COLOR_F::default()));
         let canvas = Canvas {
             ctx,
+            p: palette,
             origin,
             scale: dpi as f32 / 96.,
         };
@@ -219,8 +264,9 @@ impl Canvas {
     }
 
     pub(super) fn panel(&self, w: f32, h: f32, radius: f32) -> Result<()> {
-        self.gradient(0., 0., w, h, radius, (PANEL_TOP, 0.97), (PANEL, 0.97))?;
-        self.stroke(0., 0., w, h, radius, (255, 255, 255), 0.11)
+        let p = self.p;
+        self.gradient(0., 0., w, h, radius, (p.panel_top, 0.97), (p.panel, 0.97))?;
+        self.stroke(0., 0., w, h, radius, p.line, 0.11)
     }
 
     /// Runs `draw` with output limited to `rect`.
