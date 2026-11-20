@@ -3,7 +3,9 @@
 mod app;
 mod dock;
 mod geometry;
+mod integrations;
 mod launchpad;
+mod metrics;
 mod platform;
 mod render;
 mod settings;

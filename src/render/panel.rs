@@ -4,7 +4,7 @@ use windows::Win32::{
 };
 use windows::core::Result;
 
-use crate::settings::{Adjust, Key, PreviewKey, SECTIONS, Section};
+use crate::settings::{Adjust, Key, MonitorKey, SECTIONS, Section};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
@@ -385,21 +385,20 @@ impl Renderer {
 
         // Footer with the page's reset button.
         let r = layout.reset;
-        if section.is_preview() {
+        let note = match section {
+            Section::Clock => Some("界面预览 · 仅本次运行有效"),
+            Section::Monitor => {
+                Some("CPU 核温取自已运行的 Core Temp，GPU 温度取决于驱动。无读数显示 —")
+            }
+            _ => None,
+        };
+        if let Some(text) = note {
             let note = Area {
                 left: view.left + 2.,
                 right: r.left - 8.,
                 ..r
             };
-            self.label(
-                c,
-                "界面预览 · 仅本次运行有效",
-                note,
-                11.,
-                false,
-                c.p.muted,
-                1.,
-            )?;
+            self.label(c, text, note, 11., false, c.p.muted, 1.)?;
         }
         self.button_face(c, &t, r, 6., hover(Action::Reset))?;
         self.label_aligned(
@@ -548,10 +547,10 @@ impl Renderer {
 
     fn paint_monitor_icon(&self, c: &Canvas, key: Key, icon: Area) -> Result<()> {
         let symbol = match key {
-            Key::Preview(PreviewKey::Temperature) => Symbol::Thermometer,
-            Key::Preview(PreviewKey::Memory) => Symbol::Memory,
-            Key::Preview(PreviewKey::Cpu) => Symbol::Chip,
-            Key::Preview(PreviewKey::Disk) => Symbol::Disk,
+            Key::Monitor(MonitorKey::Temperature) => Symbol::Thermometer,
+            Key::Monitor(MonitorKey::Memory) => Symbol::Memory,
+            Key::Monitor(MonitorKey::Cpu) => Symbol::Chip,
+            Key::Monitor(MonitorKey::Disk) => Symbol::Disk,
             _ => return Ok(()),
         };
         c.symbol_in(symbol, icon, 30., c.p.ink, 1.)

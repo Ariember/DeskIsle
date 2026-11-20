@@ -1,6 +1,7 @@
 mod commands;
 mod launchpad;
 mod menus;
+mod monitor;
 mod settings;
 mod system;
 
@@ -8,6 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
+use crate::metrics::Indicator;
 use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::{TrayHost, TrayInput};
@@ -20,6 +22,7 @@ use crate::ui::layout::{
     DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
 };
 use crate::ui::system::SystemStatus;
+use monitor::MetricsWorker;
 use windows::Win32::Foundation::POINT;
 use windows::core::{Error, Result};
 
@@ -36,6 +39,8 @@ struct Bars {
     audio_watch: Option<audio::AudioWatch>,
     /// Worker notifications stop before the status window goes away.
     worker: SystemWorker,
+    metrics_worker: MetricsWorker,
+    indicators: Vec<Indicator>,
     top: Bar,
     bottom: Bar,
     pins: Vec<PinnedApp>,
@@ -146,6 +151,8 @@ pub(crate) fn run() -> Result<()> {
     let mut worker = SystemWorker::new(top.0)?;
     worker.refresh_network()?;
     let mut bars = Bars {
+        metrics_worker: MetricsWorker::new(top.0)?,
+        indicators: Vec::new(),
         worker,
         events,
         renderer,
@@ -158,7 +165,7 @@ pub(crate) fn run() -> Result<()> {
         pins,
         apps,
         foreground,
-        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0, &[]),
+        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0, &[], &[]),
         monitor,
         top_rect,
         fullscreen,
@@ -178,8 +185,7 @@ pub(crate) fn run() -> Result<()> {
         overflow_open: false,
         native_taskbar,
     };
-    bars.restatus();
-    bars.draw()?;
+    bars.apply_monitor_settings()?;
     bars.position()?;
     // Applications answer at once; the loop below receives their icons.
     bars.tray.request_icons()?;
@@ -210,8 +216,13 @@ pub(crate) fn run() -> Result<()> {
                 bars.tray.request_icons()?;
             }
             Event::FullScreen(fullscreen) => {
+                let was_hidden = bars.fullscreen;
                 bars.fullscreen = fullscreen;
+                bars.sync_sampling();
                 bars.publish_tray_rects();
+                if was_hidden && !fullscreen {
+                    bars.draw()?;
+                }
                 bars.position()?;
                 if fullscreen {
                     bars.tray.cancel_click();
@@ -229,6 +240,10 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh_system()?;
             }
             Event::Audio => bars.refresh_audio()?,
+            Event::MetricsUpdate => match bars.draw_metrics() {
+                Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
+                result => result?,
+            },
             Event::DefaultOutput => {
                 bars.watch_audio();
                 bars.refresh_audio()?;
@@ -403,8 +418,10 @@ impl Bars {
             self.shown.len(),
             visible,
             &self.system.items(),
+            &self.indicators,
         );
         self.publish_tray_rects();
+        self.sync_sampling();
     }
 
     fn publish_tray_rects(&self) {
@@ -587,6 +604,7 @@ impl Bars {
                 .map(StatusHit::System)
                 .or(self.overflow_open.then_some(StatusHit::Overflow)),
             self.top_hover,
+            &self.indicators,
         )?;
         let icons = self
             .layout

@@ -73,7 +73,10 @@ pub enum Symbol {
     Chip,
     Disk,
     Thermometer,
+    GraphicsCard,
     Memory,
+    MeterBars(u8),
+    MeterRing(u8),
 }
 
 /// Width and height of the grid icons are outlined on.
@@ -605,6 +608,63 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
                 s.line(&[(x, 16.5), (x, 19.5)]);
             }
         }
+        Symbol::GraphicsCard => {
+            // The rear bracket, cooling fan and PCIe contacts stay distinct at 16 DIPs.
+            s.line(&[(2., 4.), (4.5, 4.), (4.5, 20.)]);
+            s.rect(4.5, 6., 21.5, 16., 2., Stroke);
+            s.circle(15.5, 11., 2.7, Stroke);
+            s.line(&[(7.5, 10.), (9.5, 10.)]);
+            s.rect(7., 16., 13., 18.5, 0.7, Fill);
+        }
+        Symbol::MeterBars(percent) => {
+            for index in 0..5 {
+                let left = 1.5 + index as f32 * 4.5;
+                let top = 14. - index as f32 * 2.5;
+                s.rect(left, top, left + 3., 19., 1.25, Fill).alpha = 0.23;
+                let used = (f32::from(percent) / 20. - index as f32).clamp(0., 1.);
+                if used > 0. {
+                    s.rect(left, 19. - (19. - top) * used, left + 3., 19., 1.25, Fill);
+                }
+            }
+        }
+        Symbol::MeterRing(percent) => {
+            s.circle(12., 12., 8.5, Stroke).alpha = 0.23;
+            match percent {
+                0 => {}
+                100.. => {
+                    s.circle(12., 12., 8.5, Stroke);
+                }
+                level => {
+                    s.arc(12., 12., 8.5, -90., -90. + f32::from(level) * 3.6);
+                }
+            }
+        }
+    }
+    s.0
+}
+
+/// A trace through consecutive samples; a failed read leaves a gap in the line.
+/// Use a point for an isolated reading so the graph is legible from its first sample.
+pub fn history_trace(history: &[Option<u8>]) -> Vec<Shape> {
+    let mut s = Sketch(Vec::new());
+    let mut run = Vec::new();
+    let dx = 22. / history.len().saturating_sub(1).max(1) as f32;
+    for (index, value) in history.iter().chain([&None]).enumerate() {
+        if let Some(value) = value {
+            let x = 23. - history.len().saturating_sub(index + 1) as f32 * dx;
+            run.push((x, 19. - f32::from((*value).min(100)) * 0.14));
+        } else {
+            match run.as_slice() {
+                [] => {}
+                &[(x, y)] => {
+                    s.circle(x, y, 0.8, Paint::Fill);
+                }
+                points => {
+                    s.line(points);
+                }
+            }
+            run.clear();
+        }
     }
     s.0
 }
@@ -815,6 +875,12 @@ mod tests {
         Symbol::Disk,
         Symbol::Thermometer,
         Symbol::Memory,
+        Symbol::GraphicsCard,
+        Symbol::MeterBars(0),
+        Symbol::MeterBars(63),
+        Symbol::MeterRing(0),
+        Symbol::MeterRing(63),
+        Symbol::MeterRing(100),
     ];
 
     fn points(shape: &Shape) -> Vec<Point> {
@@ -859,6 +925,17 @@ mod tests {
         assert_eq!(lit(0), 1);
         assert!(lit(0) < lit(1) && lit(1) < lit(2) && lit(2) < lit(3));
         assert_eq!(lit(3), lit(9));
+    }
+
+    #[test]
+    fn trace_breaks_at_missing_samples_and_places_newest_on_the_right() {
+        let shapes = history_trace(&[Some(0), Some(100), None, Some(50)]);
+        assert_eq!(shapes.len(), 2);
+        let trace = points(&shapes[0]);
+        assert!(trace[0].0 < trace[1].0 && trace[0].1 > trace[1].1);
+        assert_eq!(shapes[1].paint, Paint::Fill);
+        assert!(shapes[1].start.0 > trace[1].0);
+        assert!(history_trace(&[None, None]).is_empty());
     }
 
     #[test]

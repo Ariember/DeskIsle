@@ -439,6 +439,12 @@ impl Bars {
                     MenuKey::Dismiss => break None,
                     _ => {}
                 },
+                Event::MetricsUpdate => {
+                    if let Err(error) = self.draw_metrics() {
+                        failure = Some(error);
+                        break None;
+                    }
+                }
                 Event::SystemUpdate if flyout.is_some() => {
                     let updated = self.system_updated(window.0)?;
                     refresh_flyout |= updated.is_some()

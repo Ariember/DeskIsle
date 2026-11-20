@@ -2,6 +2,8 @@
 //! settings file, the settings panel and resetting to defaults. Adding a setting means
 //! adding a [`Key`] variant and its row, then reacting to the change in the app layer.
 
+use crate::metrics::{Metric, Sources, Style};
+
 /// Identifies one setting. Callers read values through the typed accessors on
 /// [`Settings`]; the panel and the settings file go through [`SCHEMA`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,14 +14,19 @@ pub enum Key {
     HoverZoom,
     HideTaskbar,
     Autostart,
-    Preview(PreviewKey),
+    Clock(ClockKey),
+    Monitor(MonitorKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PreviewKey {
-    ClockFormat,
-    ClockDate,
-    ClockWeekday,
+pub enum ClockKey {
+    Format,
+    Date,
+    Weekday,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorKey {
     Highlight,
     Cpu,
     CpuStyle,
@@ -58,10 +65,6 @@ impl Section {
             Section::Clock => "时间",
             Section::Monitor => "监控",
         }
-    }
-
-    pub fn is_preview(self) -> bool {
-        matches!(self, Self::Clock | Self::Monitor)
     }
 }
 
@@ -180,24 +183,43 @@ const MONITOR_STYLES: &[Choice] = &[
     },
 ];
 
-const fn preview(
-    key: PreviewKey,
+const fn clock_preview(
+    key: ClockKey,
     id: &'static str,
-    section: Section,
     label: &'static str,
     help: &'static str,
     control: Control,
     default: i32,
 ) -> Spec {
     Spec {
-        key: Key::Preview(key),
+        key: Key::Clock(key),
         id,
-        section,
+        section: Section::Clock,
         label,
         help,
         control,
         default,
         store: Store::Session,
+    }
+}
+
+const fn monitor(
+    key: MonitorKey,
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+    control: Control,
+    default: i32,
+) -> Spec {
+    Spec {
+        key: Key::Monitor(key),
+        id,
+        section: Section::Monitor,
+        label,
+        help,
+        control,
+        default,
+        store: Store::File,
     }
 }
 
@@ -272,109 +294,97 @@ pub const SCHEMA: &[Spec] = &[
         default: 0,
         store: Store::System,
     },
-    preview(
-        PreviewKey::ClockFormat,
+    clock_preview(
+        ClockKey::Format,
         "clock.format",
-        Section::Clock,
         "时间格式",
         "顶部栏时钟的小时制",
         Control::Choice(CLOCK_FORMATS),
         0,
     ),
-    preview(
-        PreviewKey::ClockDate,
+    clock_preview(
+        ClockKey::Date,
         "clock.date",
-        Section::Clock,
         "显示日期",
         "在时间旁显示月份和日期",
         Control::Toggle,
         1,
     ),
-    preview(
-        PreviewKey::ClockWeekday,
+    clock_preview(
+        ClockKey::Weekday,
         "clock.weekday",
-        Section::Clock,
         "显示星期",
         "在日期旁显示星期几",
         Control::Toggle,
         0,
     ),
-    preview(
-        PreviewKey::Highlight,
+    monitor(
+        MonitorKey::Highlight,
         "monitor.highlight",
-        Section::Monitor,
         "高占用提醒",
-        "资源占用过高时高亮显示",
+        "CPU、内存或磁盘占用达到 90% 时高亮显示",
         Control::Toggle,
         0,
     ),
-    preview(
-        PreviewKey::Cpu,
+    monitor(
+        MonitorKey::Cpu,
         "monitor.cpu",
-        Section::Monitor,
         "CPU",
         "",
         Control::Toggle,
         1,
     ),
-    preview(
-        PreviewKey::CpuStyle,
+    monitor(
+        MonitorKey::CpuStyle,
         "monitor.cpu_style",
-        Section::Monitor,
         "显示样式",
         "",
         Control::Choice(MONITOR_STYLES),
         3,
     ),
-    preview(
-        PreviewKey::Temperature,
+    monitor(
+        MonitorKey::Temperature,
         "monitor.temperature",
-        Section::Monitor,
         "核心温度",
         "",
         Control::Toggle,
         0,
     ),
-    preview(
-        PreviewKey::GpuTemperature,
+    monitor(
+        MonitorKey::GpuTemperature,
         "monitor.gpu_temperature",
-        Section::Monitor,
         "GPU",
         "",
         Control::Toggle,
         0,
     ),
-    preview(
-        PreviewKey::Memory,
+    monitor(
+        MonitorKey::Memory,
         "monitor.memory",
-        Section::Monitor,
         "内存",
         "",
         Control::Toggle,
         1,
     ),
-    preview(
-        PreviewKey::MemoryStyle,
+    monitor(
+        MonitorKey::MemoryStyle,
         "monitor.memory_style",
-        Section::Monitor,
         "显示样式",
         "",
         Control::Choice(MONITOR_STYLES),
         0,
     ),
-    preview(
-        PreviewKey::Disk,
+    monitor(
+        MonitorKey::Disk,
         "monitor.disk",
-        Section::Monitor,
         "磁盘",
         "",
         Control::Toggle,
         0,
     ),
-    preview(
-        PreviewKey::DiskStyle,
+    monitor(
+        MonitorKey::DiskStyle,
         "monitor.disk_style",
-        Section::Monitor,
         "显示样式",
         "",
         Control::Choice(MONITOR_STYLES),
@@ -533,6 +543,31 @@ impl Settings {
         self.get(key) != 0
     }
 
+    pub fn sources(&self) -> Sources {
+        let temperature = self.enabled(Key::Monitor(MonitorKey::Temperature));
+        Sources {
+            cpu: self.enabled(Key::Monitor(MonitorKey::Cpu)),
+            memory: self.enabled(Key::Monitor(MonitorKey::Memory)),
+            disk: self.enabled(Key::Monitor(MonitorKey::Disk)),
+            cpu_temperature: temperature,
+            gpu_temperature: temperature && self.enabled(Key::Monitor(MonitorKey::GpuTemperature)),
+        }
+    }
+
+    pub fn monitor_style(&self, metric: Metric) -> Style {
+        let key = match metric {
+            Metric::Cpu => MonitorKey::CpuStyle,
+            Metric::Memory => MonitorKey::MemoryStyle,
+            Metric::Disk => MonitorKey::DiskStyle,
+            Metric::CpuTemperature | Metric::GpuTemperature => return Style::Value,
+        };
+        [Style::Bars, Style::Ring, Style::Graph, Style::Value][self.get(Key::Monitor(key)) as usize]
+    }
+
+    pub fn monitor_highlight(&self) -> bool {
+        self.enabled(Key::Monitor(MonitorKey::Highlight))
+    }
+
     /// The Dock icon edge in DIPs.
     pub fn icon_size(&self) -> i32 {
         self.get(Key::IconSize)
@@ -629,17 +664,28 @@ mod tests {
     }
 
     #[test]
-    fn monitor_preview_keeps_style_when_toggled_and_stays_out_of_the_file() {
+    fn monitor_settings_round_trip_with_hidden_styles_and_gpu_selection() {
         let mut settings = Settings::default();
-        let saved: Vec<_> = settings.file_entries().collect();
-        let cpu = Key::Preview(PreviewKey::Cpu);
-        let style = Key::Preview(PreviewKey::CpuStyle);
-        settings.adjust(style, Adjust::Pick(1));
-        settings.adjust(cpu, Adjust::Toggle);
-        assert!(!settings.enabled(cpu));
-        assert_eq!(settings.get(style), 1);
-        assert_eq!(settings.file_entries().collect::<Vec<_>>(), saved);
-        settings.set_text("monitor.cpu_style", "graph").unwrap();
-        assert_eq!(settings.get(style), 1);
+        assert!(settings.sources().cpu && settings.sources().memory);
+        assert_eq!(settings.monitor_style(Metric::Cpu), Style::Value);
+        assert_eq!(settings.monitor_style(Metric::Memory), Style::Bars);
+        assert_eq!(settings.monitor_style(Metric::Disk), Style::Graph);
+        assert!(!settings.sources().disk);
+        settings.set_text("monitor.cpu_style", "ring").unwrap();
+        settings.adjust(Key::Monitor(MonitorKey::Cpu), Adjust::Toggle);
+        settings.adjust(Key::Monitor(MonitorKey::GpuTemperature), Adjust::Toggle);
+        settings.adjust(Key::Monitor(MonitorKey::Highlight), Adjust::Toggle);
+
+        let mut read = Settings::default();
+        for (id, text) in settings.file_entries() {
+            read.set_text(id, &text).unwrap();
+        }
+        assert!(!read.sources().cpu);
+        assert_eq!(read.monitor_style(Metric::Cpu), Style::Ring);
+        assert!(read.monitor_highlight());
+        assert!(!read.sources().gpu_temperature);
+        read.adjust(Key::Monitor(MonitorKey::Temperature), Adjust::Toggle);
+        assert!(read.sources().cpu_temperature && read.sources().gpu_temperature);
+        assert_eq!(read.monitor_style(Metric::GpuTemperature), Style::Value);
     }
 }

@@ -258,6 +258,7 @@ impl Bars {
         let previous = std::mem::replace(&mut self.settings, next);
         let changed: Vec<_> = self.settings.changed(&previous).collect();
         let (mut relayout, mut redisplay, mut save, mut retheme) = (false, false, false, false);
+        let mut monitor_changed = false;
         for spec in changed {
             let enabled = self.settings.enabled(spec.key);
             let result = match spec.key {
@@ -280,7 +281,11 @@ impl Bars {
                     }
                 }
                 Key::Autostart => startup::set(enabled),
-                Key::Preview(_) => Ok(()),
+                Key::Clock(_) => Ok(()),
+                Key::Monitor(_) => {
+                    monitor_changed = true;
+                    Ok(())
+                }
             };
             if let Err(error) = result {
                 platform::report_error(Some(self.settings_owner()), &error);
@@ -292,6 +297,9 @@ impl Bars {
         if save && let Err(error) = storage::save_settings(&self.settings) {
             // The change still applies for this session.
             platform::report_error(Some(self.settings_owner()), &error);
+        }
+        if monitor_changed {
+            self.apply_monitor_settings()?;
         }
         if retheme {
             self.apply_theme()?;

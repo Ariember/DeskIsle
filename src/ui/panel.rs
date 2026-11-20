@@ -4,7 +4,7 @@
 
 use crate::geometry::Rect;
 use crate::settings::{
-    self, Adjust, Control, Key, PreviewKey, SCHEMA, SECTIONS, Section, Settings,
+    self, Adjust, Control, Key, MonitorKey, SCHEMA, SECTIONS, Section, Settings,
 };
 
 pub const WIDTH: f32 = 720.;
@@ -425,12 +425,12 @@ impl PanelLayout {
 
 /// These controls share a card with the monitor they configure.
 fn detail_parent(key: Key) -> Option<Key> {
-    use PreviewKey::*;
-    Some(Key::Preview(match key {
-        Key::Preview(CpuStyle) => Cpu,
-        Key::Preview(GpuTemperature) => Temperature,
-        Key::Preview(MemoryStyle) => Memory,
-        Key::Preview(DiskStyle) => Disk,
+    use MonitorKey::*;
+    Some(Key::Monitor(match key {
+        Key::Monitor(CpuStyle) => Cpu,
+        Key::Monitor(GpuTemperature) => Temperature,
+        Key::Monitor(MemoryStyle) => Memory,
+        Key::Monitor(DiskStyle) => Disk,
         _ => return None,
     }))
 }
@@ -722,7 +722,7 @@ mod tests {
                     assert_eq!(layout.hit(gap, y), None);
                 }
                 Part::Switch { area, .. } => {
-                    assert_eq!(detail.key, Key::Preview(PreviewKey::GpuTemperature));
+                    assert_eq!(detail.key, Key::Monitor(MonitorKey::GpuTemperature));
                     let toggle = Some(Action::Change(detail.key, Adjust::Toggle));
                     assert_eq!(action_at(*area), toggle);
                     assert_eq!(action_at(detail.label_area.unwrap()), toggle);

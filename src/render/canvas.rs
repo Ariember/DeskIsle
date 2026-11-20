@@ -386,6 +386,20 @@ impl Canvas {
         color: Rgb,
         alpha: f32,
     ) -> Result<()> {
+        self.draw_shapes(icon::sketch(symbol), x, y, size, weight, color, alpha)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_shapes(
+        &self,
+        shapes: Vec<icon::Shape>,
+        x: f32,
+        y: f32,
+        size: f32,
+        weight: f32,
+        color: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
         let unit = size / icon::GRID * self.scale;
         let left = self.origin.x as f32 + (x - size / 2.) * self.scale;
         let top = self.origin.y as f32 + (y - size / 2.) * self.scale;
@@ -411,7 +425,7 @@ impl Canvas {
                 },
                 None,
             )?;
-            for shape in icon::sketch(symbol) {
+            for shape in shapes {
                 let geometry = factory.CreatePathGeometry()?;
                 let sink = geometry.Open()?;
                 let begin = match shape.paint {

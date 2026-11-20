@@ -2,6 +2,7 @@ pub mod audio;
 pub mod display;
 pub mod launchpad;
 pub mod media;
+pub mod metrics;
 pub mod network;
 pub mod power;
 pub mod shell;
@@ -169,6 +170,12 @@ pub fn monitor() -> Result<Monitor> {
 }
 
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
+const METRICS_UPDATED: u32 = WM_APP + 6;
+
+/// Wakes the UI thread. The worker holds the window's lifetime lock through this call.
+pub fn notify_metrics(hwnd: HWND) -> Result<()> {
+    unsafe { PostMessageW(Some(hwnd), METRICS_UPDATED, WPARAM(0), LPARAM(0)) }
+}
 
 /// Reserves the top edge of the primary monitor for the status bar, so maximized
 /// windows keep their caption buttons below it.
@@ -338,6 +345,7 @@ pub enum Event {
     Refresh,
     Display,
     Clock,
+    MetricsUpdate,
     Move(HWND, i32, i32),
     Leave,
     Click(HWND, i32, i32),
@@ -455,6 +463,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         audio::AUDIO_CHANGED if wp.0 != 0 => Event::DefaultOutput,
         audio::AUDIO_CHANGED => Event::Audio,
         system_worker::UPDATED => Event::SystemUpdate,
+        METRICS_UPDATED => Event::MetricsUpdate,
         m if m != 0 && m == TASKBAR_CREATED.get() => Event::ShellRestart,
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),

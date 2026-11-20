@@ -1,4 +1,5 @@
 use crate::geometry::Rect;
+use crate::metrics::{Indicator, Style};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
@@ -165,6 +166,8 @@ pub struct StatusLayout {
     pub tray: Vec<Slot>,
     /// Lists every tray icon, so it appears whenever any icon exists.
     pub overflow: Option<Rect>,
+    /// Visible monitoring indicators, in the same order as the settings.
+    pub metrics: Vec<Rect>,
     /// System controls in display order.
     pub system: Vec<(SystemItem, Rect)>,
     pub clock: Rect,
@@ -182,6 +185,7 @@ impl StatusLayout {
         shown: usize,
         total: usize,
         system: &[SystemItem],
+        metrics: &[Indicator],
     ) -> Self {
         let px = scaled(dpi);
         let width = width.max(1);
@@ -210,18 +214,42 @@ impl StatusLayout {
                 (item, rect)
             })
             .collect::<Vec<_>>();
-        // The overflow button keeps the tray's pitch on both sides: its center sits one
-        // slot from the last tray icon's and one slot from the first system control's, so
-        // the chevron is spaced evenly between its neighbors.
-        let first_center = system
-            .first()
-            .map_or(system_start + slot / 2, |(_, r)| r.x + r.width / 2);
+        // Reserve the mark, some title space and the overflow button before adding
+        // indicators. Keep complete cells so a clipped value never reads incorrectly.
+        let metrics_room = system_start - px(100) - if total > 0 { slot } else { 0 };
+        let mut metrics_width = 0;
+        let mut metric_slots = Vec::new();
+        for indicator in metrics {
+            let w = px(match indicator.style {
+                Style::Value => 60,
+                Style::Graph => 56,
+                Style::Bars | Style::Ring => 44,
+            });
+            if metrics_width + w > metrics_room {
+                break;
+            }
+            metric_slots.push(cell(metrics_width, w));
+            metrics_width += w;
+        }
+        let metrics_start = system_start - metrics_width;
+        for r in &mut metric_slots {
+            r.x += metrics_start;
+        }
+        // With no monitors, center the overflow chevron on the tray's pitch relative
+        // to the first system icon. Otherwise the chevron precedes the monitor strip.
+        let first_center = if metric_slots.is_empty() {
+            system
+                .first()
+                .map_or(system_start + slot / 2, |(_, r)| r.x + r.width / 2)
+        } else {
+            metrics_start + slot / 2
+        };
         let half = px(13).max(1);
         let overflow = (total > 0).then(|| {
             let center = (first_center - slot).max(half);
             cell(center - half, 2 * half)
         });
-        let tray_end = overflow.map_or(system_start, |r| r.x + r.width / 2 - slot / 2);
+        let tray_end = overflow.map_or(metrics_start, |r| r.x + r.width / 2 - slot / 2);
         // Keep room for the mark and the active application's name.
         let title_min = px(220);
         let capacity = ((tray_end - title_min).max(0) / slot) as usize;
@@ -245,6 +273,7 @@ impl StatusLayout {
             title,
             tray,
             overflow,
+            metrics: metric_slots,
             system,
             clock,
         }
@@ -377,7 +406,7 @@ mod tests {
             let px = scaled(dpi);
             let (width, height) = (px(1920), px(STATUS_HEIGHT));
             let system = [SystemItem::Network, SystemItem::Sound, SystemItem::Control];
-            let layout = StatusLayout::new(width, height, dpi, 3, 5, &system);
+            let layout = StatusLayout::new(width, height, dpi, 3, 5, &system, &[]);
             assert_eq!(layout.tray.len(), 3);
             let overflow = layout.overflow.unwrap();
             let last = layout.tray[2].rect;
@@ -411,12 +440,12 @@ mod tests {
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
             // A narrow bar moves icons into the overflow list but keeps the title area.
-            let narrow = StatusLayout::new(px(520), height, dpi, 40, 40, &system);
+            let narrow = StatusLayout::new(px(520), height, dpi, 40, 40, &system, &[]);
             assert!(narrow.tray.len() < 40);
             assert!(narrow.tray[0].rect.x >= px(220));
             assert!(narrow.overflow.is_some());
         }
-        let empty = StatusLayout::new(800, 30, 96, 0, 0, &[]);
+        let empty = StatusLayout::new(800, 30, 96, 0, 0, &[], &[]);
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
         assert_eq!(empty.hit(700, 10), StatusHit::Title);
         assert_eq!(empty.hit(735, 10), StatusHit::Bar);
@@ -425,7 +454,7 @@ mod tests {
     #[test]
     fn battery_slot_has_room_for_its_charge_and_targets_highlight_slots() {
         let system = [SystemItem::Battery, SystemItem::Control];
-        let layout = StatusLayout::new(1920, 30, 96, 0, 0, &system);
+        let layout = StatusLayout::new(1920, 30, 96, 0, 0, &system, &[]);
         let (battery, control) = (layout.system[0].1, layout.system[1].1);
         assert_eq!(battery.width, 60);
         assert_eq!(battery.x + battery.width, control.x);
@@ -436,5 +465,50 @@ mod tests {
         assert_eq!(layout.target(StatusHit::Clock), Some(layout.clock));
         assert_eq!(layout.target(StatusHit::Mark), Some(layout.mark));
         assert_eq!(layout.target(StatusHit::Bar), None);
+    }
+
+    #[test]
+    fn metrics_stay_between_overflow_and_system_controls_at_each_scale() {
+        use crate::metrics::Metric;
+
+        let metrics = [Style::Value, Style::Bars, Style::Graph, Style::Ring]
+            .map(|style| Indicator::new(Metric::Cpu, style));
+        for dpi in [96, 120, 144, 192] {
+            let px = scaled(dpi);
+            let layout = |width, count| {
+                StatusLayout::new(
+                    px(width),
+                    px(STATUS_HEIGHT),
+                    dpi,
+                    count,
+                    count,
+                    &[SystemItem::Network, SystemItem::Sound],
+                    &metrics,
+                )
+            };
+            let full = layout(1000, 5);
+            assert_eq!(full.metrics.len(), metrics.len());
+            let overflow = full.overflow.unwrap();
+            assert!(overflow.x + overflow.width <= full.metrics[0].x);
+            for pair in full.metrics.windows(2) {
+                assert_eq!(pair[0].x + pair[0].width, pair[1].x);
+            }
+            let last = full.metrics.last().unwrap();
+            assert_eq!(last.x + last.width, full.system[0].1.x);
+            assert_eq!(full.hit(full.metrics[0].x, 0), StatusHit::Bar);
+            assert_eq!(full.hit(overflow.x, 0), StatusHit::Overflow);
+            assert_eq!(
+                full.hit(last.x + last.width, 0),
+                StatusHit::System(SystemItem::Network)
+            );
+
+            let narrow = layout(345, 5);
+            assert_eq!(narrow.metrics.len(), 1);
+            assert!(narrow.tray.is_empty());
+            assert!(narrow.overflow.is_some());
+            let empty_tray = layout(1000, 0);
+            assert!(empty_tray.overflow.is_none());
+            assert!(empty_tray.title.x + empty_tray.title.width <= empty_tray.metrics[0].x);
+        }
     }
 }

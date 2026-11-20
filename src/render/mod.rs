@@ -1,6 +1,7 @@
 mod canvas;
 mod launchpad;
 mod menu;
+mod metrics;
 mod panel;
 
 use std::{
@@ -30,6 +31,7 @@ use windows::Win32::{
 use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
+use crate::metrics::Indicator;
 use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{StatusHit, StatusLayout};
 use crate::ui::system::Mark;
@@ -74,6 +76,7 @@ pub struct Renderer {
     bottom_size: Option<Dimensions>,
     indicators: Vec<(i32, bool, bool)>,
     top_state: Option<TopState>,
+    metric_layer: Option<metrics::MetricLayer>,
     menu: Option<MenuView>,
     panel: Option<PanelView>,
     launchpad: Option<launchpad::LaunchpadView>,
@@ -276,6 +279,7 @@ impl Renderer {
                 bottom_size: None,
                 indicators: Vec::new(),
                 top_state: None,
+                metric_layer: None,
                 menu: None,
                 panel: None,
                 launchpad: None,
@@ -325,7 +329,9 @@ impl Renderer {
         marks: &[Mark],
         open: Option<StatusHit>,
         hover: Option<StatusHit>,
+        metrics: &[Indicator],
     ) -> Result<()> {
+        let metrics_changed = self.update_metrics(layout, dpi, metrics)?;
         let state = TopState {
             layout: layout.clone(),
             dpi,
@@ -337,6 +343,9 @@ impl Renderer {
             hover,
         };
         if self.top_state.as_ref() == Some(&state) {
+            if metrics_changed {
+                unsafe { self.device.Commit()? };
+            }
             return Ok(());
         }
         let s = dpi as f32 / 96.;
