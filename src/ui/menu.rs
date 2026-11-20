@@ -93,13 +93,17 @@ pub struct Menu<C> {
     pub entries: Vec<Entry<C>>,
     /// The narrowest the panel gets, in DIPs.
     pub min_width: f32,
+    /// The widest the panel gets, in DIPs. Longer text ends in an ellipsis.
+    pub max_width: f32,
 }
 
 impl<C> Menu<C> {
-    pub fn new() -> Self {
+    /// A menu of exactly `width` DIPs, so DeskIsle's menus line up whatever they list.
+    pub fn fixed(width: f32) -> Self {
         Self {
             entries: Vec::new(),
-            min_width: MIN_WIDTH,
+            min_width: width,
+            max_width: width,
         }
     }
 
@@ -239,8 +243,9 @@ pub const TEXT_INSET: f32 = 12.;
 pub const LABEL_SIZE: f32 = 13.;
 pub const DETAIL_SIZE: f32 = 12.;
 pub const TITLE_SIZE: f32 = 14.;
-const MIN_WIDTH: f32 = 216.;
-const MAX_WIDTH: f32 = 380.;
+/// Width shared by every menu: the status bar's flyouts, clock, tray overflow and
+/// DeskIsle menu, and the application menus of the Dock and the status bar title.
+pub const DROPDOWN_WIDTH: f32 = 320.;
 /// Distance between the menu and the target it was opened for, in DIPs.
 const GAP: f32 = 6.;
 
@@ -372,9 +377,9 @@ impl MenuLayout {
         if checks {
             content += CHECK_COLUMN;
         }
-        let panel = (content + 2. * PADDING)
-            .ceil()
-            .clamp(menu.min_width.min(MAX_WIDTH), MAX_WIDTH);
+        let max = menu.max_width.max(1.);
+        let min = menu.min_width.min(max);
+        let panel = (content + 2. * PADDING).ceil().clamp(min, max);
         Self {
             scale: dpi as f32 / 96.,
             width: panel + 2. * SHADOW,
@@ -596,11 +601,12 @@ fn windows_list(menu: &mut Menu<Command>, app: &AppGroup, foreground: Option<isi
 }
 
 fn app_header(menu: &mut Menu<Command>, app: &AppGroup) {
-    let subtitle = match (app.windows.len(), app.pinned()) {
-        (0, true) => "已固定 · 未运行".to_owned(),
-        (0, false) => String::new(),
-        (n, _) if app.active => format!("{n} 个窗口 · 前台"),
-        (n, _) => format!("{n} 个窗口"),
+    // The rows below already list the windows and offer pinning, so the subtitle only
+    // says what they cannot: whether the application is in front or not running.
+    let subtitle = match app.windows.len() {
+        0 => "未运行",
+        _ if app.active => "前台",
+        _ => "",
     };
     let icon = app
         .executable()
@@ -611,7 +617,7 @@ fn app_header(menu: &mut Menu<Command>, app: &AppGroup) {
 
 /// The menu of one application's Dock icon or status bar title.
 pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
-    let mut menu = Menu::new();
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     app_header(&mut menu, app);
     windows_list(&mut menu, app, foreground);
     menu.separator();
@@ -676,7 +682,7 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
 
 /// Lets the user pick one of several windows after a click on the Dock icon.
 pub fn window_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
-    let mut menu = Menu::new();
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     app_header(&mut menu, app);
     windows_list(&mut menu, app, foreground);
     menu
@@ -685,7 +691,7 @@ pub fn window_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
 /// Empty space on either bar and the status bar mark: every application, a few system
 /// tools, and quitting DeskIsle.
 pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
-    let mut menu = Menu::new();
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     let running = apps.iter().filter(|a| !a.windows.is_empty()).count();
     menu.header(
         "DeskIsle",
@@ -741,7 +747,7 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
 }
 
 pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
-    let mut menu = Menu::new();
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.header(date, year, Icon::Glyph("\u{E787}"));
     menu.separator();
     menu.item(
@@ -769,23 +775,19 @@ pub struct TrayEntry<'a> {
 
 /// Icons that are not on the bar for activation, then every icon as a toggle.
 pub fn tray_menu(icons: &[TrayEntry<'_>]) -> Menu<Command> {
-    let mut menu = Menu::new();
-    let hidden = icons.iter().filter(|i| !i.on_bar).count();
-    menu.header(
-        "通知区域",
-        format!("{} 个图标 · {hidden} 个未显示", icons.len()),
-        Icon::Glyph("\u{E946}"),
-    );
-    menu.separator();
-    for icon in icons.iter().filter(|i| !i.on_bar) {
-        menu.item(
-            icon.label,
-            Icon::Tray(icon.index),
-            Some(Command::TrayActivate(icon.index)),
-        );
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
+    if icons.iter().any(|i| !i.on_bar) {
+        menu.label("其他图标");
+        for icon in icons.iter().filter(|i| !i.on_bar) {
+            menu.item(
+                icon.label,
+                Icon::Tray(icon.index),
+                Some(Command::TrayActivate(icon.index)),
+            );
+        }
+        menu.separator();
     }
-    menu.separator();
-    menu.item("在状态栏显示", Icon::None, None);
+    menu.label("在状态栏显示");
     for icon in icons {
         menu.item(
             icon.label,
@@ -806,7 +808,7 @@ mod tests {
     }
 
     fn sample() -> Menu<u8> {
-        let mut menu = Menu::new();
+        let mut menu = Menu::fixed(DROPDOWN_WIDTH);
         menu.separator();
         menu.header("Editor", "2 个窗口", Icon::None);
         menu.item("first", Icon::Window { active: true }, Some(1));
@@ -878,6 +880,18 @@ mod tests {
             e,
             Entry::Item(Item { icon: Icon::Window { active: true }, label, .. }) if label == "viewer 8"
         )));
+
+        // The header only says what the rows cannot, and the menu lines up with the
+        // status bar dropdowns.
+        let subtitle = |menu: &Menu<Command>| match &menu.entries[0] {
+            Entry::Header { subtitle, .. } => subtitle.clone(),
+            _ => panic!("menus start with the application header"),
+        };
+        assert_eq!(subtitle(&menu), "前台");
+        let mut idle = app_menu(&apps[0], Some(8));
+        assert_eq!(subtitle(&idle), "未运行");
+        let layout = MenuLayout::new(&mut idle, 96, measure);
+        assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
     }
 
     #[test]
@@ -955,20 +969,20 @@ mod tests {
         assert_eq!(menu.step(first, true), last);
         assert_eq!(menu.step(last, true), first);
         assert_eq!(menu.step(first, false), last);
-        let mut empty = Menu::<u8>::new();
+        let mut empty = Menu::<u8>::fixed(DROPDOWN_WIDTH);
         empty.header("t", "", Icon::None);
         assert_eq!(empty.step(None, true), None);
     }
 
     #[test]
-    fn width_follows_text_within_limits() {
-        let mut short = sample();
-        let mut long = sample();
-        long.item("x".repeat(400), Icon::None, Some(3));
-        let short = MenuLayout::new(&mut short, 96, measure);
-        let long = MenuLayout::new(&mut long, 96, measure);
-        assert_eq!(short.width, MIN_WIDTH + 2. * SHADOW);
-        assert_eq!(long.width, MAX_WIDTH + 2. * SHADOW);
+    fn menus_keep_one_width_whatever_their_text() {
+        // Long text ends in an ellipsis instead of widening the menu.
+        for label in ["x".to_owned(), "x".repeat(400)] {
+            let mut fixed = sample();
+            fixed.item(label, Icon::None, Some(3));
+            let fixed = MenuLayout::new(&mut fixed, 96, measure);
+            assert_eq!(fixed.width, DROPDOWN_WIDTH + 2. * SHADOW);
+        }
     }
 
     #[test]

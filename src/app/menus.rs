@@ -5,7 +5,7 @@ use crate::ui::layout::{StatusHit, SystemItem};
 use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
 };
-use crate::ui::system::volume_slider;
+use crate::ui::system::{settings_page, volume_slider};
 use windows::Win32::Foundation::HWND;
 use windows::core::{Error, Result};
 
@@ -20,7 +20,8 @@ impl Bars {
                     Ok(false)
                 }
                 StatusHit::Overflow => self.tray_menu(),
-                StatusHit::System(item) => self.flyout(item),
+                // A left click opens the flyout; a right click goes straight to Settings.
+                StatusHit::System(item) => self.run_command(Command::Open(settings_page(item))),
                 StatusHit::Clock => self.clock_menu(),
                 StatusHit::Title => match self.apps.iter().position(|app| app.active) {
                     Some(index) => {

@@ -331,6 +331,8 @@ pub enum Event {
     Leave,
     Click(HWND, i32, i32),
     RightClick(HWND, i32, i32),
+    /// The middle button was released over a bar, in its client pixels.
+    MiddleClick(HWND, i32, i32),
     Menu(HWND),
     /// A mouse button went down on a bar (`true` for the right button).
     Press(HWND, bool),
@@ -359,7 +361,8 @@ pub enum Event {
     DefaultOutput,
     /// The power source or battery charge changed.
     Power,
-    Scroll(i16),
+    /// A wheel turn of `delta` (120 per notch) over a bar, at its client pixels.
+    Scroll(HWND, i16, i32, i32),
     /// Pointer input in the settings panel, in its client pixels.
     PanelMove(i32, i32),
     PanelLeave,
@@ -434,8 +437,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_RBUTTONDOWN => Event::Press(hwnd, true),
         WM_LBUTTONUP => Event::Click(hwnd, x, y),
         WM_RBUTTONUP => Event::RightClick(hwnd, x, y),
+        WM_MBUTTONUP => Event::MiddleClick(hwnd, x, y),
         WM_CONTEXTMENU => Event::Menu(hwnd),
-        WM_MOUSEWHEEL => Event::Scroll((wp.0 >> 16) as i16),
+        WM_MOUSEWHEEL => {
+            // Wheel messages carry screen coordinates.
+            let mut point = POINT { x, y };
+            let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+            Event::Scroll(hwnd, (wp.0 >> 16) as i16, point.x, point.y)
+        }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     };
@@ -453,8 +462,9 @@ fn queue(hwnd: HWND, event: Event) {
                 Event::Click(..)
                     | Event::SystemUpdate
                     | Event::RightClick(..)
+                    | Event::MiddleClick(..)
                     | Event::Press(..)
-                    | Event::Scroll(_)
+                    | Event::Scroll(..)
                     | Event::MenuPick(..)
                     | Event::MenuPress(..)
                     | Event::MenuKey(_)

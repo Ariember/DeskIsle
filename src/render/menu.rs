@@ -14,7 +14,14 @@ use crate::ui::system::PLAYER_GLYPH;
 use super::canvas::{Canvas, Rgb, Text, paint, text_format};
 use super::{Renderer, ease};
 
-const MENU_RADIUS: f32 = 10.;
+/// The panel's corner radius. The highlight inside it, inset by the panel padding,
+/// uses a radius that keeps both corners concentric.
+const MENU_RADIUS: f32 = 12.;
+const HIGHLIGHT_RADIUS: f32 = MENU_RADIUS - menu::PADDING;
+/// Diameter of the round backing every glyph icon of a menu row sits on.
+const ICON_BADGE: f32 = 24.;
+/// Marks a window in an application's list; filled for the foreground window.
+const WINDOW_GLYPH: &str = "\u{E922}";
 const OPEN_DURATION: f32 = 0.12;
 const HOVER_DURATION: f32 = 0.09;
 
@@ -144,7 +151,8 @@ impl Renderer {
             }
         }
         let (row_left, _, row_right, _) = layout.row(0);
-        let highlight = |accent: Rgb| {
+        // A plain rounded wash, the same shape the status bar uses behind its targets.
+        let highlight = |accent: Rgb, alpha: f32| {
             paint(
                 &self.device,
                 self.palette,
@@ -153,15 +161,12 @@ impl Renderer {
                 dpi,
                 |c| {
                     let (w, h) = (row_right - row_left, menu::ITEM_HEIGHT);
-                    c.fill(0., 1., w, h - 1., 6., accent, 0.17)?;
-                    c.stroke(0., 1., w, h - 1., 6., accent, 0.22)?;
-                    // A short accent bar at the leading edge marks the selected row.
-                    c.round(2., h / 2. - 7., 5., h / 2. + 7., 1.5, accent)
+                    c.fill(0., 1., w, h - 1., HIGHLIGHT_RADIUS, accent, alpha)
                 },
             )
         };
-        let accent = highlight(self.palette.accent)?;
-        let danger = highlight(self.palette.danger)?;
+        let accent = highlight(self.palette.accent, 0.1)?;
+        let danger = highlight(self.palette.danger, 0.12)?;
         unsafe {
             let target = self.device.CreateTargetForHwnd(hwnd, true)?;
             let root = self.device.CreateVisual()?;
@@ -332,14 +337,26 @@ impl Renderer {
             c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)?;
         }
         let ink = if on { c.p.on_accent } else { c.p.ink };
-        self.glyph_at(
-            c,
-            glyph,
-            Area::new(x - r, y - r, x + r, y + r),
-            size * 0.5,
-            ink,
-            1.,
-        )
+        let area = Area::new(x - r, y - r, x + r, y + r);
+        self.glyph_at(c, glyph, area, size * 0.5, ink, 1.)
+    }
+
+    /// A glyph of a command row on a faint circle of its own `tint`, so a destructive
+    /// command reads red and a disabled one fades with its label.
+    #[allow(clippy::too_many_arguments)]
+    fn soft_badge(
+        &self,
+        c: &Canvas,
+        glyph: &str,
+        x: f32,
+        y: f32,
+        tint: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        let r = ICON_BADGE / 2.;
+        c.fill(x - r, y - r, x + r, y + r, r, tint, 0.1 * alpha)?;
+        let area = Area::new(x - r, y - r, x + r, y + r);
+        self.glyph_at(c, glyph, area, ICON_BADGE * 0.5, tint, alpha)
     }
 
     fn paint_entry<C>(
@@ -367,8 +384,9 @@ impl Renderer {
                     c.fill(l, t, r, b, 10., c.p.line, 0.055)?;
                     c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
                     let y = (t + b) / 2.;
-                    self.badge(c, tile.glyph, l + 8. + 15., y, 30., tile.on)?;
-                    let text = Area::new(l + 46., t, r - 6., y + 1.);
+                    // Three tiles share the fixed dropdown width; keep their text room.
+                    self.badge(c, tile.glyph, l + 6. + 14., y, 28., tile.on)?;
+                    let text = Area::new(l + 42., t, r - 4., y + 1.);
                     let alpha = if tile.command.is_some() { 1. } else { 0.5 };
                     self.text_at(
                         c,
@@ -382,7 +400,7 @@ impl Renderer {
                         c.p.ink,
                         alpha,
                     )?;
-                    let detail = Area::new(l + 46., y, r - 6., y + 16.);
+                    let detail = Area::new(l + 42., y, r - 4., y + 16.);
                     self.text_at(c, &tile.detail, detail, 11., false, c.p.muted, 0.9)?;
                 }
                 Ok(())
@@ -472,37 +490,16 @@ impl Renderer {
                     (false, true) => (c.p.ink, 1.),
                 };
                 match &item.icon {
-                    Icon::Glyph(glyph) => c.draw_text(
-                        &self.write,
-                        glyph,
-                        c.rect(icon_x - 10., top, icon_x + 10., bottom),
-                        Text {
-                            size: 15.,
-                            glyph: true,
-                            align: DWRITE_TEXT_ALIGNMENT_CENTER,
-                            ..Text::default()
-                        },
-                        if item.danger { c.p.danger } else { c.p.muted },
-                        alpha,
-                    )?,
+                    // Glyphs, options and windows all sit on the same round backing.
+                    Icon::Glyph(glyph) => {
+                        let tint = if item.danger { c.p.danger } else { c.p.ink };
+                        self.soft_badge(c, glyph, icon_x, middle, tint, alpha)?;
+                    }
                     Icon::Choice { glyph, on } => {
-                        self.badge(c, glyph, icon_x, middle, 24., *on)?;
+                        self.badge(c, glyph, icon_x, middle, ICON_BADGE, *on)?;
                     }
                     Icon::Window { active } => {
-                        let (half, color) = if *active {
-                            (3.5, c.p.accent)
-                        } else {
-                            (2.5, c.p.muted)
-                        };
-                        c.fill(
-                            icon_x - half,
-                            middle - half,
-                            icon_x + half,
-                            middle + half,
-                            half,
-                            color,
-                            alpha,
-                        )?;
+                        self.badge(c, WINDOW_GLYPH, icon_x, middle, ICON_BADGE, *active)?;
                     }
                     icon => {
                         let size = 18.;
@@ -580,7 +577,8 @@ impl Renderer {
             Icon::File(path) => self.shell_icon(path).ok().flatten(),
             Icon::Tray(index) => tray(*index).and_then(|icon| self.hicon_bitmap(icon).ok()),
             Icon::Glyph(glyph) => {
-                c.fill(x, y, x + size, y + size, size * 0.28, c.p.accent, 0.16)?;
+                // Round like every other glyph backing in the menus.
+                c.fill(x, y, x + size, y + size, size / 2., c.p.accent, 0.12)?;
                 c.glyph(
                     &self.write,
                     glyph,

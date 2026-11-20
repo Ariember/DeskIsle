@@ -4,11 +4,14 @@
 use super::Bars;
 use crate::platform::{audio, display, power, system_worker::Snapshot};
 use crate::system::{Display, Network};
-use crate::ui::layout::SystemItem;
+use crate::ui::layout::{StatusHit, SystemItem};
 use crate::ui::menu::{Command, Menu};
 use crate::ui::system::{self, SystemCommand, SystemStatus};
 use windows::Win32::Foundation::HWND;
 use windows::core::Result;
+
+/// Wheel movement of one notch, as Windows reports it.
+const NOTCH: i32 = 120;
 
 /// Queries what the status bar icons show. A feature whose query fails shows as
 /// unavailable until the next update rather than stopping DeskIsle.
@@ -90,6 +93,38 @@ impl Bars {
             watch.bind_default();
         } else {
             self.audio_watch = audio::AudioWatch::new(self.top.0).ok();
+        }
+    }
+
+    /// Turns the default output's volume by wheel `delta` over the sound icon. Wheel
+    /// turns elsewhere on the status bar do nothing.
+    pub(super) fn scroll_status(&mut self, delta: i16, x: i32, y: i32) -> Result<()> {
+        if self.status.hit(x, y) != StatusHit::System(SystemItem::Sound) {
+            self.wheel = 0;
+            return Ok(());
+        }
+        // Precision touchpads send fractions of a notch; collect them into whole steps.
+        self.wheel += i32::from(delta);
+        let notches = self.wheel / NOTCH;
+        self.wheel %= NOTCH;
+        let Ok(state) = audio::state() else {
+            return Ok(());
+        };
+        let Some(volume) = system::wheel_volume(&state, notches) else {
+            return Ok(());
+        };
+        if let Err(error) = audio::set_volume(volume) {
+            crate::platform::report_error(Some(self.top.0), &error);
+        }
+        // Windows reports the new volume, which redraws the icon.
+        Ok(())
+    }
+
+    /// Mutes or unmutes the default output, as a middle click on the sound icon does.
+    pub(super) fn toggle_mute(&self) {
+        let result = audio::state().and_then(|state| audio::set_muted(!state.muted));
+        if let Err(error) = result {
+            crate::platform::report_error(Some(self.top.0), &error);
         }
     }
 

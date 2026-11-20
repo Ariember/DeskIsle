@@ -28,10 +28,11 @@ use windows::Win32::{
 };
 use windows::core::{Error, HSTRING, Interface, Result};
 
-use crate::ui::layout::{StatusLayout, SystemItem};
+use crate::geometry::Rect;
+use crate::ui::layout::{StatusHit, StatusLayout, SystemItem};
 use crate::ui::system::Mark;
 
-use self::canvas::{Palette, Text, paint};
+use self::canvas::{Canvas, Palette, Text, paint};
 use self::menu::MenuView;
 use self::panel::PanelView;
 
@@ -84,6 +85,7 @@ struct TopState {
     stamps: Vec<u64>,
     marks: Vec<Mark>,
     open: Option<SystemItem>,
+    hover: Option<StatusHit>,
 }
 
 struct Bar {
@@ -121,6 +123,8 @@ struct IconLayer {
 }
 
 const DURATION: f32 = 0.14;
+/// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
+const PILL_RADIUS: f32 = 7.;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
 fn ease(
@@ -242,7 +246,7 @@ impl Renderer {
 
     /// Each stamp identifies the current tray image and its attention indicator.
     /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the control
-    /// whose flyout is `open`.
+    /// whose flyout is `open` and a fainter one behind the `hover` target.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_top(
         &mut self,
@@ -253,6 +257,7 @@ impl Renderer {
         icons: &[TrayImage],
         marks: &[Mark],
         open: Option<SystemItem>,
+        hover: Option<StatusHit>,
     ) -> Result<()> {
         let state = TopState {
             layout: layout.clone(),
@@ -262,6 +267,7 @@ impl Renderer {
             stamps: icons.iter().map(|image| image.stamp).collect(),
             marks: marks.to_vec(),
             open,
+            hover,
         };
         if self.top_state.as_ref() == Some(&state) {
             return Ok(());
@@ -270,6 +276,22 @@ impl Renderer {
         let dip = |px: i32| px as f32 / s;
         let w = dip(layout.width);
         let h = dip(layout.height);
+        // Every target shares one rounded backing: faint while hovered, stronger while
+        // its dropdown is open.
+        let open_slot = open.and_then(|item| layout.target(StatusHit::System(item)));
+        let hover_slot = hover
+            .and_then(|hit| layout.target(hit))
+            .filter(|&slot| Some(slot) != open_slot);
+        let backing = |c: &Canvas, slot: Rect, alpha: f32| {
+            let (l, r) = (dip(slot.x) + 2., dip(slot.x + slot.width) - 2.);
+            c.fill(l, 4., r, h - 4., PILL_RADIUS, c.p.line, alpha)
+        };
+        let glyph_text = Text {
+            size: 15.,
+            glyph: true,
+            align: DWRITE_TEXT_ALIGNMENT_CENTER,
+            ..Text::default()
+        };
         let surface = paint(
             &self.device,
             self.palette,
@@ -278,9 +300,9 @@ impl Renderer {
             dpi,
             |c| {
                 c.bar_glass(w, h, 0.)?;
-                c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.16)?;
-                c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., c.p.accent)?;
-                c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., c.p.accent)?;
+                c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.12)?;
+                // The DeskIsle mark: a ring, as round as the controls beside it.
+                c.ring(18., h / 2., 6., 1.75, c.p.accent)?;
                 let t = layout.title;
                 c.text(
                     &self.write,
@@ -290,6 +312,12 @@ impl Renderer {
                     true,
                     c.p.ink,
                 )?;
+                if let Some(slot) = hover_slot {
+                    backing(c, slot, 0.08)?;
+                }
+                if let Some(slot) = open_slot {
+                    backing(c, slot, 0.15)?;
+                }
                 let icon_size = (16. * s).round();
                 for (slot, image) in layout.tray.iter().zip(icons) {
                     let r = slot.rect;
@@ -322,40 +350,50 @@ impl Renderer {
                         c.p.muted,
                     )?;
                 }
-                for (&(item, r), mark) in layout.system.iter().zip(marks) {
+                for (&(_, r), mark) in layout.system.iter().zip(marks) {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));
-                    if open == Some(item) {
-                        c.fill(l + 1., 3., right - 1., h - 3., 6., c.p.line, 0.14)?;
-                    }
                     match *mark {
                         Mark::Glyph { glyph, dim } => c.draw_text(
                             &self.write,
                             glyph,
                             c.rect(l, 0., right, h),
-                            Text {
-                                size: 15.,
-                                glyph: true,
-                                align: DWRITE_TEXT_ALIGNMENT_CENTER,
-                                ..Text::default()
-                            },
+                            glyph_text,
                             c.p.ink,
                             if dim { 0.4 } else { 1. },
                         )?,
+                        Mark::Battery { glyph, percent } => {
+                            let Some(percent) = percent else {
+                                let area = c.rect(l, 0., right, h);
+                                c.draw_text(&self.write, glyph, area, glyph_text, c.p.ink, 1.)?;
+                                continue;
+                            };
+                            let area = c.rect(l + 3., 0., l + 27., h);
+                            c.draw_text(&self.write, glyph, area, glyph_text, c.p.ink, 1.)?;
+                            c.draw_text(
+                                &self.write,
+                                &format!("{percent}%"),
+                                c.rect(l + 27., 0., right - 2., h),
+                                Text {
+                                    size: 11.5,
+                                    ..Text::default()
+                                },
+                                c.p.ink,
+                                1.,
+                            )?;
+                        }
                         Mark::Switches => {
-                            // Two small switches, the upper one on.
+                            // Two filled capsules with round knobs, the upper one on.
                             let x = (l + right) / 2.;
                             let y = h / 2.;
-                            for (top, on) in [(y - 6., true), (y + 1., false)] {
-                                c.stroke(x - 7., top, x + 7., top + 5.5, 2.75, c.p.ink, 1.)?;
-                                let knob = if on { x + 4.25 } else { x - 4.25 };
-                                c.round(
-                                    knob - 1.75,
-                                    top + 1.,
-                                    knob + 1.75,
-                                    top + 4.5,
-                                    1.75,
-                                    c.p.ink,
-                                )?;
+                            for (top, on) in [(y - 7., true), (y + 1., false)] {
+                                let (bottom, alpha) = (top + 6., if on { 1. } else { 0.3 });
+                                c.fill(x - 7., top, x + 7., bottom, 3., c.p.ink, alpha)?;
+                                let (knob, color) = if on {
+                                    (x + 3.5, c.p.bar)
+                                } else {
+                                    (x - 3.5, c.p.ink)
+                                };
+                                c.round(knob - 2., top + 1., knob + 2., bottom - 1., 2., color)?;
                             }
                         }
                     }

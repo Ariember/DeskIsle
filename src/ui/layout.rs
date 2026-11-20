@@ -102,6 +102,17 @@ pub enum SystemItem {
     Control,
 }
 
+impl SystemItem {
+    /// Width of the control's slot on the status bar in DIPs. The battery also shows
+    /// its charge beside the glyph.
+    pub fn slot_width(self) -> i32 {
+        match self {
+            Self::Battery => 60,
+            _ => 30,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusHit {
     Tray(usize),
@@ -154,11 +165,20 @@ impl StatusLayout {
         let clock_width = px(48).min(width);
         let clock = cell((width - px(10) - clock_width).max(0), clock_width);
         let slot = px(28).max(1);
-        let system_start = (clock.x - px(4) - system.len() as i32 * slot).max(0);
+        let widths = system
+            .iter()
+            .map(|&item| px(item.slot_width()).max(1))
+            .collect::<Vec<_>>();
+        let system_start = (clock.x - px(4) - widths.iter().sum::<i32>()).max(0);
+        let mut next = system_start;
         let system = system
             .iter()
-            .enumerate()
-            .map(|(i, &item)| (item, cell(system_start + i as i32 * slot, slot)))
+            .zip(widths)
+            .map(|(&item, w)| {
+                let rect = cell(next, w);
+                next += w;
+                (item, rect)
+            })
             .collect::<Vec<_>>();
         let overflow = (total > 0).then(|| cell((system_start - px(6) - slot).max(0), slot));
         let tray_end = overflow.map_or(system_start, |r| r.x);
@@ -199,6 +219,20 @@ impl StatusLayout {
             StatusHit::Title
         } else {
             StatusHit::Bar
+        }
+    }
+
+    /// The slot a hovered or open target highlights. The title and empty space have none.
+    pub fn target(&self, hit: StatusHit) -> Option<Rect> {
+        match hit {
+            StatusHit::Tray(index) => self.tray.get(index).map(|slot| slot.rect),
+            StatusHit::Overflow => self.overflow,
+            StatusHit::System(item) => {
+                let found = self.system.iter().find(|(i, _)| *i == item);
+                found.map(|&(_, rect)| rect)
+            }
+            StatusHit::Clock => Some(self.clock),
+            StatusHit::Title | StatusHit::Bar => None,
         }
     }
 }
@@ -307,5 +341,20 @@ mod tests {
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
         assert_eq!(empty.hit(700, 10), StatusHit::Title);
         assert_eq!(empty.hit(735, 10), StatusHit::Bar);
+    }
+
+    #[test]
+    fn battery_slot_has_room_for_its_charge_and_targets_highlight_slots() {
+        let system = [SystemItem::Battery, SystemItem::Control];
+        let layout = StatusLayout::new(1920, 30, 96, 0, 0, &system);
+        let (battery, control) = (layout.system[0].1, layout.system[1].1);
+        assert_eq!(battery.width, 60);
+        assert_eq!(battery.x + battery.width, control.x);
+        let target = layout
+            .target(StatusHit::System(SystemItem::Control))
+            .unwrap();
+        assert_eq!(target, control);
+        assert_eq!(layout.target(StatusHit::Clock), Some(layout.clock));
+        assert_eq!(layout.target(StatusHit::Bar), None);
     }
 }

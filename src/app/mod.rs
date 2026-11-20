@@ -49,6 +49,10 @@ struct Bars {
     /// Keys of tray icons the user moved into the overflow menu.
     hidden: BTreeSet<String>,
     hover: Option<usize>,
+    /// The status bar target under the pointer, highlighted on the bar.
+    top_hover: Option<StatusHit>,
+    /// Wheel movement over the sound icon not yet turned into a volume step.
+    wheel: i32,
     time: String,
     /// A left press on a bar dismissed the open menu; its release must not click.
     swallow_click: bool,
@@ -156,6 +160,8 @@ pub(crate) fn run() -> Result<()> {
         shown: Vec::new(),
         hidden,
         hover: None,
+        top_hover: None,
+        wheel: 0,
         time,
         swallow_click: false,
         settings,
@@ -205,6 +211,7 @@ pub(crate) fn run() -> Result<()> {
                 if fullscreen {
                     bars.tray.cancel_click();
                     bars.set_hover(None)?;
+                    bars.set_top_hover(None)?;
                 }
             }
             Event::Clock => {
@@ -229,8 +236,18 @@ pub(crate) fn run() -> Result<()> {
                 platform::track_leave(hwnd)?;
                 bars.set_hover(bars.layout.hit(x, y))?;
             }
-            Event::Leave => bars.set_hover(None)?,
-            Event::Scroll(delta) if delta != 0 => {
+            Event::Move(hwnd, x, y) if hwnd == bars.top.0 => {
+                platform::track_leave(hwnd)?;
+                bars.set_top_hover(Some(bars.status.hit(x, y)))?;
+            }
+            Event::Leave => {
+                bars.set_hover(None)?;
+                bars.set_top_hover(None)?;
+            }
+            Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
+                bars.scroll_status(delta, x, y)?;
+            }
+            Event::Scroll(_, delta, _, _) if delta != 0 => {
                 let first = bars
                     .layout
                     .first
@@ -239,6 +256,7 @@ pub(crate) fn run() -> Result<()> {
                     bars.draw()?;
                 }
             }
+            Event::MiddleClick(owner, x, y) => bars.middle_click(owner, x, y)?,
             Event::Press(..) => {
                 bars.tray.cancel_click();
                 bars.swallow_click = false;
@@ -461,6 +479,17 @@ impl Bars {
         Ok(())
     }
 
+    /// Highlights the status bar target under the pointer. The title and empty space
+    /// have no highlight, so moving across them does not repaint.
+    fn set_top_hover(&mut self, hit: Option<StatusHit>) -> Result<()> {
+        let hit = hit.filter(|&hit| self.status.target(hit).is_some());
+        if self.top_hover != hit {
+            self.top_hover = hit;
+            self.draw()?;
+        }
+        Ok(())
+    }
+
     fn draw(&mut self) -> Result<()> {
         match self.draw_frame() {
             Err(e) if is_device_lost(&e) => {
@@ -514,6 +543,7 @@ impl Bars {
             &tray,
             &marks,
             self.open_flyout,
+            self.top_hover,
         )?;
         let icons = self
             .layout

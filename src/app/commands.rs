@@ -1,8 +1,12 @@
+use std::path::Path;
+
 use super::Bars;
 use crate::dock::{self, Action, group_apps};
 use crate::platform::{self, shell};
 use crate::storage;
+use crate::ui::layout::{StatusHit, SystemItem};
 use crate::ui::menu::{self, Command};
+use windows::Win32::Foundation::HWND;
 use windows::core::Result;
 
 impl Bars {
@@ -50,6 +54,27 @@ impl Bars {
         }
         self.refresh()?;
         Ok(false)
+    }
+
+    /// A middle click mutes or unmutes over the sound icon and starts another instance
+    /// over a Dock icon, as the Windows taskbar does.
+    pub(super) fn middle_click(&mut self, owner: HWND, x: i32, y: i32) -> Result<()> {
+        if owner == self.top.0 {
+            if self.status.hit(x, y) == StatusHit::System(SystemItem::Sound) {
+                self.toggle_mute();
+            }
+            return Ok(());
+        }
+        let path = match self.layout.hit(x, y) {
+            Some(index) if owner == self.bottom.0 => {
+                self.apps[index].executable().map(Path::to_path_buf)
+            }
+            _ => None,
+        };
+        match path {
+            Some(path) => self.run_command(Command::NewInstance(path)).map(drop),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn select(&mut self, index: usize) -> Result<()> {

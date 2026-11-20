@@ -198,6 +198,23 @@ impl Canvas {
         Ok(())
     }
 
+    /// A circle outline `width` DIPs thick, centered on `x`, `y`.
+    pub(super) fn ring(&self, x: f32, y: f32, radius: f32, width: f32, color: Rgb) -> Result<()> {
+        let mut ellipse = D2D1_ELLIPSE {
+            radiusX: radius * self.scale,
+            radiusY: radius * self.scale,
+            ..Default::default()
+        };
+        ellipse.point.X = self.origin.x as f32 + x * self.scale;
+        ellipse.point.Y = self.origin.y as f32 + y * self.scale;
+        let brush = self.brush_alpha(color, 1.)?;
+        unsafe {
+            self.ctx
+                .DrawEllipse(&ellipse, &brush, width * self.scale, None)
+        };
+        Ok(())
+    }
+
     /// Fills a rounded rectangle with a vertical gradient from `top` to `bottom`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn gradient(

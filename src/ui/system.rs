@@ -4,7 +4,7 @@
 
 use crate::system::{Audio, Battery, Display, Media, MediaAction, Network, PowerPlan, RadioKind};
 use crate::ui::layout::SystemItem;
-use crate::ui::menu::{Command, Entry, Icon, Menu, Slider, SliderTarget, Tile};
+use crate::ui::menu::{Command, DROPDOWN_WIDTH, Entry, Icon, Menu, Slider, SliderTarget, Tile};
 
 /// A change to a system feature, chosen in a flyout.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,11 @@ pub struct SystemStatus {
 pub enum Mark {
     /// A Segoe Fluent Icons glyph, drawn faded when `dim`.
     Glyph { glyph: &'static str, dim: bool },
+    /// The battery glyph followed by the charge, when the battery reports it.
+    Battery {
+        glyph: &'static str,
+        percent: Option<u8>,
+    },
     /// Two stacked switches, the control center's own mark.
     Switches,
 }
@@ -61,8 +66,14 @@ impl SystemStatus {
             },
             SystemItem::Display => glyph(DISPLAY),
             SystemItem::Battery => match self.battery {
-                Some(battery) => glyph(battery_glyph(battery)),
-                None => glyph(BATTERY_UNKNOWN),
+                Some(battery) => Mark::Battery {
+                    glyph: battery_glyph(battery),
+                    percent: battery.percent.map(|p| p.min(100)),
+                },
+                None => Mark::Battery {
+                    glyph: BATTERY_UNKNOWN,
+                    percent: None,
+                },
             },
             SystemItem::Sound => match &self.audio {
                 Some(audio) => glyph(volume_glyph(audio.volume, audio.muted)),
@@ -76,9 +87,37 @@ impl SystemStatus {
     }
 }
 
+/// The Windows settings page a right click on `item` opens directly, skipping the
+/// flyout a left click shows.
+pub fn settings_page(item: SystemItem) -> &'static str {
+    match item {
+        SystemItem::Network => "ms-settings:network",
+        SystemItem::Display => "ms-settings:display",
+        SystemItem::Battery => "ms-settings:powersleep",
+        SystemItem::Sound => "ms-settings:sound",
+        SystemItem::Control => "ms-settings:",
+    }
+}
+
+/// Volume change per wheel notch over the sound icon, in percent.
+pub const VOLUME_STEP: i32 = 2;
+
+/// The volume to set after `notches` wheel notches over the sound icon (positive is
+/// up), or `None` when nothing changes. Turning a muted output down leaves it muted;
+/// turning it up unmutes it, as dragging the slider does.
+pub fn wheel_volume(audio: &Audio, notches: i32) -> Option<u8> {
+    if notches == 0 || (audio.muted && notches < 0) {
+        return None;
+    }
+    let volume = (i32::from(audio.volume) + notches * VOLUME_STEP).clamp(0, 100) as u8;
+    (volume != audio.volume || audio.muted).then_some(volume)
+}
+
 const WIFI: &str = "\u{E701}";
+const ETHERNET: &str = "\u{E839}";
 const BLUETOOTH: &str = "\u{E702}";
 const DISPLAY: &str = "\u{E7F4}";
+const SETTINGS: &str = "\u{E713}";
 const BRIGHTNESS: &str = "\u{E706}";
 const MOON: &str = "\u{E708}";
 const CONTRAST: &str = "\u{E793}";
@@ -159,18 +198,15 @@ fn brightness_slider(menu: &mut Menu<Command>, display: &Display) {
     }));
 }
 
-const FLYOUT_WIDTH: f32 = 300.;
-
 /// Volume, output devices and the sound settings.
 pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
-    let mut menu = Menu::new();
-    menu.min_width = FLYOUT_WIDTH;
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.label("声音");
     add_volume(&mut menu, audio);
     menu.separator();
     match audio {
         Some(audio) if !audio.outputs.is_empty() => {
-            menu.label("输出");
+            menu.label("输出设备");
             for output in &audio.outputs {
                 // Choosing the current default again is harmless and keeps it clickable.
                 let command = Some(SystemCommand::SetOutput(output.id.clone()));
@@ -189,8 +225,8 @@ pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
     }
     menu.separator();
     menu.item(
-        "声音偏好设置",
-        Icon::None,
+        "声音设置",
+        Icon::Glyph(SETTINGS),
         Some(Command::Open("ms-settings:sound")),
     );
     menu
@@ -198,18 +234,18 @@ pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
 
 /// Charge, power plans and the battery settings.
 pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Command> {
-    let mut menu = Menu::new();
-    menu.min_width = FLYOUT_WIDTH;
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     if let Some(battery) = battery {
-        let percent = battery
-            .percent
-            .map_or("电量未知".into(), |p| format!("{p}%"));
         let source = match (battery.plugged, battery.charging) {
-            (true, true) => "已接通电源 · 正在充电",
+            (true, true) => "正在充电",
             (true, false) => "已接通电源",
             (false, _) => "正在使用电池",
         };
-        menu.label(format!("{percent}  {source}"));
+        // An unknown charge is left out rather than spelled out.
+        menu.label(match battery.percent {
+            Some(percent) => format!("电池 {percent}% · {source}"),
+            None => format!("电池 · {source}"),
+        });
         menu.separator();
     }
     if !plans.is_empty() {
@@ -225,14 +261,16 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
         }
         menu.separator();
     }
-    menu.item(
-        "电池偏好设置",
-        Icon::None,
-        Some(Command::Open("ms-settings:batterysaver")),
-    );
+    if battery.is_some() {
+        menu.item(
+            "电池设置",
+            Icon::Glyph(SETTINGS),
+            Some(Command::Open("ms-settings:batterysaver")),
+        );
+    }
     menu.item(
         "电源和睡眠设置",
-        Icon::None,
+        Icon::Glyph(SETTINGS),
         Some(Command::Open("ms-settings:powersleep")),
     );
     menu
@@ -240,18 +278,16 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
 
 /// Brightness, dark mode, HDR and the display settings.
 pub fn display_flyout(display: &Display) -> Menu<Command> {
-    let mut menu = Menu::new();
-    menu.min_width = FLYOUT_WIDTH;
-    menu.label(if display.brightness.is_some() {
-        "显示器"
-    } else {
-        "显示器 · 不支持调节亮度"
-    });
-    brightness_slider(&mut menu, display);
-    menu.separator();
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
+    menu.label("显示器");
+    // Monitors without DDC/CI get no slider instead of a dead one.
+    if display.brightness.is_some() {
+        brightness_slider(&mut menu, display);
+        menu.separator();
+    }
     choice(
         &mut menu,
-        "系统暗色模式",
+        "深色模式",
         CONTRAST,
         display.dark,
         Some(SystemCommand::SetDark(!display.dark)),
@@ -261,8 +297,8 @@ pub fn display_flyout(display: &Display) -> Menu<Command> {
     }
     menu.separator();
     menu.item(
-        "显示器偏好设置",
-        Icon::None,
+        "显示设置",
+        Icon::Glyph(SETTINGS),
         Some(Command::Open("ms-settings:display")),
     );
     menu
@@ -279,8 +315,7 @@ fn radio_detail(on: Option<bool>, connected: Option<&str>) -> String {
 
 /// Wi-Fi and Bluetooth switches and the network settings.
 pub fn network_flyout(network: &Network) -> Menu<Command> {
-    let mut menu = Menu::new();
-    menu.min_width = FLYOUT_WIDTH;
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.label("网络");
     for (kind, label, glyph, on, connected) in [
         (
@@ -298,25 +333,37 @@ pub fn network_flyout(network: &Network) -> Menu<Command> {
             None,
         ),
     ] {
+        // A radio this computer lacks is not listed; its settings link stays below.
+        let Some(on) = on else {
+            continue;
+        };
         menu.item(
             label,
-            Icon::Choice {
-                glyph,
-                on: on == Some(true),
-            },
-            on.map(|on| Command::System(SystemCommand::SetRadio(kind, !on))),
+            Icon::Choice { glyph, on },
+            Some(Command::System(SystemCommand::SetRadio(kind, !on))),
         )
-        .detail = radio_detail(on, connected);
+        .detail = radio_detail(Some(on), connected);
+    }
+    if network.wired {
+        menu.item(
+            "以太网",
+            Icon::Choice {
+                glyph: ETHERNET,
+                on: true,
+            },
+            None,
+        )
+        .detail = "已连接".into();
     }
     menu.separator();
     menu.item(
         "网络和 Internet 设置",
-        Icon::None,
+        Icon::Glyph(SETTINGS),
         Some(Command::Open("ms-settings:network")),
     );
     menu.item(
         "蓝牙和其他设备",
-        Icon::None,
+        Icon::Glyph(SETTINGS),
         Some(Command::Open("ms-settings:bluetooth")),
     );
     menu
@@ -351,8 +398,7 @@ pub fn control_flyout(
     media: Option<&Media>,
 ) -> Menu<Command> {
     let network = &status.network;
-    let mut menu = Menu::new();
-    menu.min_width = 330.;
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.entries.push(Entry::Tiles(vec![
         radio_tile(
             RadioKind::WiFi,
@@ -372,7 +418,7 @@ pub fn control_flyout(
     menu.entries.push(Entry::Tiles(vec![
         Tile {
             glyph: CONTRAST,
-            title: "暗色模式".into(),
+            title: "深色".into(),
             detail: if display.dark { "打开" } else { "关闭" }.into(),
             on: display.dark,
             command: Some(Command::System(SystemCommand::SetDark(!display.dark))),
@@ -392,13 +438,17 @@ pub fn control_flyout(
             command: Some(Command::Open("ms-settings-displays-topology:projection")),
         },
     ]));
-    menu.label("显示器");
-    brightness_slider(&mut menu, display);
-    menu.label("声音");
+    // Each slider carries its own glyph, so the rows need no headings, and a monitor
+    // without DDC/CI gets no brightness row at all.
+    if display.brightness.is_some() {
+        brightness_slider(&mut menu, display);
+    }
     add_volume(&mut menu, status.audio.as_ref());
+    // The player appears only while something plays; the flyout is rebuilt when the
+    // media query answers.
     let control = |glyph, action| (glyph, Some(Command::System(SystemCommand::Media(action))));
-    menu.entries.push(match media {
-        Some(media) => Entry::Player {
+    if let Some(media) = media {
+        menu.entries.push(Entry::Player {
             title: if media.title.is_empty() {
                 "正在播放".into()
             } else {
@@ -417,13 +467,8 @@ pub fn control_flyout(
                 ),
                 control("\u{E893}", MediaAction::Next),
             ],
-        },
-        None => Entry::Player {
-            title: "未在播放".into(),
-            detail: String::new(),
-            buttons: Vec::new(),
-        },
-    });
+        });
+    }
     menu
 }
 
@@ -444,6 +489,10 @@ mod tests {
             }
         }
         found
+    }
+
+    fn count(menu: &Menu<Command>, kind: fn(&Entry<Command>) -> bool) -> usize {
+        menu.entries.iter().filter(|e| kind(e)).count()
     }
 
     #[test]
@@ -476,9 +525,9 @@ mod tests {
         assert!(items.contains(&SystemItem::Battery));
         assert_eq!(
             status.mark(SystemItem::Battery),
-            Mark::Glyph {
+            Mark::Battery {
                 glyph: "\u{E856}",
-                dim: false
+                percent: Some(64)
             }
         );
         assert_eq!(volume_glyph(80, true), MUTE);
@@ -490,6 +539,23 @@ mod tests {
             charging: false,
         };
         assert_eq!(battery_glyph(full), "\u{EA93}");
+    }
+
+    #[test]
+    fn wheel_steps_volume_and_only_unmutes_upward() {
+        let audio = |volume, muted| Audio {
+            volume,
+            muted,
+            outputs: Vec::new(),
+        };
+        assert_eq!(wheel_volume(&audio(40, false), 1), Some(42));
+        assert_eq!(wheel_volume(&audio(40, false), -3), Some(34));
+        assert_eq!(wheel_volume(&audio(99, false), 2), Some(100));
+        assert_eq!(wheel_volume(&audio(100, false), 1), None);
+        assert_eq!(wheel_volume(&audio(0, false), -1), None);
+        assert_eq!(wheel_volume(&audio(40, false), 0), None);
+        assert_eq!(wheel_volume(&audio(40, true), -1), None);
+        assert_eq!(wheel_volume(&audio(100, true), 1), Some(100));
     }
 
     #[test]
@@ -522,6 +588,10 @@ mod tests {
         let shown = commands(&display_flyout(&display));
         assert!(shown.contains(&Command::System(SystemCommand::SetDark(false))));
         assert!(shown.contains(&Command::System(SystemCommand::SetHdr(true))));
+        let slider: fn(&Entry<Command>) -> bool = |e| matches!(e, Entry::Slider(_));
+        let player: fn(&Entry<Command>) -> bool = |e| matches!(e, Entry::Player { .. });
+        // A monitor without DDC/CI shows no brightness slider at all.
+        assert_eq!(count(&display_flyout(&display), slider), 0);
 
         // Missing radios fall back to their settings pages.
         let status = SystemStatus {
@@ -543,6 +613,16 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Command::System(SystemCommand::Media(_))))
         );
+        // Nothing playing and no brightness control: no placeholder rows either.
+        let flyout = control_flyout(&status, &display, None);
+        assert_eq!(count(&flyout, player), 0);
+        assert_eq!(count(&flyout, slider), 1);
+
+        // The network flyout lists only the radios this computer has.
+        let network = commands(&network_flyout(&status.network));
+        let bluetooth = Command::System(SystemCommand::SetRadio(RadioKind::Bluetooth, true));
+        assert!(!network.contains(&bluetooth));
+        assert!(network.contains(&Command::Open("ms-settings:bluetooth")));
     }
 
     #[test]
@@ -577,12 +657,12 @@ mod tests {
                 Focus::Part(1, 0),
                 Focus::Part(1, 1),
                 Focus::Part(1, 2),
+                Focus::Slider(2),
+                Focus::Part(3, 0),
                 Focus::Slider(3),
-                Focus::Part(5, 0),
-                Focus::Slider(5),
-                Focus::Part(6, 0),
-                Focus::Part(6, 1),
-                Focus::Part(6, 2),
+                Focus::Part(4, 0),
+                Focus::Part(4, 1),
+                Focus::Part(4, 2),
             ]
         );
         assert_eq!(menu.step(Some(ordered[0]), false), ordered.last().copied());
