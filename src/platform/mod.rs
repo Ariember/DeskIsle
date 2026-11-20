@@ -148,7 +148,6 @@ pub fn monitor() -> Result<Monitor> {
         if work.width <= 0 || work.height <= 0 || bounds.width <= 0 || dpi == 0 {
             return Err(Error::new(E_FAIL, "显示器未提供有效的工作区或 DPI"));
         }
-        let work = taskbar::dock_work_area(bounds, work);
         Ok(Monitor { bounds, work, dpi })
     }
 }
@@ -157,13 +156,16 @@ pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 
 /// Reserves the top edge of the primary monitor for the status bar, so maximized
 /// windows keep their caption buttons below it.
-pub struct AppBar(HWND);
+pub struct AppBar {
+    hwnd: HWND,
+    explorer: Option<(HWND, u32)>,
+}
 
 impl AppBar {
     fn data(&self) -> APPBARDATA {
         APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: self.0,
+            hWnd: self.hwnd,
             uCallbackMessage: APPBAR_CHANGED,
             uEdge: ABE_TOP,
             ..Default::default()
@@ -171,22 +173,34 @@ impl AppBar {
     }
 
     /// `hwnd` is the status bar and outlives the registration.
-    pub fn new(hwnd: HWND) -> Self {
-        let bar = Self(hwnd);
-        bar.register();
-        bar
+    pub fn new(hwnd: HWND) -> Result<Self> {
+        let mut bar = Self {
+            hwnd,
+            explorer: None,
+        };
+        bar.register()?;
+        Ok(bar)
     }
 
-    /// Registers again after Explorer restarts. Without Explorer, or when the bar is
-    /// already registered, the shell returns FALSE and the bar keeps its position.
-    pub fn register(&self) {
+    /// TaskbarCreated is also broadcast by our tray host to repopulate its icons.
+    pub fn register(&mut self) -> Result<()> {
+        let tray = taskbar::explorer_tray()
+            .ok_or_else(|| Error::new(E_FAIL, "找不到 Explorer 主任务栏"))?;
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(tray, Some(&mut pid)) };
+        if self.explorer == Some((tray, pid)) {
+            return Ok(());
+        }
         let mut data = self.data();
-        unsafe { SHAppBarMessage(ABM_NEW, &mut data) };
+        if unsafe { SHAppBarMessage(ABM_NEW, &mut data) } == 0 {
+            return Err(Error::new(E_FAIL, "Explorer 未注册顶部状态栏"));
+        }
+        self.explorer = Some((tray, pid));
+        Ok(())
     }
 
-    /// Returns the strip granted along the top edge, or the requested strip when the
-    /// shell does not answer.
-    pub fn place(&self, bounds: Rect, height: i32) -> Rect {
+    /// Returns the strip Explorer granted along the top edge.
+    pub fn place(&self, bounds: Rect, height: i32) -> Result<Rect> {
         let requested = RECT {
             left: bounds.x,
             top: bounds.y,
@@ -197,25 +211,29 @@ impl AppBar {
         data.rc = requested;
         unsafe {
             if SHAppBarMessage(ABM_QUERYPOS, &mut data) == 0 {
-                return to_rect(requested);
+                return Err(Error::new(E_FAIL, "无法查询顶部状态栏的可用位置"));
             }
             // QUERYPOS moves the strip below other top-edge appbars; keep our own height.
             data.rc.bottom = data.rc.top + height;
-            SHAppBarMessage(ABM_SETPOS, &mut data);
+            if SHAppBarMessage(ABM_SETPOS, &mut data) == 0 {
+                return Err(Error::new(E_FAIL, "Explorer 未预留顶部状态栏工作区"));
+            }
         }
         let granted = to_rect(data.rc);
         if granted.width <= 0 || granted.height <= 0 {
-            to_rect(requested)
+            Err(Error::new(E_FAIL, "Explorer 返回了无效的顶部状态栏位置"))
         } else {
-            granted
+            Ok(granted)
         }
     }
 }
 
 impl Drop for AppBar {
     fn drop(&mut self) {
-        let mut data = self.data();
-        unsafe { SHAppBarMessage(ABM_REMOVE, &mut data) };
+        if self.explorer.is_some() {
+            let mut data = self.data();
+            unsafe { SHAppBarMessage(ABM_REMOVE, &mut data) };
+        }
     }
 }
 

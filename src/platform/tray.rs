@@ -201,6 +201,26 @@ impl TrayHost {
         };
     }
 
+    /// Shell32 looks up Shell_TrayWnd when negotiating an AppBar. Its position
+    /// requests use memory shared with that process, so Explorer must receive
+    /// them directly, including after a display change or Explorer restart.
+    pub fn with_explorer_taskbar<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )?;
+        }
+        let result = action();
+        self.raise();
+        result
+    }
+
     pub fn icons(&self) -> &[TrayIcon] {
         &self.icons
     }

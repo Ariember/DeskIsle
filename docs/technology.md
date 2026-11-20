@@ -16,7 +16,7 @@ DeskIsle 是面向 Windows 的桌面美化工具。首个开发目标是常驻 D
 
 首版两栏和右键菜单共用 D3D11 和 DirectComposition 设备，使用 Direct2D 绘制表面、DirectWrite 排印文字，并通过 WIC 解码 Shell 图标。这些接口通过同一个 `windows` 依赖调用。悬停动画由合成器执行，时钟在分钟变化时更新。
 
-在 Windows x64 的 MSVC 开发环境运行 `cargo run --release --locked` 启动原型。运行 `cargo test --locked` 检查状态与布局。在交互式桌面运行 `cargo test --locked --test windows_bars -- --ignored` 可验证双栏位置、正常退出，以及退出后归还顶部工作区。
+在 Windows x64 的 MSVC 开发环境运行 `cargo run --release --locked` 启动原型。运行 `cargo test --locked` 检查状态与布局。在交互式桌面运行 `cargo test --locked --test windows_bars -- --ignored` 可验证启动前已最大化和运行中重新最大化的窗口边界、双栏位置，以及正常退出和强制结束后的工作区恢复。
 
 - **稳定性**：覆盖启动与退出、用户选中窗口前目标已关闭、最小化恢复、资源管理器重启、睡眠唤醒，以及不同缩放比例下的显示器热插拔。以实际前台窗口、可操作的系统桌面和正确的 Dock 位置作为验收依据。
 - **性能**：在发布构建上分别测静置 CPU、工作集和连续悬停时的可见更新间隔。记录显卡、刷新率、缩放比例、采样时长及测量方法。判断高刷表现要看帧间隔分布；桌面同步等待耗时只能说明同步节拍。

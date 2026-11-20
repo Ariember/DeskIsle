@@ -16,14 +16,13 @@ use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayou
 use windows::core::{Error, Result};
 
 struct Bars {
-    // Unsubscribe first, then release composition targets, the appbar reservation and
-    // the tray host before the bar HWNDs.
+    // Destroy the tray host before removing the AppBar so Shell32 addresses Explorer.
     events: shell::WindowEvents,
     renderer: Option<Renderer>,
     /// Released after the renderer, which drops the panel's composition target first.
     panel: Option<settings::Panel>,
-    appbar: AppBar,
     tray: TrayHost,
+    appbar: AppBar,
     top: Bar,
     bottom: Bar,
     pins: Vec<PinnedApp>,
@@ -84,8 +83,6 @@ pub(crate) fn run() -> Result<()> {
     let _desktop = platform::Desktop::init()?;
     let (top, bottom) = platform::create_bars()?;
     let events = shell::WindowEvents::subscribe(bottom.0)?;
-    let appbar = AppBar::new(top.0);
-    let tray = TrayHost::new()?;
     let hidden = storage::load_hidden().unwrap_or_else(|error| {
         // Unreadable settings leave every icon on the bar; the file is rewritten only
         // when the user changes a choice.
@@ -96,11 +93,14 @@ pub(crate) fn run() -> Result<()> {
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
     let mut native_taskbar = NativeTaskbar::default();
+    let monitor = platform::monitor()?;
+    let appbar = AppBar::new(top.0)?;
+    let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi))?;
     if settings.enabled(Key::HideTaskbar) {
         native_taskbar.hide()?;
     }
     let monitor = platform::monitor()?;
-    let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi));
+    let tray = TrayHost::new()?;
     // The shell may have announced an already full-screen app before registration.
     // Only an application from the window snapshot qualifies (the desktop also fills the screen).
     let fullscreen = apps.iter().any(|app| app.active)
@@ -161,8 +161,6 @@ pub(crate) fn run() -> Result<()> {
             Event::AppBarMoved => bars.display(true)?,
             Event::ShellRestart => {
                 bars.hide_taskbar()?;
-                bars.appbar.register();
-                bars.tray.raise();
                 bars.display(true)?;
             }
             Event::FullScreen(fullscreen) => {
@@ -248,12 +246,15 @@ impl Bars {
         let monitor = platform::monitor()?;
         let replace =
             replace || monitor.bounds != self.monitor.bounds || monitor.dpi != self.monitor.dpi;
-        self.monitor = monitor;
         if replace {
-            self.top_rect = self
-                .appbar
-                .place(self.monitor.bounds, status_height(self.monitor.dpi));
+            self.top_rect = self.tray.with_explorer_taskbar(|| {
+                self.appbar.register()?;
+                self.appbar
+                    .place(monitor.bounds, status_height(monitor.dpi))
+            })?;
         }
+        self.native_taskbar.refresh_work_area()?;
+        self.monitor = platform::monitor()?;
         (self.apps, self.foreground) = applications(&self.pins)?;
         self.restatus();
         self.relayout(self.layout.first)?;
