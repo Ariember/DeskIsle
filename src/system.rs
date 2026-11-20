@@ -57,8 +57,9 @@ pub struct Network {
     pub wifi: Option<bool>,
     /// The network Wi-Fi is connected to.
     pub ssid: Option<String>,
-    /// Connected to the internet through a network other than Wi-Fi.
+    /// The Internet profile belongs to an Ethernet adapter.
     pub wired: bool,
+    pub cellular: bool,
     pub bluetooth: Option<bool>,
 }
 

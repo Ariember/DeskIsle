@@ -1,17 +1,20 @@
 use std::io::{BufRead, Write};
+use std::os::windows::io::AsRawHandle;
 use std::process::{ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HRESULT, Owned, Result, w};
+use windows::core::{Error, HRESULT, Owned, PCWSTR, Result, w};
 
 use crate::geometry::Rect;
 
 pub const RESTORE_TASKBAR: &str = "--restore-taskbar";
+const RECOVERY_MUTEX: PCWSTR = w!("Local\\DeskIsle.TaskbarRecovery");
 
 pub fn claim_session() -> Result<Option<Owned<HANDLE>>> {
     // Only one Dock can manage the primary taskbar in this logon session.
@@ -19,7 +22,27 @@ pub fn claim_session() -> Result<Option<Owned<HANDLE>>> {
         let handle = CreateMutexW(None, false, w!("Local\\DeskIsle.Bars"))?;
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
         let mutex = Owned::new(handle);
-        Ok((!exists).then_some(mutex))
+        if exists {
+            return Ok(None);
+        }
+        // A killed main process releases Bars immediately. Its helper still owns the
+        // recovery marker until its last desktop write (or until the helper itself dies).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let probe = Owned::new(CreateMutexW(None, false, RECOVERY_MUTEX)?);
+            let recovering = GetLastError() == ERROR_ALREADY_EXISTS;
+            drop(probe);
+            if !recovering {
+                return Ok(Some(mutex));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    E_FAIL,
+                    "前一实例的任务栏恢复尚未结束，请稍后重试",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -57,6 +80,29 @@ pub struct NativeTaskbar {
     released_bottom: bool,
 }
 
+fn start_recovery() -> Result<ChildStdin> {
+    let marker = unsafe { Owned::new(CreateMutexW(None, false, RECOVERY_MUTEX)?) };
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg(RESTORE_TASKBAR)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // Give only this child a non-inheritable handle before any takeover record is sent.
+    // It belongs to the child's handle table and closes automatically on process exit.
+    let mut remote_handle = HANDLE::default();
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            *marker,
+            HANDLE(child.as_raw_handle()),
+            &mut remote_handle,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )?;
+    }
+    Ok(child.stdin.take().expect("child started with piped stdin"))
+}
+
 impl NativeTaskbar {
     pub fn hide(&mut self) -> Result<()> {
         let Some(hwnd) = explorer_tray() else {
@@ -68,11 +114,7 @@ impl NativeTaskbar {
         // Arm recovery before hiding anything. The OS closes our pipe on normal exit,
         // failed startup and process termination alike. Explorer may recreate its HWND.
         if self.recovery.is_none() {
-            let child = Command::new(std::env::current_exe()?)
-                .arg(RESTORE_TASKBAR)
-                .stdin(Stdio::piped())
-                .spawn()?;
-            self.recovery = child.stdin;
+            self.recovery = Some(start_recovery()?);
         }
         let hidden = identity(hwnd);
         if hidden != self.hidden {
@@ -106,6 +148,20 @@ impl NativeTaskbar {
             set_work_area(work)?;
         }
         Ok(())
+    }
+
+    pub fn dock_work_area(&self, monitor: &super::Monitor) -> Result<Rect> {
+        // If the taskbar was already hidden by another utility, use its vacant strip
+        // solely for positioning our Dock. Its visibility and the system work area
+        // remain under the other utility's control.
+        if self.hidden.is_empty()
+            && let Some(hwnd) = explorer_tray()
+            && !unsafe { IsWindowVisible(hwnd) }.as_bool()
+            && let Some(work) = bottom_adjustment(monitor, hwnd, true)?
+        {
+            return Ok(super::to_rect(work));
+        }
+        Ok(monitor.work)
     }
 
     /// Gives the taskbar back while DeskIsle keeps running, as on exit.
@@ -196,7 +252,10 @@ fn restore(hidden: &str, released_bottom: bool) -> Result<()> {
 }
 
 fn adjusted_work_area(hwnd: HWND, release: bool) -> Result<Option<RECT>> {
-    let monitor = super::monitor()?;
+    bottom_adjustment(&super::monitor()?, hwnd, release)
+}
+
+fn bottom_adjustment(monitor: &super::Monitor, hwnd: HWND, release: bool) -> Result<Option<RECT>> {
     let mut tray = RECT::default();
     match unsafe { GetWindowRect(hwnd, &mut tray) } {
         Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_WINDOW_HANDLE.0) => {

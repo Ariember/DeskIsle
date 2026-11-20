@@ -164,27 +164,55 @@ impl<C> Menu<C> {
         }
     }
 
-    fn enabled(&self, index: usize) -> bool {
-        self.command(index).is_some()
+    pub fn focused_command(&self, focus: Focus) -> Option<&C> {
+        match focus {
+            Focus::Item(index) => self.command(index),
+            Focus::Part(index, part) => self.part_command(index, part),
+            Focus::Slider(_) => None,
+        }
     }
 
     /// The next enabled item after `from` (or before it when `forward` is false),
     /// wrapping around. Starts at either end when nothing is selected.
-    pub fn step(&self, from: Option<usize>, forward: bool) -> Option<usize> {
-        let count = self.entries.len();
-        if count == 0 {
-            return None;
-        }
-        let start = from.unwrap_or(if forward { count - 1 } else { 0 });
-        (1..=count)
-            .map(|offset| {
-                if forward {
-                    (start + offset) % count
-                } else {
-                    (start + count - offset % count) % count
+    pub fn step(&self, from: Option<Focus>, forward: bool) -> Option<Focus> {
+        let mut controls = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let parts = match entry {
+                Entry::Item(item) if item.command.is_some() => {
+                    controls.push(Focus::Item(index));
+                    continue;
                 }
-            })
-            .find(|&index| self.enabled(index))
+                Entry::Slider(slider) => {
+                    if slider.button.is_some() {
+                        controls.push(Focus::Part(index, 0));
+                    }
+                    if slider.value.is_some() {
+                        controls.push(Focus::Slider(index));
+                    }
+                    continue;
+                }
+                Entry::Tiles(tiles) => tiles.len(),
+                Entry::Player { buttons, .. } => buttons.len(),
+                _ => continue,
+            };
+            controls.extend(
+                (0..parts)
+                    .filter(|&part| self.part_command(index, part).is_some())
+                    .map(|part| Focus::Part(index, part)),
+            );
+        }
+        let current = controls.iter().position(|&c| Some(c) == from);
+        let next = if forward {
+            current
+                .and_then(|i| controls.get(i + 1))
+                .or(controls.first())
+        } else {
+            current
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| controls.get(i))
+                .or(controls.last())
+        };
+        next.copied()
     }
 }
 
@@ -236,6 +264,24 @@ pub enum Hit {
     Part(usize, usize),
     /// The track of an available slider, with the value at the pointer.
     Slider(usize, u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Item(usize),
+    Part(usize, usize),
+    Slider(usize),
+}
+
+impl Hit {
+    pub fn focus(self) -> Option<Focus> {
+        match self {
+            Self::Item(i) => Some(Focus::Item(i)),
+            Self::Part(i, p) => Some(Focus::Part(i, p)),
+            Self::Slider(i, _) => Some(Focus::Slider(i)),
+            _ => None,
+        }
+    }
 }
 
 /// A menu's geometry in DIPs, with the panel inset by [`SHADOW`] inside the window.
@@ -427,7 +473,7 @@ impl MenuLayout {
             None => Hit::Inert,
         };
         match &menu.entries[index] {
-            Entry::Item(_) if menu.enabled(index) => Hit::Item(index),
+            Entry::Item(item) if item.command.is_some() => Hit::Item(index),
             Entry::Tiles(tiles) => (0..tiles.len())
                 .find(|&i| inside(self.tile(index, i, tiles.len())))
                 .map_or(Hit::Inert, part),
@@ -447,6 +493,24 @@ impl MenuLayout {
                 }
             }
             _ => Hit::Inert,
+        }
+    }
+
+    /// The area covered by the focus highlight, including a margin around a slider
+    /// so the highlight remains visible behind its opaque track.
+    pub fn focus_bounds<C>(&self, menu: &Menu<C>, focus: Focus) -> (f32, f32, f32, f32) {
+        match focus {
+            Focus::Item(i) => self.row(i),
+            Focus::Slider(i) => self.block(i),
+            Focus::Part(i, p) => match &menu.entries[i] {
+                Entry::Tiles(tiles) => self.tile(i, p, tiles.len()),
+                Entry::Player { buttons, .. } => self.player_button(i, p, buttons.len()),
+                Entry::Slider(_) => {
+                    let (l, t, _, b) = self.block(i);
+                    (l - 2., t, l + TRACK_HEIGHT + 2., b)
+                }
+                _ => unreachable!("focus belongs to an interactive part"),
+            },
         }
     }
 
@@ -884,11 +948,13 @@ mod tests {
     fn keyboard_steps_over_inert_entries_and_wraps() {
         let mut menu = sample();
         MenuLayout::new(&mut menu, 96, measure);
-        assert_eq!(menu.step(None, true), Some(1));
-        assert_eq!(menu.step(None, false), Some(4));
-        assert_eq!(menu.step(Some(1), true), Some(4));
-        assert_eq!(menu.step(Some(4), true), Some(1));
-        assert_eq!(menu.step(Some(1), false), Some(4));
+        let first = Some(Focus::Item(1));
+        let last = Some(Focus::Item(4));
+        assert_eq!(menu.step(None, true), first);
+        assert_eq!(menu.step(None, false), last);
+        assert_eq!(menu.step(first, true), last);
+        assert_eq!(menu.step(last, true), first);
+        assert_eq!(menu.step(first, false), last);
         let mut empty = Menu::<u8>::new();
         empty.header("t", "", Icon::None);
         assert_eq!(empty.step(None, true), None);

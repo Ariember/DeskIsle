@@ -175,9 +175,13 @@ impl TrayHost {
             // Applications add their icons again on TaskbarCreated, now through this host.
             // UIPI keeps the broadcast from elevated processes; their icons appear on their
             // next update.
-            SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0))?;
+            host.request_icons()?;
             Ok(host)
         }
+    }
+
+    pub fn request_icons(&self) -> Result<()> {
+        unsafe { SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0)) }
     }
 
     /// Keeps this host first for `FindWindow`. Explorer raises its taskbar when the user

@@ -29,8 +29,9 @@ pub(super) struct MenuView {
     accent: IDCompositionSurface,
     danger: IDCompositionSurface,
     scale: f32,
-    rows: Vec<(f32, f32)>,
-    hover: Option<usize>,
+    highlight_width: f32,
+    highlight_scale: IDCompositionScaleTransform,
+    highlighted: bool,
     /// The highlight's vertical offset in pixels.
     y: Tween,
     /// Each slider's own layer by entry index, repainted alone while it is dragged.
@@ -168,6 +169,8 @@ impl Renderer {
             let glow = self.device.CreateVisual()?;
             glow.SetContent(&accent)?;
             glow.SetOffsetX2((row_left * layout.scale).round())?;
+            let highlight_scale = self.device.CreateScaleTransform()?;
+            glow.SetTransform(&highlight_scale)?;
             let glow_fade = self.device.CreateEffectGroup()?;
             glow_fade.SetOpacity2(0.)?;
             glow.SetEffect(&glow_fade)?;
@@ -202,8 +205,9 @@ impl Renderer {
                 accent,
                 danger,
                 scale: layout.scale,
-                rows: layout.rows.clone(),
-                hover: None,
+                highlight_width: row_right - row_left,
+                highlight_scale,
+                highlighted: false,
                 y: Tween::at(0.),
                 sliders,
                 track,
@@ -599,25 +603,26 @@ impl Renderer {
         }
     }
 
-    /// Moves the highlight to entry `index`, sliding from the previous one.
-    pub fn menu_hover(&mut self, index: Option<usize>, danger: bool) -> Result<()> {
+    /// Moves the highlight to an enabled item, button or track.
+    pub fn menu_hover(&mut self, bounds: Option<(f32, f32, f32, f32)>, danger: bool) -> Result<()> {
         let Some(view) = self.menu.as_mut() else {
             return Ok(());
         };
-        if view.hover == index {
-            return Ok(());
-        }
         unsafe {
-            match (view.hover, index) {
-                (_, None) => {
-                    view.glow_fade
-                        .SetOpacity(&ease(&self.device, 1., 0., HOVER_DURATION)?)?
-                }
-                (previous, Some(index)) => {
-                    let y = (view.rows[index].0 * view.scale).round();
+            match bounds {
+                None => view
+                    .glow_fade
+                    .SetOpacity(&ease(&self.device, 1., 0., HOVER_DURATION)?)?,
+                Some((l, t, r, b)) => {
+                    let y = (t * view.scale).round();
+                    view.glow.SetOffsetX2((l * view.scale).round())?;
+                    view.highlight_scale
+                        .SetScaleX2((r - l) / view.highlight_width)?;
+                    view.highlight_scale
+                        .SetScaleY2((b - t) / menu::ITEM_HEIGHT)?;
                     view.glow
                         .SetContent(if danger { &view.danger } else { &view.accent })?;
-                    if previous.is_some() {
+                    if view.highlighted {
                         let from = view.y.now();
                         view.glow
                             .SetOffsetY(&ease(&self.device, from, y, HOVER_DURATION)?)?;
@@ -632,7 +637,7 @@ impl Renderer {
             }
             self.device.Commit()?;
         }
-        view.hover = index;
+        view.highlighted = bounds.is_some();
         Ok(())
     }
 

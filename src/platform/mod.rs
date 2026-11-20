@@ -5,6 +5,7 @@ pub mod network;
 pub mod power;
 pub mod shell;
 pub mod startup;
+pub mod system_worker;
 pub mod taskbar;
 pub mod tray;
 
@@ -21,7 +22,11 @@ use windows::Win32::{
         },
         Gdi::*,
     },
-    System::{Com::*, LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemInformation::GetLocalTime,
+        WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
+    },
     UI::{
         Controls::MARGINS,
         HiDpi::*,
@@ -41,7 +46,7 @@ impl Desktop {
     pub fn init() -> Result<Self> {
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            RoInitialize(RO_INIT_SINGLETHREADED)?;
         }
         Ok(Self)
     }
@@ -49,7 +54,7 @@ impl Desktop {
 
 impl Drop for Desktop {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        unsafe { RoUninitialize() };
     }
 }
 
@@ -178,40 +183,61 @@ impl AppBar {
     }
 
     /// `hwnd` is the status bar and outlives the registration.
-    pub fn new(hwnd: HWND) -> Result<Self> {
-        let mut bar = Self {
+    pub fn new(hwnd: HWND) -> Self {
+        Self {
             hwnd,
             explorer: None,
-        };
-        bar.register()?;
-        Ok(bar)
+        }
     }
 
-    /// TaskbarCreated is also broadcast by our tray host to repopulate its icons.
-    pub fn register(&mut self) -> Result<()> {
-        let tray = taskbar::explorer_tray()
-            .ok_or_else(|| Error::new(E_FAIL, "找不到 Explorer 主任务栏"))?;
+    fn shell_id(tray: HWND) -> (HWND, u32) {
         let mut pid = 0;
         unsafe { GetWindowThreadProcessId(tray, Some(&mut pid)) };
-        if self.explorer == Some((tray, pid)) {
+        (tray, pid)
+    }
+
+    pub fn shell_changed(&self) -> bool {
+        self.explorer != taskbar::explorer_tray().map(Self::shell_id)
+    }
+
+    fn register(&mut self, id: (HWND, u32)) -> Result<()> {
+        if self.explorer == Some(id) {
             return Ok(());
         }
         let mut data = self.data();
         if unsafe { SHAppBarMessage(ABM_NEW, &mut data) } == 0 {
             return Err(Error::new(E_FAIL, "Explorer 未注册顶部状态栏"));
         }
-        self.explorer = Some((tray, pid));
+        self.explorer = Some(id);
         Ok(())
     }
 
     /// Returns the strip Explorer granted along the top edge.
-    pub fn place(&self, bounds: Rect, height: i32) -> Result<Rect> {
+    pub fn place(&mut self, bounds: Rect, height: i32) -> Result<Rect> {
         let requested = RECT {
             left: bounds.x,
             top: bounds.y,
             right: bounds.x + bounds.width,
             bottom: bounds.y + height,
         };
+        // Explorer may be between instances at logon or during a restart.
+        // TaskbarCreated will negotiate the actual reservation once it is ready.
+        let Some(tray) = taskbar::explorer_tray() else {
+            self.explorer = None;
+            return Ok(to_rect(requested));
+        };
+        let id = Self::shell_id(tray);
+        match self.reserve(id, requested, height) {
+            Err(_) if taskbar::explorer_tray().map(Self::shell_id) != Some(id) => {
+                self.explorer = None;
+                Ok(to_rect(requested))
+            }
+            result => result,
+        }
+    }
+
+    fn reserve(&mut self, id: (HWND, u32), requested: RECT, height: i32) -> Result<Rect> {
+        self.register(id)?;
         let mut data = self.data();
         data.rc = requested;
         unsafe {
@@ -267,6 +293,8 @@ impl Bar {
 pub enum MenuKey {
     Down,
     Up,
+    Left,
+    Right,
     Home,
     End,
     Select,
@@ -324,6 +352,10 @@ pub enum Event {
     Tray,
     /// The default output's volume or mute changed.
     Audio,
+    /// The worker completed a network or media request.
+    SystemUpdate,
+    /// Windows selected a different default playback endpoint (possibly none).
+    DefaultOutput,
     /// The power source or battery charge changed.
     Power,
     Scroll(i16),
@@ -387,7 +419,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize => Event::Power,
+        audio::AUDIO_CHANGED if wp.0 != 0 => Event::DefaultOutput,
         audio::AUDIO_CHANGED => Event::Audio,
+        system_worker::UPDATED => Event::SystemUpdate,
         m if m != 0 && m == TASKBAR_CREATED.get() => Event::ShellRestart,
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),
@@ -416,6 +450,7 @@ fn queue(hwnd: HWND, event: Event) {
             || matches!(
                 event,
                 Event::Click(..)
+                    | Event::SystemUpdate
                     | Event::RightClick(..)
                     | Event::Press(..)
                     | Event::Scroll(_)
@@ -587,6 +622,10 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
             VK_DOWN => MenuKey::Down,
             VK_UP => MenuKey::Up,
+            VK_TAB if (unsafe { GetKeyState(VK_SHIFT.0 as i32) }) < 0 => MenuKey::Up,
+            VK_TAB => MenuKey::Down,
+            VK_LEFT => MenuKey::Left,
+            VK_RIGHT => MenuKey::Right,
             VK_HOME => MenuKey::Home,
             VK_END => MenuKey::End,
             VK_RETURN | VK_SPACE => MenuKey::Select,

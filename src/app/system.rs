@@ -2,20 +2,21 @@
 //! flyouts and carrying out the changes chosen there.
 
 use super::Bars;
-use crate::platform::{audio, display, media, network, power};
-use crate::system::Display;
+use crate::platform::{audio, display, power, system_worker::Snapshot};
+use crate::system::{Display, Network};
 use crate::ui::layout::SystemItem;
 use crate::ui::menu::{Command, Menu};
 use crate::ui::system::{self, SystemCommand, SystemStatus};
+use windows::Win32::Foundation::HWND;
 use windows::core::Result;
 
 /// Queries what the status bar icons show. A feature whose query fails shows as
 /// unavailable until the next update rather than stopping DeskIsle.
-pub(super) fn status() -> SystemStatus {
+pub(super) fn status(network: Network) -> SystemStatus {
     SystemStatus {
         audio: audio::state().ok(),
         battery: power::battery().ok().flatten(),
-        network: network::state(),
+        network,
     }
 }
 
@@ -30,11 +31,39 @@ impl Bars {
         if relayout {
             self.restatus();
         }
-        self.draw()
+        if self.open_flyout.is_none() {
+            self.draw()?;
+        }
+        // The flyout draws the bars after it releases its composition target.
+        Ok(())
     }
 
     pub(super) fn refresh_system(&mut self) -> Result<()> {
-        self.show_status(status())
+        self.worker.refresh_network()?;
+        self.show_status(status(self.system.network.clone()))
+    }
+
+    pub(super) fn system_updated(&mut self, owner: HWND) -> Result<Option<SystemItem>> {
+        let Some(update) = self.worker.take_update() else {
+            return Ok(None);
+        };
+        if let Err(error) = update.result {
+            crate::platform::report_error(Some(owner), &error);
+        }
+        match update.snapshot {
+            Snapshot::Network(network) if network != self.system.network => {
+                self.show_status(SystemStatus {
+                    network,
+                    ..self.system.clone()
+                })?;
+                Ok(Some(SystemItem::Network))
+            }
+            Snapshot::Media(media) if media != self.media => {
+                self.media = media;
+                Ok(Some(SystemItem::Control))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// After a volume notification from Windows.
@@ -57,10 +86,11 @@ impl Bars {
 
     /// Follows the current default output, which the user may have switched since.
     pub(super) fn watch_audio(&mut self) {
-        // Dropping the old watch first unregisters it from the previous device.
-        self.audio_watch = None;
-        // Without an output device the icon shows muted until the next update.
-        self.audio_watch = audio::AudioWatch::new(self.top.0).ok();
+        if let Some(watch) = &mut self.audio_watch {
+            watch.bind_default();
+        } else {
+            self.audio_watch = audio::AudioWatch::new(self.top.0).ok();
+        }
     }
 
     /// The flyout of `item`, built from freshly queried state.
@@ -70,10 +100,7 @@ impl Bars {
         if item == SystemItem::Battery {
             status.battery = power::battery().ok().flatten();
         }
-        if matches!(item, SystemItem::Network | SystemItem::Control) {
-            status.network = network::state();
-        }
-        let menu = match item {
+        match item {
             SystemItem::Sound => system::sound_flyout(status.audio.as_ref()),
             // A failed query lists no plans; the settings links still work.
             SystemItem::Battery => {
@@ -87,15 +114,20 @@ impl Bars {
                     dark: display::system_dark().unwrap_or(false),
                     hdr: None,
                 };
-                system::control_flyout(&status, &display, media::state().as_ref())
+                system::control_flyout(&status, &display, self.media.as_ref())
             }
-        };
-        self.system = status;
-        menu
+        }
     }
 
     /// Opens the flyout of a status bar control, with the control highlighted meanwhile.
     pub(super) fn flyout(&mut self, item: SystemItem) -> Result<bool> {
+        if matches!(item, SystemItem::Network | SystemItem::Control) {
+            self.worker.refresh_network()?;
+        }
+        if item == SystemItem::Control {
+            self.media = None;
+            self.worker.media(None)?;
+        }
         if matches!(item, SystemItem::Sound | SystemItem::Control) {
             self.watch_audio();
         }
@@ -121,17 +153,13 @@ impl Bars {
     pub(super) fn system_command(&mut self, command: SystemCommand) -> Result<()> {
         match command {
             SystemCommand::SetMuted(muted) => audio::set_muted(muted),
-            SystemCommand::SetOutput(id) => {
-                let result = audio::set_default_output(&id);
-                self.watch_audio();
-                result
-            }
+            SystemCommand::SetOutput(id) => audio::set_default_output(&id),
             SystemCommand::SetPlan(id) => power::set_plan(id),
             // Windows broadcasts the change; the bars switch palette when it arrives.
             SystemCommand::SetDark(dark) => display::set_system_dark(dark),
             SystemCommand::SetHdr(on) => display::set_hdr(on),
-            SystemCommand::SetRadio(kind, on) => network::set_radio(kind, on),
-            SystemCommand::Media(action) => media::control(action),
+            SystemCommand::SetRadio(kind, on) => self.worker.set_radio(kind, on),
+            SystemCommand::Media(action) => self.worker.media(Some(action)),
         }
     }
 }

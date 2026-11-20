@@ -53,6 +53,7 @@ impl SystemStatus {
         let glyph = |glyph| Mark::Glyph { glyph, dim: false };
         match item {
             SystemItem::Network if self.network.ssid.is_some() => glyph(WIFI),
+            SystemItem::Network if self.network.cellular => glyph("\u{EC05}"),
             SystemItem::Network if self.network.wired => glyph("\u{E839}"),
             SystemItem::Network => Mark::Glyph {
                 glyph: WIFI,
@@ -134,13 +135,19 @@ fn choice(
     );
 }
 
-fn volume_slider(menu: &mut Menu<Command>, audio: Option<&Audio>) {
-    menu.entries.push(Entry::Slider(Slider {
+pub fn volume_slider(state: Option<(u8, bool)>) -> Slider<Command> {
+    Slider {
         target: SliderTarget::Volume,
-        value: audio.map(|a| if a.muted { 0 } else { a.volume }),
-        glyph: audio.map_or(MUTE, |a| volume_glyph(a.volume, a.muted)),
-        button: audio.map(|a| Command::System(SystemCommand::SetMuted(!a.muted))),
-    }));
+        value: state.map(|(volume, muted)| if muted { 0 } else { volume }),
+        glyph: state.map_or(MUTE, |(volume, muted)| volume_glyph(volume, muted)),
+        button: state.map(|(_, muted)| Command::System(SystemCommand::SetMuted(!muted))),
+    }
+}
+
+fn add_volume(menu: &mut Menu<Command>, audio: Option<&Audio>) {
+    menu.entries.push(Entry::Slider(volume_slider(
+        audio.map(|a| (a.volume, a.muted)),
+    )));
 }
 
 fn brightness_slider(menu: &mut Menu<Command>, display: &Display) {
@@ -159,7 +166,7 @@ pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
     let mut menu = Menu::new();
     menu.min_width = FLYOUT_WIDTH;
     menu.label("声音");
-    volume_slider(&mut menu, audio);
+    add_volume(&mut menu, audio);
     menu.separator();
     match audio {
         Some(audio) if !audio.outputs.is_empty() => {
@@ -388,7 +395,7 @@ pub fn control_flyout(
     menu.label("显示器");
     brightness_slider(&mut menu, display);
     menu.label("声音");
-    volume_slider(&mut menu, status.audio.as_ref());
+    add_volume(&mut menu, status.audio.as_ref());
     let control = |glyph, action| (glyph, Some(Command::System(SystemCommand::Media(action))));
     menu.entries.push(match media {
         Some(media) => Entry::Player {
@@ -455,6 +462,14 @@ mod tests {
             plugged: false,
             charging: false,
         });
+        status.network.cellular = true;
+        assert_eq!(
+            status.mark(SystemItem::Network),
+            Mark::Glyph {
+                glyph: "\u{EC05}",
+                dim: false
+            }
+        );
         status.network.ssid = Some("home".into());
         let items = status.items();
         assert_eq!(items.last(), Some(&SystemItem::Control));
@@ -528,5 +543,48 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Command::System(SystemCommand::Media(_))))
         );
+    }
+
+    #[test]
+    fn control_center_keyboard_reaches_tiles_sliders_and_player_buttons() {
+        use crate::ui::menu::Focus;
+        let status = SystemStatus {
+            audio: Some(Audio::default()),
+            ..SystemStatus::default()
+        };
+        let display = Display {
+            brightness: Some(80),
+            ..Display::default()
+        };
+        let menu = control_flyout(&status, &display, Some(&Media::default()));
+        let mut focus = None;
+        let mut ordered = Vec::new();
+        while let Some(next) = menu.step(focus, true) {
+            if ordered.contains(&next) {
+                break;
+            }
+            if !matches!(next, Focus::Slider(_)) {
+                assert!(menu.focused_command(next).is_some());
+            }
+            ordered.push(next);
+            focus = Some(next);
+        }
+        assert_eq!(
+            ordered,
+            vec![
+                Focus::Part(0, 0),
+                Focus::Part(0, 1),
+                Focus::Part(1, 0),
+                Focus::Part(1, 1),
+                Focus::Part(1, 2),
+                Focus::Slider(3),
+                Focus::Part(5, 0),
+                Focus::Slider(5),
+                Focus::Part(6, 0),
+                Focus::Part(6, 1),
+                Focus::Part(6, 2),
+            ]
+        );
+        assert_eq!(menu.step(Some(ordered[0]), false), ordered.last().copied());
     }
 }

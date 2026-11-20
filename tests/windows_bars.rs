@@ -13,11 +13,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
     GWL_EXSTYLE, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SW_HIDE,
-    SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA,
+    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+    WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, w};
 
@@ -80,14 +80,16 @@ fn explorer_taskbar() -> Option<HWND> {
 struct TaskbarSnapshot {
     hwnd: HWND,
     visible: bool,
+    work: RECT,
 }
 
 impl Drop for TaskbarSnapshot {
     fn drop(&mut self) {
         // Also restore the desktop when a failed assertion kills the test child.
-        if explorer_taskbar() == Some(self.hwnd)
-            && unsafe { IsWindowVisible(self.hwnd) }.as_bool() != self.visible
-        {
+        if explorer_taskbar() != Some(self.hwnd) {
+            return;
+        }
+        if unsafe { IsWindowVisible(self.hwnd) }.as_bool() != self.visible {
             let show = if self.visible {
                 SW_SHOWNOACTIVATE
             } else {
@@ -95,6 +97,33 @@ impl Drop for TaskbarSnapshot {
             };
             let _ = unsafe { ShowWindow(self.hwnd, show) };
         }
+        if primary_work_area().is_ok_and(|work| work != self.work) {
+            let _ = set_work_area(self.work);
+        }
+    }
+}
+
+fn primary_work_area() -> windows::core::Result<RECT> {
+    let mut work = RECT::default();
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&raw mut work).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )?;
+    }
+    Ok(work)
+}
+
+fn set_work_area(mut work: RECT) -> windows::core::Result<()> {
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETWORKAREA,
+            1,
+            Some((&raw mut work).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
     }
 }
 
@@ -216,19 +245,7 @@ fn send_to_child(pid: u32, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
 #[test]
 #[ignore = "requires an interactive Windows desktop"]
 fn bars_open_in_the_primary_work_area_and_close_together() {
-    let read_work = || {
-        let mut work = RECT::default();
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETWORKAREA,
-                0,
-                Some((&raw mut work).cast()),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-            )
-        }
-        .expect("read primary work area");
-        work
-    };
+    let read_work = || primary_work_area().expect("read primary work area");
     // This test thread reads physical screen coordinates on mixed-DPI desktops.
     let previous =
         unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
@@ -238,7 +255,12 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     let taskbar = TaskbarSnapshot {
         hwnd,
         visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
+        work,
     };
+    assert!(
+        taskbar.visible,
+        "test requires an initially visible Explorer taskbar"
+    );
     let taskbar_rect = window_rect(hwnd);
     let screen_bottom = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let bottom_taskbar = taskbar.visible
@@ -431,8 +453,67 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     assert_eq!((bars.status, bars.dock), (Some(status), Some(dock)));
     assert!(!unsafe { IsWindowVisible(taskbar.hwnd) }.as_bool());
 
+    wait_until(
+        "second owner did not take over the work area before termination",
+        || read_work() == dock_work && fits_work(),
+    );
+    assert_ne!(
+        dock_work, work,
+        "forced-exit test needs an active reservation"
+    );
+    if bottom_taskbar {
+        // A utility explicitly reserves the same strip as the hidden native taskbar.
+        // Its setting notification must move the Dock without reclaiming the strip.
+        let external = RECT {
+            bottom: taskbar_rect.top,
+            ..dock_work
+        };
+        let old_bottom = window_rect(dock).bottom;
+        set_work_area(external).unwrap();
+        send_to_child(
+            owner.0.id(),
+            status,
+            WM_SETTINGCHANGE,
+            WPARAM(SPI_SETWORKAREA.0 as usize),
+            LPARAM(0),
+        );
+        wait_until(
+            "Dock did not honor another utility's bottom reservation",
+            || {
+                read_work() == external
+                    && window_rect(dock).bottom == old_bottom - (dock_work.bottom - external.bottom)
+            },
+        );
+        set_work_area(dock_work).unwrap();
+        send_to_child(
+            owner.0.id(),
+            status,
+            WM_SETTINGCHANGE,
+            WPARAM(SPI_SETWORKAREA.0 as usize),
+            LPARAM(0),
+        );
+        wait_until(
+            "original takeover not active before forced termination",
+            || window_rect(dock).bottom == old_bottom && fits_work(),
+        );
+    }
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
+    // Start immediately after the main process dies. Its helper can still be
+    // restoring Explorer, and the replacement must complete its own takeover.
+    let mut replacement = TestInstance::start();
+    let (replacement_status, _) = replacement.wait_for_bars();
+    wait_until(
+        "rapid relaunch did not take over both desktop edges",
+        || {
+            !unsafe { IsWindowVisible(hwnd) }.as_bool()
+                && read_work().top == window_rect(replacement_status).bottom
+                && read_work().bottom == expected_bottom
+                && fits_work()
+        },
+    );
+    replacement.0.kill().unwrap();
+    replacement.0.wait().unwrap();
     wait_until(
         "native taskbar visibility not restored after forced termination",
         || unsafe { IsWindowVisible(taskbar.hwnd) }.as_bool() == taskbar.visible,
@@ -441,6 +522,31 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         "work area and maximized window not restored after forced termination",
         restored,
     );
+    if bottom_taskbar {
+        // Another utility already hid Explorer but kept its original reservation.
+        // The Dock uses the vacant strip locally, without taking ownership of either.
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        set_work_area(work).unwrap();
+        let mut prehidden = TestInstance::start();
+        let (status, dock) = prehidden.wait_for_bars();
+        wait_until(
+            "Dock did not use space above an externally hidden taskbar",
+            || {
+                let dpi = unsafe { GetDpiForWindow(dock) } as i32;
+                !unsafe { IsWindowVisible(hwnd) }.as_bool()
+                    && read_work().bottom == work.bottom
+                    && window_rect(dock).bottom == screen_bottom - (8 * dpi + 48) / 96
+            },
+        );
+        send_to_child(prehidden.0.id(), status, WM_CLOSE, WPARAM(0), LPARAM(0));
+        wait_until("prehidden Dock did not exit", || {
+            prehidden.0.try_wait().unwrap().is_some()
+        });
+        assert!(prehidden.0.wait().unwrap().success());
+        wait_until("prehidden work area not restored after exit", restored);
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+    }
     drop(probe);
+    drop(taskbar);
     unsafe { SetThreadDpiAwarenessContext(previous) };
 }

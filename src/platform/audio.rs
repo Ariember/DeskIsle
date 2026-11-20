@@ -4,22 +4,23 @@
 use std::ffi::c_void;
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, WPARAM};
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, eConsole, eRender,
+    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IMMDevice,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
+    eConsole, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
-use windows::core::{GUID, PWSTR, Result, implement};
+use windows::core::{GUID, Interface, PCWSTR, PWSTR, Result, implement};
 
 use crate::system::{Audio, AudioOutput};
 
-/// Posted to the window passed to [`AudioWatch::new`] when the volume or mute changes.
+/// Posted when the volume changes. A nonzero wParam indicates a new default output.
 pub const AUDIO_CHANGED: u32 = WM_APP + 3;
 
 fn enumerator() -> Result<IMMDeviceEnumerator> {
@@ -171,49 +172,140 @@ mod policy {
 
 pub use policy::set_default_output;
 
-#[implement(IAudioEndpointVolumeCallback)]
+#[implement(IAudioEndpointVolumeCallback, IMMNotificationClient)]
 struct Notify {
     /// The status bar, which outlives the subscription. Kept as a number because
     /// Windows calls back on its own worker thread, where only PostMessageW touches it.
     hwnd: isize,
 }
 
-impl IAudioEndpointVolumeCallback_Impl for Notify_Impl {
-    fn OnNotify(&self, _: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
-        // The UI thread queries the new state itself; repeated posts are merged there.
-        let _ = unsafe {
+impl Notify {
+    fn post(&self, default_changed: bool) -> Result<()> {
+        // COM invokes this on its own thread. Rebinding and querying happen on the UI thread.
+        unsafe {
             PostMessageW(
                 Some(HWND(self.hwnd as _)),
                 AUDIO_CHANGED,
-                WPARAM(0),
+                WPARAM(usize::from(default_changed)),
                 LPARAM(0),
             )
-        };
+        }
+    }
+}
+
+impl IAudioEndpointVolumeCallback_Impl for Notify_Impl {
+    fn OnNotify(&self, _: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
+        self.post(false)
+    }
+}
+
+impl IMMNotificationClient_Impl for Notify_Impl {
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> Result<()> {
+        if flow == eRender && role == eConsole {
+            return self.post(true);
+        }
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _: &PCWSTR) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> Result<()> {
         Ok(())
     }
 }
 
-/// Tells the status bar about volume changes on the current default output, such as the
-/// keyboard's volume keys. Subscribe again after the default device changes.
+/// The device subscription stays active even while there is no default output.
 pub struct AudioWatch {
-    volume: IAudioEndpointVolume,
-    callback: IAudioEndpointVolumeCallback,
+    devices: IMMDeviceEnumerator,
+    device_callback: IMMNotificationClient,
+    volume: Option<IAudioEndpointVolume>,
+    volume_callback: IAudioEndpointVolumeCallback,
 }
 
 impl AudioWatch {
     pub fn new(hwnd: HWND) -> Result<Self> {
-        let volume = default_volume()?;
-        let callback: IAudioEndpointVolumeCallback = Notify {
+        let devices = enumerator()?;
+        let device_callback: IMMNotificationClient = Notify {
             hwnd: hwnd.0 as isize,
         }
         .into();
-        unsafe { volume.RegisterControlChangeNotify(&callback)? };
-        Ok(Self { volume, callback })
+        let volume_callback = device_callback.cast()?;
+        // The enumerator borrows the callback until UnregisterEndpointNotificationCallback.
+        unsafe { devices.RegisterEndpointNotificationCallback(&device_callback)? };
+        let mut watch = Self {
+            devices,
+            device_callback,
+            volume: None,
+            volume_callback,
+        };
+        watch.bind_default();
+        Ok(watch)
+    }
+
+    pub fn bind_default(&mut self) {
+        self.unbind_volume();
+        self.volume = default_volume()
+            .and_then(|volume| {
+                unsafe { volume.RegisterControlChangeNotify(&self.volume_callback)? };
+                Ok(volume)
+            })
+            .ok();
+    }
+
+    fn unbind_volume(&mut self) {
+        if let Some(volume) = self.volume.take() {
+            let _ = unsafe { volume.UnregisterControlChangeNotify(&self.volume_callback) };
+        }
     }
 }
 
 impl Drop for AudioWatch {
     fn drop(&mut self) {
-        let _ = unsafe { self.volume.UnregisterControlChangeNotify(&self.callback) };
+        self.unbind_volume();
+        let _ = unsafe {
+            self.devices
+                .UnregisterEndpointNotificationCallback(&self.device_callback)
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Media::Audio::{eCapture, eCommunications};
+    use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+
+    #[test]
+    fn only_default_playback_changes_request_a_volume_rebind() -> Result<()> {
+        // A null target posts to the calling thread's queue, so no hardware or visible bar
+        // is needed to check the notifications the UI receives.
+        let devices: IMMNotificationClient = Notify { hwnd: 0 }.into();
+        let volume: IAudioEndpointVolumeCallback = devices.cast()?;
+        unsafe {
+            devices.OnDefaultDeviceChanged(eCapture, eConsole, PCWSTR::null())?;
+            devices.OnDefaultDeviceChanged(eRender, eCommunications, PCWSTR::null())?;
+            // Losing the last output also changes the default, with a null ID.
+            devices.OnDefaultDeviceChanged(eRender, eConsole, PCWSTR::null())?;
+            volume.OnNotify(&mut AUDIO_VOLUME_NOTIFICATION_DATA::default())?;
+        }
+        let mut received = Vec::new();
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, AUDIO_CHANGED, AUDIO_CHANGED, PM_REMOVE) }
+            .as_bool()
+        {
+            received.push(message.wParam.0);
+        }
+        assert_eq!(received, [1, 0]);
+        Ok(())
     }
 }

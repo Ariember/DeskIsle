@@ -2,8 +2,10 @@ use super::Bars;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
 use crate::ui::layout::{StatusHit, SystemItem};
-use crate::ui::menu::{self, Anchor, Command, Hit, Menu, MenuLayout, SliderTarget, TrayEntry};
-use crate::ui::system::volume_glyph;
+use crate::ui::menu::{
+    self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
+};
+use crate::ui::system::volume_slider;
 use windows::Win32::Foundation::HWND;
 use windows::core::{Error, Result};
 
@@ -187,39 +189,31 @@ impl Bars {
         }
         let opened_over = platform::foreground();
         let active = window.show();
-        let mut hover: Option<usize> = None;
+        let mut hover: Option<Focus> = None;
         let mut held = Vec::new();
         let mut failure = None;
         // The slider entry being dragged.
         let mut drag: Option<usize> = None;
+        let mut refresh_flyout = false;
         let choice = loop {
             let mut target = hover;
             let mut chosen = None;
+            let mut slide = None;
             match platform::next_event()? {
                 Event::MenuPress(x, y) => {
                     if let Hit::Slider(index, value) = layout.hit(&menu, x, y) {
                         window.capture();
                         drag = Some(index);
                         target = None;
-                        if let Err(error) = self.slide(&window, &mut menu, index, value, false) {
-                            failure = Some(error);
-                            break None;
-                        }
+                        slide = Some((index, value, false));
                     }
                 }
                 Event::MenuMove(x, y) => match drag {
                     Some(index) => {
-                        let value = layout.slider_value(index, x);
-                        if let Err(error) = self.slide(&window, &mut menu, index, value, false) {
-                            failure = Some(error);
-                            break None;
-                        }
+                        slide = Some((index, layout.slider_value(index, x), false));
                     }
                     None => {
-                        target = match layout.hit(&menu, x, y) {
-                            Hit::Item(index) => Some(index),
-                            _ => None,
-                        }
+                        target = layout.hit(&menu, x, y).focus();
                     }
                 },
                 Event::MenuLeave if drag.is_none() => target = None,
@@ -227,32 +221,50 @@ impl Bars {
                 Event::MenuPick(x, _) if drag.is_some() => {
                     let index = drag.take().expect("dragging");
                     window.release();
-                    let value = layout.slider_value(index, x);
-                    if let Err(error) = self.slide(&window, &mut menu, index, value, true) {
-                        failure = Some(error);
-                        break None;
-                    }
+                    slide = Some((index, layout.slider_value(index, x), true));
                 }
                 // The shadow margin belongs to the window but not to the menu.
                 Event::MenuPick(x, y) if layout.hit(&menu, x, y) == Hit::Outside => break None,
                 Event::MenuPick(x, y) => {
-                    chosen = match layout.hit(&menu, x, y) {
-                        Hit::Item(index) => menu.command(index).cloned(),
-                        Hit::Part(index, part) => menu.part_command(index, part).cloned(),
-                        _ => None,
-                    }
+                    chosen = layout
+                        .hit(&menu, x, y)
+                        .focus()
+                        .and_then(|focus| menu.focused_command(focus))
+                        .cloned();
                 }
                 Event::MenuKey(key) => match key {
                     MenuKey::Down => target = menu.step(hover, true),
                     MenuKey::Up => target = menu.step(hover, false),
                     MenuKey::Home => target = menu.step(None, true),
                     MenuKey::End => target = menu.step(None, false),
+                    MenuKey::Left | MenuKey::Right => {
+                        let forward = key == MenuKey::Right;
+                        if let Some(Focus::Slider(index)) = hover {
+                            if let menu::Entry::Slider(slider) = &menu.entries[index]
+                                && let Some(current) = slider.value
+                            {
+                                let value = if forward {
+                                    current.saturating_add(5).min(100)
+                                } else {
+                                    current.saturating_sub(5)
+                                };
+                                slide = Some((index, value, true));
+                            }
+                        } else {
+                            target = menu.step(hover, forward);
+                        }
+                    }
                     MenuKey::Select => {
-                        chosen = hover.and_then(|index| menu.command(index).cloned())
+                        chosen = hover.and_then(|focus| menu.focused_command(focus).cloned())
                     }
                     MenuKey::Dismiss => break None,
                     _ => {}
                 },
+                Event::SystemUpdate if flyout.is_some() => {
+                    let updated = self.system_updated(window.0)?;
+                    refresh_flyout |= updated.is_some()
+                        && (flyout == updated || flyout == Some(SystemItem::Control));
+                }
                 Event::MenuDismiss => break None,
                 Event::Press(_, right) => {
                     // A right press goes on to open the menu of what it hit.
@@ -275,30 +287,49 @@ impl Bars {
                 event @ (Event::Audio | Event::Power) if held.contains(&event) => {}
                 event => held.push(event),
             }
-            match (chosen, flyout) {
-                (Some(Command::System(command)), Some(item)) => {
-                    if let Err(error) = self.system_command(command) {
-                        platform::report_error(Some(window.0), &error);
-                    }
-                    menu = self.flyout_menu(item);
-                    layout = self.menu_layout(&mut menu);
-                    window.place(layout.place(anchor, self.monitor.bounds));
-                    hover = None;
-                    if let Err(error) = self.paint_menu(&window, &menu, &layout, false) {
+            if let Some((index, value, done)) = slide {
+                match self.slide(&window, &mut menu, index, value, done) {
+                    Ok(true) => {}
+                    Ok(false) => drag = None,
+                    Err(error) => {
                         failure = Some(error);
                         break None;
                     }
-                    continue;
+                }
+            }
+            match (chosen, flyout) {
+                (Some(Command::System(command)), Some(_)) => {
+                    if let Err(error) = self.system_command(command) {
+                        platform::report_error(Some(window.0), &error);
+                    }
+                    refresh_flyout = true;
                 }
                 (Some(command), _) => break Some(command),
                 (None, _) => {}
             }
+            if refresh_flyout
+                && drag.is_none()
+                && let Some(item) = flyout
+            {
+                menu = self.flyout_menu(item);
+                layout = self.menu_layout(&mut menu);
+                window.place(layout.place(anchor, self.monitor.bounds));
+                target = target.filter(|&focus| match focus {
+                    Focus::Slider(i) => matches!(menu.entries.get(i), Some(menu::Entry::Slider(s)) if s.value.is_some()),
+                    _ => menu.focused_command(focus).is_some(),
+                });
+                hover = None;
+                if let Err(error) = self.paint_menu(&window, &menu, &layout, false) {
+                    failure = Some(error);
+                    break None;
+                }
+                refresh_flyout = false;
+            }
             if target != hover {
-                let danger = target.is_some_and(
-                    |index| matches!(&menu.entries[index], menu::Entry::Item(item) if item.danger),
-                );
+                let danger = matches!(target, Some(Focus::Item(i)) if matches!(&menu.entries[i], menu::Entry::Item(item) if item.danger));
+                let bounds = target.map(|focus| layout.focus_bounds(&menu, focus));
                 let renderer = self.renderer.as_mut().expect("renderer bound to bars");
-                if let Err(error) = renderer.menu_hover(target, danger) {
+                if let Err(error) = renderer.menu_hover(bounds, danger) {
                     failure = Some(error);
                     break None;
                 }
@@ -327,28 +358,41 @@ impl Bars {
         index: usize,
         value: u8,
         done: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(menu::Entry::Slider(slider)) = menu.entries.get_mut(index) else {
-            return Ok(());
+            return Ok(false);
         };
-        let changed = slider.value != Some(value);
-        slider.value = Some(value);
-        let applied = match slider.target {
-            SliderTarget::Volume if changed => {
-                slider.glyph = volume_glyph(value, false);
-                audio::set_volume(value)
+        let result = update_slider(
+            slider,
+            value,
+            done,
+            |target, value| match target {
+                SliderTarget::Volume => audio::set_volume(value),
+                SliderTarget::Brightness => display::set_brightness(value),
+            },
+            |slider| match slider.target {
+                SliderTarget::Volume => {
+                    *slider = volume_slider(audio::state().ok().map(|a| (a.volume, a.muted)));
+                }
+                SliderTarget::Brightness => slider.value = display::brightness(),
+            },
+        );
+        if !matches!(result, Ok(false)) {
+            self.renderer
+                .as_mut()
+                .expect("renderer bound to bars")
+                .menu_slider(index, slider)?;
+        }
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                if !done {
+                    window.release();
+                }
+                platform::report_error(Some(window.0), &error);
+                Ok(false)
             }
-            SliderTarget::Brightness if done => display::set_brightness(value),
-            _ => Ok(()),
-        };
-        if changed {
-            let renderer = self.renderer.as_mut().expect("renderer bound to bars");
-            renderer.menu_slider(index, slider)?;
         }
-        if let Err(error) = applied {
-            platform::report_error(Some(window.0), &error);
-        }
-        Ok(())
     }
 
     /// Rebuilds the graphics device after it was lost, or reports another menu failure.
@@ -362,6 +406,100 @@ impl Bars {
     }
 }
 
+/// Returns whether the slider needs painting. A failed write can have partially
+/// changed the device, so its current state is read before the error is reported.
+fn update_slider<E>(
+    slider: &mut Slider<Command>,
+    value: u8,
+    done: bool,
+    write: impl FnOnce(SliderTarget, u8) -> std::result::Result<(), E>,
+    refresh: impl FnOnce(&mut Slider<Command>),
+) -> std::result::Result<bool, E> {
+    let changed = slider.value != Some(value);
+    let apply = match slider.target {
+        SliderTarget::Volume => changed,
+        SliderTarget::Brightness => done,
+    };
+    if apply && let Err(error) = write(slider.target, value) {
+        refresh(slider);
+        return Err(error);
+    }
+    if changed {
+        match slider.target {
+            SliderTarget::Volume => *slider = volume_slider(Some((value, false))),
+            SliderTarget::Brightness => slider.value = Some(value),
+        }
+    }
+    Ok(changed)
+}
+
 fn px(dpi: u32, dip: i32) -> i32 {
     (dip * dpi as i32 + 48) / 96
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::system::SystemCommand;
+
+    #[test]
+    fn raising_muted_volume_makes_the_button_mute_again() {
+        let mut slider = volume_slider(Some((30, true)));
+        let changed = update_slider(
+            &mut slider,
+            50,
+            false,
+            |target, value| {
+                assert_eq!((target, value), (SliderTarget::Volume, 50));
+                Ok::<_, ()>(())
+            },
+            |_| panic!("unexpected refresh"),
+        );
+        assert_eq!(changed, Ok(true));
+        assert_eq!(slider.value, Some(50));
+        assert_eq!(
+            slider.button,
+            Some(Command::System(SystemCommand::SetMuted(true)))
+        );
+    }
+
+    #[test]
+    fn failed_slider_writes_show_the_device_value_and_allow_retry() {
+        for target in [SliderTarget::Volume, SliderTarget::Brightness] {
+            let mut slider = volume_slider(Some((20, false)));
+            slider.target = target;
+            if target == SliderTarget::Brightness {
+                let preview = update_slider(
+                    &mut slider,
+                    70,
+                    false,
+                    |_, _| -> Result<()> { panic!("preview wrote to monitor") },
+                    |_| unreachable!(),
+                );
+                assert_eq!(preview, Ok(true));
+            }
+            let refused = update_slider(
+                &mut slider,
+                70,
+                true,
+                |_, _| Err(()),
+                |s| s.value = Some(25),
+            );
+            assert_eq!(refused, Err(()));
+            assert_eq!(slider.value, Some(25));
+            let mut written = None;
+            let retry = update_slider(
+                &mut slider,
+                70,
+                true,
+                |t, v| {
+                    written = Some((t, v));
+                    Ok::<_, ()>(())
+                },
+                |_| unreachable!(),
+            );
+            assert_eq!(retry, Ok(true));
+            assert_eq!(written, Some((target, 70)));
+        }
+    }
 }
