@@ -35,7 +35,7 @@ impl Bars {
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
             Command::TrayActivate(index) => {
-                self.tray_activate(index, false)?;
+                self.tray_activate(index, false, self.tray_overflow_anchor()?)?;
                 return Ok(false);
             }
             Command::Open(uri) => shell::execute(owner, uri),

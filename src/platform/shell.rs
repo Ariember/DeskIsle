@@ -89,12 +89,15 @@ unsafe extern "system" fn window_event(
     object: i32,
     child: i32,
     _: u32,
-    _: u32,
+    event_time: u32,
 ) {
     if event != EVENT_SYSTEM_FOREGROUND
         && (hwnd.is_invalid() || object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32)
     {
         return;
+    }
+    if event == EVENT_OBJECT_SHOW {
+        super::tray::menu_shown(hwnd, event_time);
     }
     if let Some(target) = EVENT_TARGET.get()
         && !CHANGE_POSTED.replace(true)
@@ -235,7 +238,7 @@ fn window_info(hwnd: HWND) -> Result<Option<WindowInfo>> {
     }
 }
 
-pub fn enumerate() -> Result<(Vec<WindowInfo>, Option<isize>)> {
+fn window_handles() -> Result<Vec<HWND>> {
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
         // EnumWindows calls synchronously; this pointer belongs to the caller for that call.
         unsafe { (&mut *(data.0 as *mut Vec<HWND>)).push(hwnd) };
@@ -244,8 +247,12 @@ pub fn enumerate() -> Result<(Vec<WindowInfo>, Option<isize>)> {
 
     let mut handles: Vec<HWND> = Vec::new();
     unsafe { EnumWindows(Some(collect), LPARAM((&raw mut handles) as isize))? };
+    Ok(handles)
+}
+
+pub fn enumerate() -> Result<(Vec<WindowInfo>, Option<isize>)> {
     let mut windows = Vec::new();
-    for hwnd in handles {
+    for hwnd in window_handles()? {
         if let Some(window) = window_info(hwnd)? {
             windows.push(window);
         }
@@ -391,6 +398,41 @@ pub fn activate(app_id: &str, id: isize) -> Result<bool> {
     if window_info(hwnd)?.is_none_or(|info| info.app_id != app_id) {
         return Ok(false);
     }
+    activate_window(hwnd)
+}
+
+pub(super) fn window_process(hwnd: HWND) -> u32 {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+/// Use the foreground window or a single task-switchable window of the tray owner.
+/// Multiple background windows leave selection to the app's own tray callback.
+pub(super) fn activate_tray_window(pid: u32) -> Result<bool> {
+    let foreground = unsafe { GetForegroundWindow() };
+    let active = unsafe { GetAncestor(foreground, GA_ROOTOWNER) };
+    let mut candidate = None;
+    let mut ambiguous = false;
+    for hwnd in window_handles()? {
+        if window_process(hwnd) != pid || window_info(hwnd)?.is_none() {
+            continue;
+        }
+        if hwnd == foreground || hwnd == active {
+            return Ok(true);
+        }
+        ambiguous |= candidate.replace(hwnd).is_some();
+    }
+    if let Some(hwnd) = candidate
+        && !ambiguous
+        && window_process(hwnd) == pid
+    {
+        return activate_window(hwnd);
+    }
+    Ok(false)
+}
+
+fn activate_window(hwnd: HWND) -> Result<bool> {
     unsafe {
         if IsIconic(hwnd).as_bool() && !ShowWindowAsync(hwnd, SW_RESTORE).as_bool() {
             if !IsWindow(Some(hwnd)).as_bool() {

@@ -350,6 +350,7 @@ pub enum Event {
     /// Explorer started again and expects appbars and tray icons to register.
     ShellRestart,
     Tray,
+    TrayActivation,
     /// The default output's volume or mute changed.
     Audio,
     /// The worker completed a network or media request.

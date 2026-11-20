@@ -257,7 +257,7 @@ impl Canvas {
                 b + d + drop,
                 radius + d,
                 (0, 0, 0),
-                0.03,
+                0.02,
             )?;
         }
         Ok(())

@@ -217,7 +217,7 @@ impl<C> Menu<C> {
 }
 
 /// Transparent margin around the panel that holds its shadow, in DIPs.
-pub const SHADOW: f32 = 16.;
+pub const SHADOW: f32 = 8.;
 pub const PADDING: f32 = 5.;
 pub const ITEM_HEIGHT: f32 = 32.;
 pub const HEADER_HEIGHT: f32 = 52.;

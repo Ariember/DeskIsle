@@ -76,11 +76,14 @@ impl Bars {
             })
             .collect::<Vec<_>>();
         let menu = menu::tray_menu(&entries);
-        let anchor = match self.status.overflow {
-            Some(r) => self.top_anchor(r.x + r.width / 2),
-            None => self.cursor_anchor()?,
-        };
-        self.show_menu(menu, anchor)
+        self.show_menu(menu, self.tray_overflow_anchor()?)
+    }
+
+    pub(super) fn tray_overflow_anchor(&self) -> Result<Anchor> {
+        match self.status.overflow {
+            Some(r) => Ok(self.top_anchor(r.x + r.width / 2)),
+            None => self.cursor_anchor(),
+        }
     }
 
     /// Below the status bar at client `x`.
@@ -181,6 +184,7 @@ impl Bars {
         anchor: Anchor,
         flyout: Option<SystemItem>,
     ) -> Result<Option<Command>> {
+        self.tray.cancel_click();
         let mut layout = self.menu_layout(&mut menu);
         let window = MenuWindow::create(layout.place(anchor, self.monitor.bounds))?;
         if let Err(error) = self.paint_menu(&window, &menu, &layout, true) {

@@ -16,7 +16,9 @@ use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
 use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem};
+use crate::ui::menu::Anchor;
 use crate::ui::system::SystemStatus;
+use windows::Win32::Foundation::POINT;
 use windows::core::{Error, Result};
 
 struct Bars {
@@ -184,6 +186,10 @@ pub(crate) fn run() -> Result<()> {
                 bars.restatus();
                 bars.draw()?;
             }
+            Event::TrayActivation => {
+                let result = bars.tray.finish_activation();
+                bars.handle_tray_click(result)?;
+            }
             Event::Display => bars.display(false)?,
             Event::AppBarMoved => bars.display(true)?,
             Event::ShellRestart if bars.appbar.shell_changed() => {
@@ -196,6 +202,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.fullscreen = fullscreen;
                 bars.position()?;
                 if fullscreen {
+                    bars.tray.cancel_click();
                     bars.set_hover(None)?;
                 }
             }
@@ -231,7 +238,10 @@ pub(crate) fn run() -> Result<()> {
                     bars.draw()?;
                 }
             }
-            Event::Press(..) => bars.swallow_click = false,
+            Event::Press(..) => {
+                bars.tray.cancel_click();
+                bars.swallow_click = false;
+            }
             Event::Click(..) if bars.swallow_click => bars.swallow_click = false,
             Event::Click(owner, x, y) if owner == bars.top.0 => {
                 let quit = match bars.status.hit(x, y) {
@@ -284,6 +294,7 @@ impl Bars {
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
     /// asks or the monitor changed, since each negotiation changes the work area again.
     fn display(&mut self, replace: bool) -> Result<()> {
+        self.tray.cancel_click();
         let monitor = platform::monitor()?;
         let replace =
             replace || monitor.bounds != self.monitor.bounds || monitor.dpi != self.monitor.dpi;
@@ -348,12 +359,25 @@ impl Bars {
     }
 
     fn tray_click(&mut self, slot: usize, right: bool) -> Result<()> {
+        let rect = self.status.tray[slot].rect;
         let index = self.shown[slot];
-        self.tray_activate(index, right)
+        self.tray_activate(index, right, self.top_anchor(rect.x + rect.width / 2))
     }
 
-    fn tray_activate(&mut self, index: usize, right: bool) -> Result<()> {
-        match self.tray.click(index, right, platform::cursor()?) {
+    fn tray_activate(&mut self, index: usize, right: bool, anchor: Anchor) -> Result<()> {
+        let result = self.tray.click(
+            index,
+            right,
+            POINT {
+                x: anchor.x,
+                y: anchor.y,
+            },
+        );
+        self.handle_tray_click(result)
+    }
+
+    fn handle_tray_click(&mut self, result: Result<bool>) -> Result<()> {
+        match result {
             Ok(false) => Ok(()),
             Ok(true) => {
                 self.restatus();
