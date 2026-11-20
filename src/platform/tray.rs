@@ -3,12 +3,13 @@
 //! Windows 11 offers no API to read the notification area. `Shell_NotifyIcon` sends a
 //! `WM_COPYDATA` to the first `Shell_TrayWnd` that `FindWindow` returns, so DeskIsle owns
 //! a hidden window of that class above Explorer's taskbar in the Z order, records the
-//! icons it receives and forwards every message to Explorer. The system tray keeps
+//! icons it receives and forwards registrations to Explorer. The system tray keeps
 //! working while DeskIsle runs and after it exits.
 
 mod menu;
+mod placement;
 
-pub(super) use menu::shown as menu_shown;
+pub(super) use menu::window_event as menu_event;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -24,6 +25,7 @@ use windows::core::{Error, GUID, Result, w};
 
 use super::taskbar::explorer_tray;
 use super::{Event, TASKBAR_CREATED, queue, shell};
+use crate::geometry::Rect;
 
 // shellapi.h. Shell32 sends the 32-bit layout to the tray from 32- and 64-bit callers.
 const TRAY_SIGNATURE: u32 = 0x3475_3423;
@@ -150,8 +152,19 @@ struct PendingActivation {
     registration: u64,
     pid: u32,
     foreground: HWND,
-    at: POINT,
+    previous_windows: Option<Vec<HWND>>,
+    click_at: POINT,
+    menu_at: POINT,
+    sent_double_click: bool,
     deadline: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrayClick {
+    Left,
+    Right,
+    // The first press and release were already posted.
+    CompleteDoubleClick,
 }
 
 impl TrayHost {
@@ -203,24 +216,53 @@ impl TrayHost {
     }
 
     /// Keeps this host first for `FindWindow`. Explorer raises its taskbar when the user
-    /// clicks it, so the UI loop calls this after foreground changes. Mirroring the
-    /// taskbar rectangle keeps applications that size popups from `Shell_TrayWnd` right.
+    /// clicks it, so the UI loop calls this after foreground changes.
     pub fn raise(&self) {
-        let mut rect = RECT::default();
-        if let Some(explorer) = explorer_tray() {
-            let _ = unsafe { GetWindowRect(explorer, &mut rect) };
-        }
         let _ = unsafe {
             SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             )
         };
+    }
+
+    /// Apps that locate the tray by window class use the edge hosting our icons.
+    pub fn position(&self, status_bar: Option<Rect>) -> Result<()> {
+        let bar = match status_bar {
+            Some(rect) => rect,
+            None => {
+                // When the user keeps the native tray, Explorer supplies its geometry.
+                let mut rect = RECT::default();
+                let Some(explorer) = explorer_tray() else {
+                    return Ok(());
+                };
+                if unsafe { GetWindowRect(explorer, &mut rect) }.is_err() {
+                    return Ok(()); // Explorer can restart during a display change.
+                }
+                super::to_rect(rect)
+            }
+        };
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                bar.x,
+                bar.y,
+                bar.width,
+                bar.height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        }
+    }
+
+    /// Publishes screen-space hit rectangles for synchronous Shell position queries.
+    pub fn set_icon_rects(&self, rects: impl Iterator<Item = (usize, Rect)>) {
+        placement::update(rects.map(|(index, rect)| (&self.icons[index], rect)));
     }
 
     /// Shell32 looks up Shell_TrayWnd when negotiating an AppBar. Its position
@@ -272,7 +314,7 @@ impl TrayHost {
                 self.icons[i].version = n.version;
                 false
             }
-            (NIM_ADD | NIM_MODIFY, Some(i)) => {
+            (NIM_MODIFY, Some(i)) => {
                 self.next_stamp += 1;
                 let icon = &mut self.icons[i];
                 icon.stamp = self.next_stamp;
@@ -292,7 +334,7 @@ impl TrayHost {
             }
             // DeskIsle may start after an icon was added. Accept the first update that
             // carries an image so icons from applications ignoring TaskbarCreated appear.
-            (NIM_ADD, None) | (NIM_MODIFY, None) if n.message == NIM_ADD || n.icon.is_some() => {
+            (NIM_ADD, _) | (NIM_MODIFY, None) if n.message == NIM_ADD || n.icon.is_some() => {
                 self.next_stamp += 1;
                 let guid = (n.flags & NIF_GUID != 0).then_some(n.guid);
                 let exe = owner_path(n.owner);
@@ -309,7 +351,7 @@ impl TrayHost {
                 } else {
                     0
                 };
-                self.icons.push(TrayIcon {
+                let icon = TrayIcon {
                     key: format!(
                         "{}|{ident}",
                         exe.map(|p| p.to_string_lossy().to_lowercase())
@@ -329,7 +371,12 @@ impl TrayHost {
                     },
                     version: 0,
                     state,
-                });
+                };
+                if let Some(index) = found {
+                    self.icons[index] = icon;
+                } else {
+                    self.icons.push(icon);
+                }
                 true
             }
             _ => false,
@@ -346,20 +393,43 @@ impl TrayHost {
             self.icons.remove(index);
             return Ok(true);
         }
-        if !right && shell::activate_tray_window(pid).unwrap_or(false) {
-            return Ok(false);
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut previous_windows = if right {
+            None
+        } else {
+            shell::tray_windows(pid).ok()
+        };
+        if let Some(windows) = &mut previous_windows {
+            let root = unsafe { GetAncestor(foreground, GA_ROOTOWNER) };
+            if windows.contains(&foreground) || windows.contains(&root) {
+                return Ok(false);
+            }
+            if icon.callback == 0 && shell::activate_tray_window(pid, windows)? {
+                return Ok(false);
+            }
+            windows.retain(|&hwnd| !unsafe { IsIconic(hwnd) }.as_bool());
         }
         if icon.callback == 0 {
-            return Ok(false);
+            return Err(Error::new(
+                E_FAIL,
+                format!("托盘图标“{}”未注册点击回调，无法请求应用菜单", icon.label),
+            ));
         }
         let registration = icon.registration;
-        let foreground = unsafe { GetForegroundWindow() };
-        let click_at = if right { at } else { super::cursor()? };
-        let changed = self.send_click(index, pid, right, click_at)?;
+        let click_at = if right {
+            at
+        } else {
+            super::cursor().unwrap_or(at)
+        };
+        let click = if right {
+            TrayClick::Right
+        } else {
+            TrayClick::Left
+        };
+        let changed = self.send_click(index, pid, click, click_at)?;
         if !right && !changed {
             // Posting a callback only queues it. Let the app restore its own hidden window
             // before considering a second action, without blocking the UI thread.
-            let deadline = Instant::now() + Duration::from_millis(u64::from(ACTIVATION_WAIT_MS));
             if unsafe { SetTimer(Some(self.hwnd), ACTIVATION_TIMER, ACTIVATION_WAIT_MS, None) } == 0
             {
                 return Err(Error::new(E_FAIL, "无法设置托盘点击定时器"));
@@ -368,8 +438,11 @@ impl TrayHost {
                 registration,
                 pid,
                 foreground,
-                at,
-                deadline,
+                previous_windows,
+                click_at,
+                menu_at: at,
+                sent_double_click: false,
+                deadline: Instant::now() + Duration::from_millis(u64::from(ACTIVATION_WAIT_MS)),
             });
         }
         Ok(changed)
@@ -383,53 +456,100 @@ impl TrayHost {
     }
 
     pub fn finish_activation(&mut self) -> Result<bool> {
+        self.check_activation(Instant::now(), unsafe { GetForegroundWindow() })
+    }
+
+    fn check_activation(&mut self, now: Instant, foreground: HWND) -> Result<bool> {
         let Some(pending) = &self.activation else {
             return Ok(false);
         };
-        // A timer message queued before cancellation can still arrive.
-        if Instant::now() < pending.deadline {
+        // A timer message queued before cancellation can still arrive. If a registration
+        // change is queued, let its Tray event run before using the icon again.
+        if now < pending.deadline || !COMMANDS.with_borrow(Vec::is_empty) {
             return Ok(false);
         }
-        let pending = self.activation.take().expect("tray activation pending");
-        let _ = unsafe { KillTimer(Some(self.hwnd), ACTIVATION_TIMER) };
-        if unsafe { GetForegroundWindow() } != pending.foreground {
+        if foreground != pending.foreground {
             // The app responded or the user moved on to another window.
+            self.cancel_click();
             return Ok(false);
         }
         let Some(index) = self.icons.iter().position(|icon| {
             icon.registration == pending.registration && icon.visible() && icon.callback != 0
         }) else {
+            self.cancel_click();
             return Ok(false);
         };
         let owner = HWND(self.icons[index].owner as _);
         let mut pid = 0;
         let thread = unsafe { GetWindowThreadProcessId(owner, Some(&mut pid)) };
         if thread == 0 || pid != pending.pid {
+            self.cancel_click();
             return Ok(false);
         }
         let mut gui = GUITHREADINFO {
             cbSize: size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
-        if (unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok()
-            && (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0)
-            || shell::activate_tray_window(pid).unwrap_or(false)
+        if unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok()
+            && (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0
         {
+            self.cancel_click();
             return Ok(false);
         }
-        self.send_click(index, pid, true, pending.at)
+        if let Ok(windows) = shell::tray_windows(pid) {
+            // A background helper that was already visible is not evidence of a
+            // response. Give the app's double-click action a turn before trying it.
+            let new_windows: Vec<_> = windows
+                .iter()
+                .copied()
+                .filter(|hwnd| {
+                    pending
+                        .previous_windows
+                        .as_ref()
+                        .is_some_and(|old| !old.contains(hwnd))
+                        && !unsafe { IsIconic(*hwnd) }.as_bool()
+                })
+                .collect();
+            let targets = if pending.sent_double_click && new_windows.is_empty() {
+                &windows
+            } else {
+                &new_windows
+            };
+            if shell::activate_tray_window(pid, targets).unwrap_or(false) {
+                self.cancel_click();
+                return Ok(false);
+            }
+        }
+        if pending.sent_double_click {
+            let at = pending.menu_at;
+            self.cancel_click();
+            return self.send_click(index, pid, TrayClick::Right, at);
+        }
+        let at = pending.click_at;
+        match self.send_click(index, pid, TrayClick::CompleteDoubleClick, at) {
+            Ok(false) => {
+                let pending = self.activation.as_mut().expect("tray activation pending");
+                pending.sent_double_click = true;
+                pending.deadline = now + Duration::from_millis(u64::from(ACTIVATION_WAIT_MS));
+                Ok(false)
+            }
+            result => {
+                self.cancel_click();
+                result
+            }
+        }
     }
 
-    fn send_click(&mut self, index: usize, pid: u32, right: bool, at: POINT) -> Result<bool> {
+    fn send_click(&mut self, index: usize, pid: u32, click: TrayClick, at: POINT) -> Result<bool> {
         let icon = &self.icons[index];
         let owner = HWND(icon.owner as _);
         // This process handled the last input, so it may pass foreground rights on to the
         // application that opens a menu or window in response.
         let _ = unsafe { AllowSetForegroundWindow(pid) };
-        if right {
-            menu::watch(pid, at);
+        if click == TrayClick::Right {
+            menu::watch(pid, icon.registration, at);
         }
-        for (wp, lp) in click_callbacks(icon.version, icon.id, right, at) {
+        for (wp, lp) in click_callbacks(icon.version, icon.id, click, at) {
             if let Err(error) = unsafe { PostMessageW(Some(owner), icon.callback, wp, lp) } {
                 menu::stop();
                 if !unsafe { IsWindow(Some(owner)) }.as_bool() {
@@ -465,33 +585,33 @@ impl Drop for TrayHost {
         // FindWindow returns Explorer's taskbar again once this window is gone.
         let _ = unsafe { DestroyWindow(self.hwnd) };
         COMMANDS.take();
+        placement::update(std::iter::empty());
     }
 }
 
 fn click_callbacks(
     version: u32,
     id: u32,
-    right: bool,
+    click: TrayClick,
     at: POINT,
 ) -> impl Iterator<Item = (WPARAM, LPARAM)> {
-    let messages = if right {
-        [WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU]
-    } else {
-        [WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT]
+    let messages: &[u32] = match click {
+        TrayClick::Right if version >= 3 => &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU],
+        TrayClick::Right => &[WM_RBUTTONDOWN, WM_RBUTTONUP],
+        TrayClick::Left if version >= 3 => &[WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT],
+        TrayClick::Left => &[WM_LBUTTONDOWN, WM_LBUTTONUP],
+        TrayClick::CompleteDoubleClick => &[WM_LBUTTONDBLCLK, WM_LBUTTONUP],
     };
-    // Version 3 added the selection message; version 4 moved the ID into lParam.
-    messages
-        .into_iter()
-        .take(if version >= 3 { 3 } else { 2 })
-        .map(move |message| {
-            if version >= 4 {
-                let point = usize::from(at.x as u16) | (usize::from(at.y as u16) << 16);
-                let event = message as isize | (((id & 0xffff) as isize) << 16);
-                (WPARAM(point), LPARAM(event))
-            } else {
-                (WPARAM(id as usize), LPARAM(message as isize))
-            }
-        })
+    // Version 4 moved the ID into lParam.
+    messages.iter().map(move |&message| {
+        if version >= 4 {
+            let point = usize::from(at.x as u16) | (usize::from(at.y as u16) << 16);
+            let event = message as isize | (((id & 0xffff) as isize) << 16);
+            (WPARAM(point), LPARAM(event))
+        } else {
+            (WPARAM(id as usize), LPARAM(message as isize))
+        }
+    })
 }
 
 fn owner_path(owner: isize) -> Option<PathBuf> {
@@ -576,6 +696,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let mut notify = false;
             if !data.is_null() {
                 let data = unsafe { &*data };
+                if data.dwData == placement::COPYDATA_ICON_RECT
+                    && let Some(result) = unsafe { placement::reply(data) }
+                {
+                    return result;
+                }
                 if data.dwData == COPYDATA_NOTIFY {
                     notify = true;
                     if let Some(command) = unsafe { parse(data) } {
@@ -584,7 +709,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                 }
             }
-            // Appbar and icon-position requests are answered by Explorer alone.
+            // Explorer handles AppBars and any icon positions we cannot supply.
             forward(msg, wp, lp).unwrap_or(LRESULT(notify as isize))
         }
         // Explorer's private messages to its taskbar. Registered messages are
@@ -601,9 +726,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unhandled_left_click_completes_double_click_before_requesting_menu() -> Result<()> {
+        // A message-only owner receives the same posted callbacks as a tray application,
+        // without creating a taskbar host or changing the desktop's foreground window.
+        let owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )?
+        };
+        const CALLBACK: u32 = WM_APP + 125;
+        let mut host = TrayHost {
+            hwnd: owner,
+            icons: Vec::new(),
+            next_stamp: 0,
+            activation: None,
+        };
+        let registration = || Notify {
+            message: NIM_ADD,
+            owner: owner.0 as isize,
+            id: 77,
+            flags: NIF_MESSAGE,
+            callback: CALLBACK,
+            icon: None,
+            tip: "Test".into(),
+            state: 0,
+            state_mask: 0,
+            version: 0,
+            guid: GUID::zeroed(),
+        };
+        host.apply(registration());
+        host.icons[0].version = 4;
+        let receive = || {
+            let mut events = Vec::new();
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, Some(owner), CALLBACK, CALLBACK, PM_REMOVE) }
+                .as_bool()
+            {
+                assert_eq!(msg.lParam.0 >> 16, 77);
+                events.push((msg.lParam.0 as u16 as u32, msg.wParam.0));
+            }
+            events
+        };
+        let anchor = POINT { x: -250, y: 48 };
+        host.click(0, false, anchor)?;
+        let pending = host.activation.as_ref().unwrap();
+        let (later, foreground) = (pending.deadline, pending.foreground);
+        let first = receive();
+        assert_eq!(
+            first.iter().map(|&(event, _)| event).collect::<Vec<_>>(),
+            [WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT]
+        );
+        let at = first[0].1;
+        host.check_activation(later, foreground)?;
+        assert_eq!(receive(), [(WM_LBUTTONDBLCLK, at), (WM_LBUTTONUP, at)]);
+        host.check_activation(later, foreground)?;
+        assert!(receive().is_empty());
+        host.check_activation(host.activation.as_ref().unwrap().deadline, foreground)?;
+        let menu_at = usize::from(anchor.x as u16) | (usize::from(anchor.y as u16) << 16);
+        assert_eq!(
+            receive(),
+            [
+                (WM_RBUTTONDOWN, menu_at),
+                (WM_RBUTTONUP, menu_at),
+                (WM_CONTEXTMENU, menu_at)
+            ]
+        );
+        host.check_activation(later, foreground)?;
+        assert!(receive().is_empty());
+
+        // Single-click handlers can foreground a window belonging to a helper process.
+        host.click(0, false, anchor)?;
+        receive();
+        let pending = host.activation.as_ref().unwrap();
+        let (later, foreground) = (pending.deadline, pending.foreground);
+        host.check_activation(later, HWND_MESSAGE)?;
+        host.check_activation(later, foreground)?;
+        assert!(receive().is_empty());
+
+        host.click(0, false, anchor)?;
+        receive();
+        let pending = host.activation.as_ref().unwrap();
+        let (later, foreground) = (pending.deadline, pending.foreground);
+        host.apply(registration());
+        host.check_activation(later, foreground)?;
+        assert!(receive().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn tray_menu_callbacks_preserve_the_anchor_and_legacy_icon_id() {
         let at = POINT { x: -250, y: 48 };
-        let modern: Vec<_> = click_callbacks(4, 77, true, at)
+        let modern: Vec<_> = click_callbacks(4, 77, TrayClick::Right, at)
             .map(|(wp, lp)| {
                 (
                     (wp.0 as i16, (wp.0 >> 16) as i16),
@@ -620,7 +844,7 @@ mod tests {
             (0, &[WM_RBUTTONDOWN, WM_RBUTTONUP][..]),
             (3, &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU][..]),
         ] {
-            let legacy: Vec<_> = click_callbacks(version, 0x1004d, true, at)
+            let legacy: Vec<_> = click_callbacks(version, 0x1004d, TrayClick::Right, at)
                 .map(|(wp, lp)| (wp.0, lp.0 as u32))
                 .collect();
             assert!(

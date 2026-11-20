@@ -96,8 +96,11 @@ unsafe extern "system" fn window_event(
     {
         return;
     }
-    if event == EVENT_OBJECT_SHOW {
-        super::tray::menu_shown(hwnd, event_time);
+    if matches!(
+        event,
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY
+    ) {
+        super::tray::menu_event(event, hwnd, event_time);
     }
     if let Some(target) = EVENT_TARGET.get()
         && !CHANGE_POSTED.replace(true)
@@ -407,29 +410,21 @@ pub(super) fn window_process(hwnd: HWND) -> u32 {
     pid
 }
 
-/// Use the foreground window or a single task-switchable window of the tray owner.
-/// Multiple background windows leave selection to the app's own tray callback.
-pub(super) fn activate_tray_window(pid: u32) -> Result<bool> {
-    let foreground = unsafe { GetForegroundWindow() };
-    let active = unsafe { GetAncestor(foreground, GA_ROOTOWNER) };
-    let mut candidate = None;
-    let mut ambiguous = false;
+pub(super) fn tray_windows(pid: u32) -> Result<Vec<HWND>> {
+    let mut windows = Vec::new();
     for hwnd in window_handles()? {
-        if window_process(hwnd) != pid || window_info(hwnd)?.is_none() {
-            continue;
+        if window_process(hwnd) == pid && window_info(hwnd)?.is_some() {
+            windows.push(hwnd);
         }
-        if hwnd == foreground || hwnd == active {
-            return Ok(true);
-        }
-        ambiguous |= candidate.replace(hwnd).is_some();
     }
-    if let Some(hwnd) = candidate
-        && !ambiguous
-        && window_process(hwnd) == pid
-    {
-        return activate_window(hwnd);
+    Ok(windows)
+}
+
+pub(super) fn activate_tray_window(pid: u32, windows: &[HWND]) -> Result<bool> {
+    match windows {
+        &[hwnd] if window_process(hwnd) == pid => activate_window(hwnd),
+        _ => Ok(false),
     }
-    Ok(false)
 }
 
 fn activate_window(hwnd: HWND) -> Result<bool> {

@@ -200,6 +200,7 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::FullScreen(fullscreen) => {
                 bars.fullscreen = fullscreen;
+                bars.publish_tray_rects();
                 bars.position()?;
                 if fullscreen {
                     bars.tray.cancel_click();
@@ -287,6 +288,11 @@ impl Bars {
     }
 
     fn position(&self) -> Result<()> {
+        self.tray.position(
+            self.settings
+                .enabled(Key::HideTaskbar)
+                .then_some(self.top_rect),
+        )?;
         self.top.position(self.top_rect, !self.fullscreen)?;
         self.bottom.position(self.layout.bottom, !self.fullscreen)
     }
@@ -356,6 +362,40 @@ impl Bars {
             visible,
             &self.system.items(),
         );
+        self.publish_tray_rects();
+    }
+
+    fn publish_tray_rects(&self) {
+        if self.fullscreen || !self.settings.enabled(Key::HideTaskbar) {
+            self.tray.set_icon_rects(std::iter::empty());
+            return;
+        }
+        // Each visible icon is reachable at its own slot or at the overflow button.
+        let on_bar = &self.shown[..self.status.tray.len()];
+        let rects = self
+            .tray
+            .icons()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, icon)| {
+                if !icon.visible() {
+                    return None;
+                }
+                let rect = on_bar
+                    .binary_search(&index)
+                    .ok()
+                    .map(|slot| self.status.tray[slot].rect)
+                    .or(self.status.overflow)?;
+                Some((
+                    index,
+                    Rect {
+                        x: self.top_rect.x + rect.x,
+                        y: self.top_rect.y + rect.y,
+                        ..rect
+                    },
+                ))
+            });
+        self.tray.set_icon_rects(rects);
     }
 
     fn tray_click(&mut self, slot: usize, right: bool) -> Result<()> {
