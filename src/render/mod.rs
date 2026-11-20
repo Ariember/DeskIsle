@@ -279,8 +279,24 @@ impl Renderer {
             |c| {
                 c.bar_glass(w, h, 0.)?;
                 c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.16)?;
-                c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., c.p.accent)?;
-                c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., c.p.accent)?;
+                let button = layout.quick_menu;
+                if button.width > 0 {
+                    let (left, right) = (dip(button.x), dip(button.x + button.width));
+                    c.fill(left, 2., right, h - 2., 5., c.p.line, 0.13)?;
+                    c.draw_text(
+                        &self.write,
+                        "◇",
+                        c.rect(left, 0., right, h),
+                        Text {
+                            size: 19.,
+                            bold: true,
+                            align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                            ..Text::default()
+                        },
+                        c.p.ink,
+                        1.,
+                    )?;
+                }
                 let t = layout.title;
                 c.text(
                     &self.write,

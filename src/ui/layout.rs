@@ -104,13 +104,14 @@ pub enum SystemItem {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusHit {
+    QuickMenu,
     Tray(usize),
     Overflow,
     System(SystemItem),
     /// The active application's name.
     Title,
     Clock,
-    /// The mark and empty space.
+    /// Empty space on the bar.
     Bar,
 }
 
@@ -119,6 +120,7 @@ pub enum StatusHit {
 pub struct StatusLayout {
     pub width: i32,
     pub height: i32,
+    pub quick_menu: Rect,
     pub title: Rect,
     /// `index` refers to the shown tray icons in display order.
     pub tray: Vec<Slot>,
@@ -173,11 +175,14 @@ impl StatusLayout {
                 rect: cell(tray_start + index as i32 * slot, slot),
             })
             .collect();
-        let title_x = px(34).min(tray_start);
+        let button_x = px(4).min(tray_start);
+        let quick_menu = cell(button_x, px(40).min(tray_start - button_x));
+        let title_x = (button_x + quick_menu.width + px(10)).min(tray_start);
         let title = cell(title_x, (tray_start - px(12) - title_x).max(0));
         Self {
             width,
             height,
+            quick_menu,
             title,
             tray,
             overflow,
@@ -195,6 +200,8 @@ impl StatusLayout {
             StatusHit::System(item)
         } else if self.clock.contains(x, y) {
             StatusHit::Clock
+        } else if self.quick_menu.contains(x, y) {
+            StatusHit::QuickMenu
         } else if self.title.contains(x, y) {
             StatusHit::Title
         } else {
@@ -293,7 +300,10 @@ mod tests {
             assert_eq!(layout.hit(last.x, 0), StatusHit::Tray(2));
             assert_eq!(layout.hit(last.x + last.width, 0), StatusHit::Overflow);
             assert_eq!(layout.hit(overflow.x - 1, height - 1), StatusHit::Tray(2));
-            assert_eq!(layout.hit(px(20), px(10)), StatusHit::Bar);
+            assert_eq!(layout.hit(px(20), px(10)), StatusHit::QuickMenu);
+            let button = layout.quick_menu;
+            assert_eq!(layout.hit(button.x - 1, 0), StatusHit::Bar);
+            assert_eq!(layout.hit(button.x + button.width, 0), StatusHit::Bar);
             assert_eq!(layout.hit(layout.title.x, px(10)), StatusHit::Title);
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 

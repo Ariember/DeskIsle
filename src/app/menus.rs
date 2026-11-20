@@ -20,6 +20,7 @@ impl Bars {
                     Ok(false)
                 }
                 StatusHit::Overflow => self.tray_menu(),
+                StatusHit::QuickMenu => self.quick_menu(),
                 StatusHit::System(item) => self.flyout(item),
                 StatusHit::Clock => self.clock_menu(),
                 StatusHit::Title => match self.apps.iter().position(|app| app.active) {
@@ -51,6 +52,12 @@ impl Bars {
         let menu = menu::bar_menu(&self.apps);
         let anchor = self.cursor_anchor()?;
         self.show_menu(menu, anchor)
+    }
+
+    pub(super) fn quick_menu(&mut self) -> Result<bool> {
+        let button = self.status.quick_menu;
+        let anchor = self.top_anchor(button.x + button.width / 2);
+        self.show_menu(menu::quick_menu(), anchor)
     }
 
     pub(super) fn clock_menu(&mut self) -> Result<bool> {

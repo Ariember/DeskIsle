@@ -521,7 +521,7 @@ impl Renderer {
                 } else {
                     0.
                 };
-                let label_left = row_left + 8. + menu::ICON_COLUMN;
+                let label_left = row_left + 8. + layout.icon_column;
                 let label_right = row_right - menu::TEXT_INSET - check;
                 let detail_width = if item.detail.is_empty() {
                     0.

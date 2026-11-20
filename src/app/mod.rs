@@ -251,6 +251,7 @@ pub(crate) fn run() -> Result<()> {
                         false
                     }
                     StatusHit::Overflow => bars.tray_menu()?,
+                    StatusHit::QuickMenu => bars.quick_menu()?,
                     StatusHit::System(item) => bars.flyout(item)?,
                     StatusHit::Clock => bars.clock_menu()?,
                     StatusHit::Title | StatusHit::Bar => bars.bar_menu()?,

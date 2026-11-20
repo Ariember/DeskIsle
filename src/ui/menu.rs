@@ -292,6 +292,8 @@ pub struct MenuLayout {
     pub height: f32,
     /// Top and bottom of each entry, aligned with `Menu::entries`.
     pub rows: Vec<(f32, f32)>,
+    /// Reserved for leading icons when at least one item uses one.
+    pub icon_column: f32,
     pub checks: bool,
 }
 
@@ -310,6 +312,15 @@ impl MenuLayout {
                 })
             )
         });
+        let icon_column = if menu
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Item(item) if item.icon != Icon::None))
+        {
+            ICON_COLUMN
+        } else {
+            0.
+        };
         let mut content: f32 = 0.;
         let mut rows = Vec::with_capacity(menu.entries.len());
         let mut y = SHADOW + PADDING;
@@ -325,7 +336,7 @@ impl MenuLayout {
                 }
                 Entry::Item(item) => {
                     let mut width =
-                        TEXT_INSET + ICON_COLUMN + measure(&item.label, LABEL_SIZE, false);
+                        TEXT_INSET + icon_column + measure(&item.label, LABEL_SIZE, false);
                     if !item.detail.is_empty() {
                         width += 24. + measure(&item.detail, DETAIL_SIZE, false);
                     }
@@ -380,6 +391,7 @@ impl MenuLayout {
             width: panel + 2. * SHADOW,
             height: y + PADDING + SHADOW,
             rows,
+            icon_column,
             checks,
         }
     }
@@ -740,6 +752,27 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
     menu
 }
 
+/// System shortcuts under the status bar's diamond button.
+pub fn quick_menu() -> Menu<Command> {
+    let mut menu = Menu::new();
+    menu.min_width = 148.;
+    menu.item("关于本机", Icon::None, None);
+    menu.separator();
+    menu.item("管理面板", Icon::None, Some(Command::Settings));
+    menu.item("应用商店", Icon::None, None);
+    menu.separator();
+    menu.item("任务管理器", Icon::None, Some(Command::TaskManager));
+    menu.item("显示桌面", Icon::None, Some(Command::ShowDesktop));
+    menu.separator();
+    for label in ["睡眠", "重新启动", "关机"] {
+        menu.item(label, Icon::None, None);
+    }
+    menu.separator();
+    menu.item("锁定屏幕", Icon::None, None);
+    menu.item("注销", Icon::None, None);
+    menu
+}
+
 pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
     let mut menu = Menu::new();
     menu.header(date, year, Icon::Glyph("\u{E787}"));
@@ -887,6 +920,14 @@ mod tests {
         assert_eq!(bar.last(), Some(&Command::Quit));
         assert!(bar.contains(&Command::Select("viewer".into())));
         assert!(!commands(&app_menu(&apps[1], None)).contains(&Command::Quit));
+        assert_eq!(
+            commands(&quick_menu()),
+            [
+                Command::Settings,
+                Command::TaskManager,
+                Command::ShowDesktop
+            ]
+        );
 
         let icons = [
             TrayEntry {
