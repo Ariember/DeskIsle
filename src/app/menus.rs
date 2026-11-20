@@ -58,6 +58,10 @@ impl Bars {
 
     /// The system menu, below the status bar mark.
     pub(super) fn mark_menu(&mut self) -> Result<bool> {
+        // The bounce is only feedback: if it fails, the menu still opens.
+        if let Some(renderer) = &self.renderer {
+            let _ = renderer.bounce_mark();
+        }
         let mark = self.status.mark;
         let anchor = self.top_anchor(mark.x + mark.width / 2);
         self.show_menu(menu::mark_menu(), anchor)

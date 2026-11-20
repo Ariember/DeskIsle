@@ -75,6 +75,7 @@ pub struct Renderer {
     menu: Option<MenuView>,
     panel: Option<PanelView>,
     palette: Palette,
+    mark: Option<MarkLayer>,
 }
 
 #[derive(PartialEq)]
@@ -109,6 +110,15 @@ impl Bar {
     }
 }
 
+/// The DeskIsle mark on its own layer above the status bar, so a click can squash and
+/// stretch it on the compositor without repainting the bar.
+struct MarkLayer {
+    visual: IDCompositionVisual2,
+    scale: IDCompositionScaleTransform,
+    /// The bar height in pixels, DPI and palette the ring was painted for.
+    key: (i32, u32, Palette),
+}
+
 struct IconLayer {
     path: PathBuf,
     label: String,
@@ -132,6 +142,21 @@ const BAR_ICON: f32 = 16.;
 const BATTERY_ICON: f32 = 22.;
 /// The chevron of the tray overflow button, smaller than the icons beside it.
 const OVERFLOW_ICON: f32 = 13.;
+/// The DeskIsle mark: a ring centered this far from the bar's leading edge, in DIPs.
+const MARK_X: f32 = 18.;
+const MARK_RADIUS: f32 = 6.;
+const MARK_STROKE: f32 = 1.75;
+/// Edge of the mark's layer in DIPs, with room for the ring's antialiased rim.
+const MARK_BOX: f32 = 20.;
+/// The mark's squash and stretch on a click: (seconds, horizontal, vertical scale).
+/// It flattens wide, springs back tall and narrow, wobbles once and settles round.
+const MARK_BOUNCE: [(f32, f32, f32); 5] = [
+    (0., 1., 1.),
+    (0.07, 1.32, 0.72),
+    (0.17, 0.86, 1.14),
+    (0.26, 1.06, 0.95),
+    (0.36, 1., 1.),
+];
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
 fn ease(
@@ -151,6 +176,35 @@ fn ease(
             delta / duration.powi(3),
         )?;
         curve.End(duration as f64, to)?;
+        Ok(curve)
+    }
+}
+
+/// A curve through `keys` of (seconds, value) that eases in and out of each key and
+/// holds the last value afterwards.
+fn keyframes(
+    device: &IDCompositionDesktopDevice,
+    keys: impl Iterator<Item = (f32, f32)>,
+) -> Result<IDCompositionAnimation> {
+    unsafe {
+        let curve = device.CreateAnimation()?;
+        let mut previous: Option<(f32, f32)> = None;
+        for (time, value) in keys {
+            if let Some((start, from)) = previous {
+                let (d, delta) = (time - start, value - from);
+                curve.AddCubic(
+                    start as f64,
+                    from,
+                    0.,
+                    3. * delta / d.powi(2),
+                    -2. * delta / d.powi(3),
+                )?;
+            }
+            previous = Some((time, value));
+        }
+        if let Some((time, value)) = previous {
+            curve.End(time as f64, value)?;
+        }
         Ok(curve)
     }
 }
@@ -222,6 +276,7 @@ impl Renderer {
                 menu: None,
                 panel: None,
                 palette: Palette::new(dark),
+                mark: None,
             })
         }
     }
@@ -303,8 +358,6 @@ impl Renderer {
             |c| {
                 c.bar_glass(w, h, 0.)?;
                 c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.12)?;
-                // The DeskIsle mark: a ring, as round as the controls beside it.
-                c.ring(18., h / 2., 6., 1.75, c.p.accent)?;
                 let t = layout.title;
                 c.text(
                     &self.write,
@@ -401,12 +454,63 @@ impl Renderer {
                 )
             },
         )?;
-        unsafe {
-            self.top.root.SetContent(&surface)?;
-            self.device.Commit()?;
-        }
+        unsafe { self.top.root.SetContent(&surface)? };
+        self.place_mark(layout.height, dpi)?;
+        unsafe { self.device.Commit()? };
         self.top_state = Some(state);
         Ok(())
+    }
+
+    /// Paints the DeskIsle mark, a ring as round as the controls beside it, onto its own
+    /// layer above the bar. The layer is kept while the bar's height, DPI and palette are.
+    fn place_mark(&mut self, height: i32, dpi: u32) -> Result<()> {
+        let key = (height, dpi, self.palette);
+        if self.mark.as_ref().is_some_and(|mark| mark.key == key) {
+            return Ok(());
+        }
+        let s = dpi as f32 / 96.;
+        // Whole-pixel offsets keep the ring as crisp as when it was painted into the bar.
+        let (cx, cy) = (MARK_X * s, height as f32 / 2.);
+        let left = (cx - MARK_BOX / 2. * s).floor();
+        let top = (cy - MARK_BOX / 2. * s).floor();
+        let (x, y) = (cx - left, cy - top);
+        let edge = (MARK_BOX * s).ceil() as i32 + 1;
+        let surface = paint(&self.device, self.palette, edge, edge, dpi, |c| {
+            c.ring(x / s, y / s, MARK_RADIUS, MARK_STROKE, c.p.accent)
+        })?;
+        unsafe {
+            if let Some(old) = self.mark.take() {
+                self.top.root.RemoveVisual(&old.visual)?;
+            }
+            let visual = self.device.CreateVisual()?;
+            visual.SetContent(&surface)?;
+            visual.SetOffsetX2(left)?;
+            visual.SetOffsetY2(top)?;
+            let scale = self.device.CreateScaleTransform()?;
+            scale.SetCenterX2(x)?;
+            scale.SetCenterY2(y)?;
+            scale.SetScaleX2(1.)?;
+            scale.SetScaleY2(1.)?;
+            visual.SetTransform(&scale)?;
+            self.top.root.AddVisual(&visual, true, None)?;
+            self.mark = Some(MarkLayer { visual, scale, key });
+        }
+        Ok(())
+    }
+
+    /// Squashes and stretches the DeskIsle mark once, as feedback for a click. A click
+    /// during the bounce starts it over.
+    pub fn bounce_mark(&self) -> Result<()> {
+        let Some(mark) = &self.mark else {
+            return Ok(());
+        };
+        let wide = keyframes(&self.device, MARK_BOUNCE.iter().map(|&(t, x, _)| (t, x)))?;
+        let tall = keyframes(&self.device, MARK_BOUNCE.iter().map(|&(t, _, y)| (t, y)))?;
+        unsafe {
+            mark.scale.SetScaleX(&wide)?;
+            mark.scale.SetScaleY(&tall)?;
+            self.device.Commit()
+        }
     }
 
     pub fn draw_dock(
