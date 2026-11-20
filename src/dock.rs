@@ -71,6 +71,14 @@ pub enum Action<'a> {
 }
 
 impl AppGroup {
+    /// The foreground window of this application, or its first in desktop Z order.
+    pub fn current_window(&self, foreground: Option<isize>) -> Option<&WindowInfo> {
+        self.windows
+            .iter()
+            .find(|window| Some(window.id) == foreground)
+            .or_else(|| self.windows.first())
+    }
+
     /// Pinned applications stay on the Dock without windows.
     pub fn pinned(&self) -> bool {
         self.launch.is_some()

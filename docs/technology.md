@@ -11,7 +11,7 @@ DeskIsle 是面向 Windows 的桌面美化工具。首个开发目标是常驻 D
 | Dock 渲染 | DirectComposition 合成，Direct3D 11 提供图形表面 | 图标上传后可重复使用，悬停时更新缩放和位移，由系统驱动过渡动画。此方案需要自行实现命中测试、键盘操作和无障碍语义，并处理图形设备重建。[DirectComposition 概览](https://learn.microsoft.com/en-us/windows/win32/directcomp/directcomposition-portal) |
 | 桌面集成 | 以普通用户权限运行独立桌面进程 | Dock 在主屏临时隐藏 Explorer 任务栏，保留用户的自动隐藏设置。恢复进程通过管道感知 Dock 退出，主进程被强制终止后也可还原原生任务栏。 |
 | 系统控制 | Core Audio、`IPolicyConfig`、Power、Shutdown（睡眠、重启、关机、注销与锁屏）、DDC/CI 与 DisplayConfig；WinRT 的 `Windows.Devices.Radios`、`Windows.Networking.Connectivity` 和 `Windows.Media.Control` | 这些接口都通过已有的 `windows` 依赖调用，无需安装额外运行时。WinRT 异步操作在 UI 线程上用 `join` 等待结果，只在用户打开面板或执行操作时调用。COM 回调和自定义接口需要 `implement`、`interface` 宏，因此直接依赖 `windows-core`，其版本已在 `Cargo.lock` 中。代价是 `IPolicyConfig` 没有公开文档，亮度只支持 DDC/CI 显示器。 |
-| 状态栏与托盘 | `SHAppBarMessage` 预留顶部条带；同类名 `Shell_TrayWnd` 宿主接收并转发托盘通知 | 只有 AppBar 能让最大化窗口避开全宽状态栏。Windows 11 的托盘由 XAML 绘制，旧的工具栏读取方式已失效，接管通知是获取图标的可行途径。代价是其他按类名查找任务栏的工具可能先找到 DeskIsle 的窗口，因此宿主使用顶部栏矩形，回答已布局图标的位置查询，并把其余任务栏请求转发给 Explorer。进程意外终止时，Explorer 可能暂时保留预留的条带。[AppBar 说明](https://learn.microsoft.com/en-us/windows/win32/shell/application-desktop-toolbars) |
+| 状态栏与托盘 | `SHAppBarMessage` 预留顶部条带；同类名 `Shell_TrayWnd` 宿主接收并转发托盘通知 | 只有 AppBar 能让最大化窗口避开全宽状态栏。Windows 11 的托盘由 XAML 绘制。启动时从 Explorer 的 `NotifyIconSettings` 缓存寻找候选项，按当前窗口或 GUID 查询 Shell 确认图标仍在托盘。缓存格式由 Explorer 管理，缺少缓存时依靠应用重新注册。宿主持续接收实时图标和点击回调。代价是其他按类名查找任务栏的工具可能先找到 DeskIsle 的窗口，因此宿主使用顶部栏矩形，回答已布局图标的位置查询，并把其余任务栏请求转发给 Explorer。进程意外终止时，Explorer 可能暂时保留预留的条带。[AppBar 说明](https://learn.microsoft.com/en-us/windows/win32/shell/application-desktop-toolbars) |
 
 ## 如何验证选型
 

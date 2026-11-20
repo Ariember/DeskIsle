@@ -9,14 +9,13 @@ use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
 use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
-use crate::platform::tray::TrayHost;
+use crate::platform::tray::{TrayHost, TrayInput};
 use crate::platform::{self, AppBar, Bar, Event, Monitor, audio, shell};
 use crate::render::{DockIcon, Renderer, TrayImage, is_device_lost};
 use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
 use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem};
-use crate::ui::menu::Anchor;
 use crate::ui::system::SystemStatus;
 use windows::Win32::Foundation::POINT;
 use windows::core::{Error, Result};
@@ -188,18 +187,14 @@ pub(crate) fn run() -> Result<()> {
                 bars.hide_taskbar()?;
                 // Explorer raises its taskbar when activated; stay first for new icons.
                 bars.tray.raise();
-                if bars.tray.update() {
+                if bars.tray.update(true) {
                     bars.restatus();
                 }
                 bars.refresh()?;
             }
-            Event::Tray if bars.tray.update() => {
+            Event::Tray if bars.tray.update(false) => {
                 bars.restatus();
                 bars.draw()?;
-            }
-            Event::TrayActivation => {
-                let result = bars.tray.finish_activation();
-                bars.handle_tray_click(result)?;
             }
             Event::Display => bars.display(false)?,
             Event::AppBarMoved => bars.display(true)?,
@@ -262,15 +257,27 @@ pub(crate) fn run() -> Result<()> {
                 }
             }
             Event::MiddleClick(owner, x, y) => bars.middle_click(owner, x, y)?,
-            Event::Press(..) => {
-                bars.tray.cancel_click();
+            Event::Press {
+                owner,
+                x,
+                y,
+                right,
+                double,
+            } => {
                 bars.swallow_click = false;
+                if owner == bars.top.0
+                    && let StatusHit::Tray(slot) = bars.status.hit(x, y)
+                {
+                    bars.tray_pointer(slot, TrayInput::Press { right, double }, x, y)?;
+                } else {
+                    bars.tray.cancel_click();
+                }
             }
             Event::Click(..) if bars.swallow_click => bars.swallow_click = false,
             Event::Click(owner, x, y) if owner == bars.top.0 => {
                 let quit = match bars.status.hit(x, y) {
                     StatusHit::Tray(slot) => {
-                        bars.tray_click(slot, false)?;
+                        bars.tray_pointer(slot, TrayInput::Release { right: false }, x, y)?;
                         false
                     }
                     StatusHit::Overflow => bars.tray_menu()?,
@@ -422,25 +429,39 @@ impl Bars {
         self.tray.set_icon_rects(rects);
     }
 
-    fn tray_click(&mut self, slot: usize, right: bool) -> Result<()> {
-        let rect = self.status.tray[slot].rect;
+    fn tray_pointer(&mut self, slot: usize, input: TrayInput, x: i32, y: i32) -> Result<()> {
         let index = self.shown[slot];
-        self.tray_activate(index, right, self.top_anchor(rect.x + rect.width / 2))
+        if matches!(
+            input,
+            TrayInput::Press { right: true, .. } | TrayInput::Release { right: true }
+        ) {
+            self.tray_anchored_input(index, input)
+        } else {
+            self.tray_input(
+                index,
+                input,
+                POINT {
+                    x: self.top_rect.x + x,
+                    y: self.top_rect.y + y,
+                },
+            )
+        }
     }
 
-    fn tray_activate(&mut self, index: usize, right: bool, anchor: Anchor) -> Result<()> {
-        let result = self.tray.click(
+    fn tray_anchored_input(&mut self, index: usize, input: TrayInput) -> Result<()> {
+        let anchor = self.tray_anchor(index)?;
+        self.tray_input(
             index,
-            right,
+            input,
             POINT {
                 x: anchor.x,
                 y: anchor.y,
             },
-        );
-        self.handle_tray_click(result)
+        )
     }
 
-    fn handle_tray_click(&mut self, result: Result<bool>) -> Result<()> {
+    fn tray_input(&mut self, index: usize, input: TrayInput, at: POINT) -> Result<()> {
+        let result = self.tray.click(index, input, at);
         match result {
             Ok(false) => Ok(()),
             Ok(true) => {

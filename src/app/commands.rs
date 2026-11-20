@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::Bars;
 use crate::dock::{self, Action, group_apps};
+use crate::platform::tray::TrayInput;
 use crate::platform::{self, power, shell};
 use crate::storage;
 use crate::ui::layout::{StatusHit, SystemItem};
@@ -32,7 +33,8 @@ impl Bars {
                 self.pins.retain(|pin| pin.app_id != id);
                 storage::save_pins(&self.pins)
             }
-            Command::Close(id, windows) => shell::close_windows(&id, &windows).map(drop),
+            Command::CloseWindow(id, window) => shell::close_windows(&id, &[window]),
+            Command::CloseAllWindows(id, windows) => shell::close_windows(&id, &windows),
             Command::TaskManager => shell::execute(owner, "taskmgr.exe"),
             Command::ShowDesktop => self.tray.toggle_desktop(),
             Command::Sleep => power::sleep(owner),
@@ -43,14 +45,23 @@ impl Bars {
             Command::Settings => self.open_settings(),
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
-            // The clock menu turns its calendar itself while it is open.
-            Command::Calendar(..) => return Ok(false),
+            // Navigation is handled inside the open menu.
+            Command::Calendar(..) | Command::TrayPage(_) => return Ok(false),
             Command::TrayActivate(index) => {
-                self.tray_activate(index, false, self.tray_anchor(index)?)?;
+                self.tray_anchored_input(index, TrayInput::KeySelect)?;
                 return Ok(false);
             }
             Command::TrayMenu(index) => {
-                self.tray_activate(index, true, self.tray_anchor(index)?)?;
+                // The Dock opens the owner's menu like a right click, including for
+                // applications that handle only the mouse button callback.
+                self.tray_anchored_input(
+                    index,
+                    TrayInput::Press {
+                        right: true,
+                        double: false,
+                    },
+                )?;
+                self.tray_anchored_input(index, TrayInput::Release { right: true })?;
                 return Ok(false);
             }
             Command::Open(uri) => shell::execute(owner, uri),

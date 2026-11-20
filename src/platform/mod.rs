@@ -76,6 +76,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         let instance = GetModuleHandleW(None)?.into();
         let class = w!("DeskIsle.Bar");
         let wc = WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
             lpszClassName: class,
@@ -91,6 +92,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         }
         TASKBAR_CREATED.set(restart);
         let menu = WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(menu_proc),
             hInstance: instance,
             lpszClassName: MENU_CLASS,
@@ -101,6 +103,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
             return Err(Error::from_thread());
         }
         let panel = WNDCLASSW {
+            style: WNDCLASS_STYLES::default(),
             lpfnWndProc: Some(panel_proc),
             lpszClassName: PANEL_CLASS,
             ..menu
@@ -341,11 +344,22 @@ pub enum Event {
     MiddleClick(HWND, i32, i32),
     Menu(HWND),
     /// A mouse button went down on a bar (`true` for the right button).
-    Press(HWND, bool),
+    Press {
+        owner: HWND,
+        x: i32,
+        y: i32,
+        right: bool,
+        double: bool,
+    },
     /// Pointer input in the open menu window, in its client pixels.
     MenuMove(i32, i32),
-    /// The left button went down in the menu, which may start dragging a slider.
-    MenuPress(i32, i32),
+    /// A button went down in the menu, in client pixels.
+    MenuPress {
+        x: i32,
+        y: i32,
+        right: bool,
+        double: bool,
+    },
     MenuLeave,
     /// The left button was released in the menu.
     MenuPick(i32, i32),
@@ -363,7 +377,6 @@ pub enum Event {
     /// Explorer started again and expects appbars and tray icons to register.
     ShellRestart,
     Tray,
-    TrayActivation,
     /// The default output's volume or mute changed.
     Audio,
     /// The worker completed a network or media request.
@@ -391,7 +404,7 @@ impl Event {
         matches!(
             self,
             Event::MenuMove(..)
-                | Event::MenuPress(..)
+                | Event::MenuPress { .. }
                 | Event::MenuLeave
                 | Event::MenuPick(..)
                 | Event::MenuContext(..)
@@ -446,8 +459,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => Event::Move(hwnd, x, y),
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave,
-        WM_LBUTTONDOWN => Event::Press(hwnd, false),
-        WM_RBUTTONDOWN => Event::Press(hwnd, true),
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => Event::Press {
+            owner: hwnd,
+            x,
+            y,
+            right: matches!(msg, WM_RBUTTONDOWN | WM_RBUTTONDBLCLK),
+            double: matches!(msg, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK),
+        },
         WM_LBUTTONUP => Event::Click(hwnd, x, y),
         WM_RBUTTONUP => Event::RightClick(hwnd, x, y),
         WM_MBUTTONUP => Event::MiddleClick(hwnd, x, y),
@@ -476,11 +494,11 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::SystemUpdate
                     | Event::RightClick(..)
                     | Event::MiddleClick(..)
-                    | Event::Press(..)
+                    | Event::Press { .. }
                     | Event::Scroll(..)
                     | Event::MenuPick(..)
                     | Event::MenuContext(..)
-                    | Event::MenuPress(..)
+                    | Event::MenuPress { .. }
                     | Event::MenuScroll(_)
                     | Event::MenuKey(_)
                     | Event::PanelClick(..)
@@ -643,7 +661,12 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             Event::MenuMove(x, y)
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
-        WM_LBUTTONDOWN => Event::MenuPress(x, y),
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => Event::MenuPress {
+            x,
+            y,
+            right: matches!(msg, WM_RBUTTONDOWN | WM_RBUTTONDBLCLK),
+            double: matches!(msg, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK),
+        },
         WM_LBUTTONUP => Event::MenuPick(x, y),
         WM_RBUTTONUP => Event::MenuContext(x, y),
         WM_MOUSEWHEEL => Event::MenuScroll((wp.0 >> 16) as i16),

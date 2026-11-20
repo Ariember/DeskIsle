@@ -206,20 +206,6 @@ impl<C> Menu<C> {
         }
     }
 
-    /// The command that turns the calendar to the next month, or the previous one when
-    /// `forward` is false, as the wheel and Page Up and Page Down do.
-    pub fn calendar_step(&self, forward: bool) -> Option<&C> {
-        let part = if forward {
-            CALENDAR_NEXT
-        } else {
-            CALENDAR_PREVIOUS
-        };
-        self.entries.iter().find_map(|entry| match entry {
-            Entry::Calendar(calendar) => calendar.buttons[part].as_ref(),
-            _ => None,
-        })
-    }
-
     pub fn focused_command(&self, focus: Focus) -> Option<&C> {
         match focus {
             Focus::Item(index) => self.command(index),
@@ -709,7 +695,8 @@ pub enum Command {
     Reveal(PathBuf),
     Pin(PathBuf),
     Unpin(String),
-    Close(String, Vec<isize>),
+    CloseWindow(String, isize),
+    CloseAllWindows(String, Vec<isize>),
     TaskManager,
     ShowDesktop,
     /// Sleeps the computer, then returns once it wakes.
@@ -731,6 +718,8 @@ pub enum Command {
     TrayMenu(usize),
     /// Keeps the tray icon on the status bar or moves it into the overflow menu.
     TrayToggle(usize),
+    /// Turns a page in the open tray list; true moves to the next page.
+    TrayPage(bool),
     /// Opens a settings page or another URI with the Shell.
     Open(&'static str),
     /// Changes a system feature from a status bar flyout, which stays open.
@@ -759,10 +748,11 @@ fn windows_list(menu: &mut Menu<Command>, app: &AppGroup, foreground: Option<isi
     }
 }
 
-fn app_header(menu: &mut Menu<Command>, app: &AppGroup) {
+fn app_header(menu: &mut Menu<Command>, app: &AppGroup, has_tray_menu: bool) {
     // The rows below already list the windows and offer pinning, so the subtitle only
     // says what they cannot: whether the application is in front or not running.
     let subtitle = match app.windows.len() {
+        0 if has_tray_menu => "后台运行",
         0 => "未运行",
         _ if app.active => "前台",
         _ => "",
@@ -775,9 +765,13 @@ fn app_header(menu: &mut Menu<Command>, app: &AppGroup) {
 }
 
 /// The menu of one application's Dock icon or status bar title.
-pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
+pub fn app_menu(
+    app: &AppGroup,
+    foreground: Option<isize>,
+    tray_menus: &[(usize, &str)],
+) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    app_header(&mut menu, app);
+    app_header(&mut menu, app, !tray_menus.is_empty());
     windows_list(&mut menu, app, foreground);
     menu.separator();
     let id = app.app_id.clone();
@@ -821,20 +815,41 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
             Some(Command::Pin(path.into())),
         );
     }
-    if !app.windows.is_empty() {
+    if let Some(window) = app.current_window(foreground) {
         menu.separator();
-        let ids = app.windows.iter().map(|w| w.id).collect();
-        let label = if app.windows.len() > 1 {
-            "关闭所有窗口"
-        } else {
-            "关闭窗口"
-        };
-        menu.item(
-            label,
+        let close = menu.item(
+            "关闭窗口",
             Icon::Symbol(Symbol::Close),
-            Some(Command::Close(id, ids)),
-        )
-        .danger = true;
+            Some(Command::CloseWindow(id.clone(), window.id)),
+        );
+        if app.windows.len() > 1 {
+            close.detail = window.title.clone();
+        }
+        if tray_menus.is_empty() {
+            let ids = app.windows.iter().map(|w| w.id).collect();
+            let exit = menu.item(
+                "退出程序",
+                Icon::Symbol(Symbol::SignOut),
+                Some(Command::CloseAllWindows(id, ids)),
+            );
+            exit.detail = "请求关闭所有窗口".into();
+            exit.danger = true;
+        }
+    }
+    if !tray_menus.is_empty() {
+        menu.separator();
+    }
+    for &(index, label) in tray_menus {
+        let item = menu.item(
+            "退出程序…",
+            Icon::Symbol(Symbol::SignOut),
+            Some(Command::TrayMenu(index)),
+        );
+        item.detail = if tray_menus.len() == 1 {
+            "打开应用托盘菜单".into()
+        } else {
+            label.lines().collect::<Vec<_>>().join(" ")
+        };
     }
     menu
 }
@@ -842,7 +857,7 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
 /// Lets the user pick one of several windows after a click on the Dock icon.
 pub fn window_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    app_header(&mut menu, app);
+    app_header(&mut menu, app, false);
     windows_list(&mut menu, app, foreground);
     menu
 }
@@ -1011,12 +1026,66 @@ pub struct TrayEntry<'a> {
     pub kept: bool,
 }
 
+impl Menu<Command> {
+    /// Recover the same row or leading icon after the live tray list changes.
+    pub fn tray_focus(&self, command: &Command) -> Option<Focus> {
+        self.entries.iter().enumerate().find_map(|(row, entry)| {
+            let Entry::Item(item) = entry else {
+                return None;
+            };
+            if item.command.as_ref() == Some(command) {
+                Some(Focus::Item(row))
+            } else if item.icon_command.as_ref() == Some(command) {
+                Some(Focus::Part(row, 0))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Wheel and Page Up/Down use the same enabled controls as pointer input.
+    pub fn page_step(&self, forward: bool) -> Option<&Command> {
+        self.entries.iter().find_map(|entry| match entry {
+            Entry::Calendar(calendar) => {
+                let part = if forward {
+                    CALENDAR_NEXT
+                } else {
+                    CALENDAR_PREVIOUS
+                };
+                calendar.buttons[part].as_ref()
+            }
+            Entry::Item(item) if item.command == Some(Command::TrayPage(forward)) => {
+                item.command.as_ref()
+            }
+            _ => None,
+        })
+    }
+}
+
 /// Every application tray icon. A row clicks the icon as the status bar does, with
 /// either button. Its leading icon sits on a solid circle while the user keeps it on
 /// the bar, and clicking that icon toggles the choice.
-pub fn tray_menu(icons: &[TrayEntry<'_>]) -> Menu<Command> {
+pub fn tray_menu(
+    icons: &[TrayEntry<'_>],
+    page: &mut usize,
+    focused_icon: Option<usize>,
+    available_px: i32,
+    dpi: u32,
+) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    for icon in icons {
+    let available = available_px as f32 * 96. / dpi as f32;
+    let rows = ((available - GAP - 2. * (SHADOW + PADDING)) / ITEM_HEIGHT).floor() as usize;
+    let paged = icons.len() > rows;
+    let page_size = if paged { rows.saturating_sub(2) } else { rows }.max(1);
+    let pages = icons.len().div_ceil(page_size);
+    *page = focused_icon
+        .and_then(|index| icons.iter().position(|icon| icon.index == index))
+        .map_or_else(
+            || (*page).min(pages.saturating_sub(1)),
+            |row| row / page_size,
+        );
+    let page = *page;
+    for icon in icons.iter().skip(page * page_size).take(page_size) {
         let item = menu.item(
             icon.label,
             Icon::Tray {
@@ -1028,6 +1097,19 @@ pub fn tray_menu(icons: &[TrayEntry<'_>]) -> Menu<Command> {
         item.icon_command = Some(Command::TrayToggle(icon.index));
         item.context = Some(Command::TrayMenu(icon.index));
         item.detail = tray_status(icon.label, icon.status);
+    }
+    if pages > 1 {
+        let previous = menu.item(
+            "上一页",
+            Icon::Symbol(Symbol::ChevronUp),
+            (page > 0).then_some(Command::TrayPage(false)),
+        );
+        previous.detail = format!("{} / {}", page + 1, pages);
+        menu.item(
+            "下一页",
+            Icon::Symbol(Symbol::ChevronDown),
+            (page + 1 < pages).then_some(Command::TrayPage(true)),
+        );
     }
     menu
 }
@@ -1092,17 +1174,16 @@ mod tests {
     fn each_icon_offers_actions_for_its_own_state() {
         let apps = apps();
         // A pinned application without windows opens or unpins; nothing to close.
-        let idle = commands(&app_menu(&apps[0], Some(8)));
+        let idle = commands(&app_menu(&apps[0], Some(8), &[]));
         assert!(idle.contains(&Command::Select("editor".into())));
         assert!(idle.contains(&Command::Unpin("editor".into())));
-        assert!(
-            !idle
-                .iter()
-                .any(|c| matches!(c, Command::Close(..) | Command::Pin(_)))
-        );
+        assert!(!idle.iter().any(|c| matches!(
+            c,
+            Command::CloseWindow(..) | Command::CloseAllWindows(..) | Command::Pin(_)
+        )));
 
         // A running, unpinned application lists its windows and can be pinned or closed.
-        let running = commands(&app_menu(&apps[1], Some(8)));
+        let running = commands(&app_menu(&apps[1], Some(8), &[]));
         assert_eq!(
             running
                 .iter()
@@ -1114,12 +1195,21 @@ mod tests {
         assert!(running.contains(&Command::NewInstance("viewer.exe".into())));
         assert_eq!(
             running.last(),
-            Some(&Command::Close("viewer".into(), vec![7, 8]))
+            Some(&Command::CloseAllWindows("viewer".into(), vec![7, 8]))
+        );
+        assert!(running.contains(&Command::CloseWindow("viewer".into(), 8)));
+        let tray = commands(&app_menu(&apps[1], None, &[(4, "Viewer")]));
+        assert!(tray.contains(&Command::CloseWindow("viewer".into(), 7)));
+        assert!(tray.contains(&Command::TrayMenu(4)));
+        assert!(
+            !tray
+                .iter()
+                .any(|c| matches!(c, Command::CloseAllWindows(..)))
         );
         assert!(!running.iter().any(|c| matches!(c, Command::Unpin(_))));
 
         // The foreground window is marked.
-        let menu = app_menu(&apps[1], Some(8));
+        let menu = app_menu(&apps[1], Some(8), &[]);
         assert!(menu.entries.iter().any(|e| matches!(
             e,
             Entry::Item(Item { icon: Icon::Window { active: true }, label, .. }) if label == "viewer 8"
@@ -1132,8 +1222,16 @@ mod tests {
             _ => panic!("menus start with the application header"),
         };
         assert_eq!(subtitle(&menu), "前台");
-        let mut idle = app_menu(&apps[0], Some(8));
+        let mut idle = app_menu(&apps[0], Some(8), &[]);
         assert_eq!(subtitle(&idle), "未运行");
+        let background = app_menu(&apps[0], None, &[(2, "Editor")]);
+        assert_eq!(subtitle(&background), "后台运行");
+        assert!(commands(&background).contains(&Command::TrayMenu(2)));
+        assert!(
+            !commands(&background)
+                .iter()
+                .any(|c| matches!(c, Command::CloseWindow(..)))
+        );
         let layout = MenuLayout::new(&mut idle, 96, measure);
         assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
     }
@@ -1144,7 +1242,7 @@ mod tests {
         let bar = commands(&bar_menu(&apps));
         assert_eq!(bar.last(), Some(&Command::Quit));
         assert!(bar.contains(&Command::Select("viewer".into())));
-        assert!(!commands(&app_menu(&apps[1], None)).contains(&Command::Quit));
+        assert!(!commands(&app_menu(&apps[1], None, &[])).contains(&Command::Quit));
 
         let icons = [
             TrayEntry {
@@ -1160,7 +1258,7 @@ mod tests {
                 kept: false,
             },
         ];
-        let menu = tray_menu(&icons);
+        let menu = tray_menu(&icons, &mut 0, None, 720, 96);
         // One row per icon, whether or not it is on the bar, with no checkmarks.
         assert_eq!(
             commands(&menu),
@@ -1200,6 +1298,92 @@ mod tests {
     }
 
     #[test]
+    fn every_tray_registration_can_be_reached_on_screen() {
+        let icons: Vec<_> = (0..53)
+            .map(|n| TrayEntry {
+                index: 2 * n + 1,
+                label: "Tray app",
+                status: "",
+                kept: false,
+            })
+            .collect();
+        let bounds = Rect {
+            x: -800,
+            y: -600,
+            width: 800,
+            height: 600,
+        };
+        for dpi in [96, 144, 192] {
+            let anchor = Anchor {
+                x: -200,
+                y: -600 + dpi as i32 / 3,
+                up: false,
+            };
+            let mut seen = Vec::new();
+            for page in 0..icons.len() {
+                let mut selected = page;
+                let mut menu = tray_menu(&icons, &mut selected, None, -anchor.y, dpi);
+                assert_eq!(selected, page);
+                let layout = MenuLayout::new(&mut menu, dpi, measure);
+                let window = layout.place(anchor, bounds);
+                assert!(window.y + window.height <= bounds.y + bounds.height);
+                for (row, entry) in menu.entries.iter().enumerate() {
+                    let Entry::Item(Item {
+                        icon: Icon::Tray { index, .. },
+                        ..
+                    }) = entry
+                    else {
+                        continue;
+                    };
+                    let (_, top, _, bottom) = layout.row(row);
+                    let x = (layout.width * layout.scale / 2.) as i32;
+                    let y = ((top + bottom) * layout.scale / 2.) as i32;
+                    assert_eq!(layout.hit(&menu, x, y), Hit::Item(row));
+                    assert_eq!(menu.command(row), Some(&Command::TrayActivate(*index)));
+                    assert_eq!(menu.context_command(row), Some(&Command::TrayMenu(*index)));
+                    seen.push(*index);
+                }
+                assert_eq!(menu.page_step(false).is_some(), page > 0);
+                if menu.page_step(true).is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                seen,
+                icons.iter().map(|icon| icon.index).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shrinking_tray_list_clamps_the_page_and_keeps_focus_on_the_same_control() {
+        let icons = [3, 9, 11].map(|index| TrayEntry {
+            index,
+            label: "App",
+            status: "",
+            kept: true,
+        });
+        let mut page = 2;
+        let menu = tray_menu(&icons[1..], &mut page, None, 720, 96);
+        assert_eq!(page, 0);
+        assert_eq!(
+            menu.tray_focus(&Command::TrayActivate(9)),
+            Some(Focus::Item(0))
+        );
+        assert_eq!(
+            menu.tray_focus(&Command::TrayToggle(11)),
+            Some(Focus::Part(1, 0))
+        );
+        assert_eq!(menu.tray_focus(&Command::TrayActivate(3)), None);
+        let menu = tray_menu(&icons, &mut page, Some(11), 108, 96);
+        assert_eq!(page, 2);
+        assert_eq!(
+            menu.tray_focus(&Command::TrayToggle(11)),
+            Some(Focus::Part(0, 0))
+        );
+    }
+
+    #[test]
     fn tray_rows_split_their_icon_from_the_rest_of_the_row() {
         let icons = [TrayEntry {
             index: 2,
@@ -1208,7 +1392,7 @@ mod tests {
             kept: true,
         }];
         for dpi in [96, 120, 144, 192] {
-            let mut menu = tray_menu(&icons);
+            let mut menu = tray_menu(&icons, &mut 0, None, 720, 96);
             let layout = MenuLayout::new(&mut menu, dpi, measure);
             let px = |dip: f32| (dip * layout.scale).round() as i32;
             let (l, t, r, b) = layout.icon_badge(0);
@@ -1336,14 +1520,14 @@ mod tests {
             turn(2026, 10)
         );
         assert_eq!(menu.part_command(index, CALENDAR_TODAY), None);
-        assert_eq!(menu.calendar_step(true).cloned(), turn(2026, 12));
+        assert_eq!(menu.page_step(true).cloned(), turn(2026, 12));
         let away = clock_menu(today, (2027, 3));
         assert_eq!(
             away.part_command(index, CALENDAR_TODAY).cloned(),
             turn(2026, 11)
         );
-        assert_eq!(clock_menu(today, (2100, 12)).calendar_step(true), None);
-        assert_eq!(clock_menu(today, (1901, 1)).calendar_step(false), None);
+        assert_eq!(clock_menu(today, (2100, 12)).page_step(true), None);
+        assert_eq!(clock_menu(today, (1901, 1)).page_step(false), None);
         // Keyboard focus reaches the arrows and the way back to today.
         let parts: Vec<_> = (0..4)
             .scan(None, |focus, _| {

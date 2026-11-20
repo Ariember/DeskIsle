@@ -433,15 +433,20 @@ impl Renderer {
     }
 
     /// A tray icon's image, on a blue circle while the user keeps it `on` the status
-    /// bar and on nothing otherwise. Missing images leave the circle alone.
+    /// bar. A registration without an image uses the same dot as the bar.
     fn tray_badge(&self, c: &Canvas, icon: Option<HICON>, x: f32, y: f32, on: bool) -> Result<()> {
         if on {
             let r = ICON_BADGE / 2.;
-            let tint = if c.p.dark { TRAY_ON_DARK } else { TRAY_ON_LIGHT };
+            let tint = if c.p.dark {
+                TRAY_ON_DARK
+            } else {
+                TRAY_ON_LIGHT
+            };
             c.fill(x - r, y - r, x + r, y + r, r, tint, 1.)?;
         }
         let Some(bitmap) = icon.and_then(|icon| self.hicon_bitmap(icon).ok()) else {
-            return Ok(());
+            let ink = if on { c.p.on_accent } else { c.p.muted };
+            return c.round(x - 3., y - 3., x + 3., y + 3., 3., ink);
         };
         // Snap to whole pixels so small icons stay sharp.
         let px = |v: f32| (v * c.scale).round() / c.scale;

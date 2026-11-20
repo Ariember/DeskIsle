@@ -1,4 +1,5 @@
 use super::Bars;
+use crate::platform::tray::TrayInput;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
 use crate::ui::layout::{StatusHit, SystemItem};
@@ -6,7 +7,7 @@ use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
 };
 use crate::ui::system::{settings_page, volume_slider};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::core::{Error, Result};
 
 impl Bars {
@@ -16,7 +17,7 @@ impl Bars {
             return match self.status.hit(x, y) {
                 StatusHit::Tray(slot) => {
                     // The application owns its tray icon's menu.
-                    self.tray_click(slot, true)?;
+                    self.tray_pointer(slot, TrayInput::Release { right: true }, x, y)?;
                     Ok(false)
                 }
                 StatusHit::Overflow => self.tray_menu(),
@@ -25,7 +26,7 @@ impl Bars {
                 StatusHit::Clock => self.clock_menu(),
                 StatusHit::Title => match self.apps.iter().position(|app| app.active) {
                     Some(index) => {
-                        let menu = menu::app_menu(&self.apps[index], self.foreground);
+                        let menu = self.app_menu(index);
                         let anchor =
                             self.top_anchor(self.status.title.x + px(self.monitor.dpi, 60));
                         self.show_menu(menu, anchor)
@@ -42,12 +43,19 @@ impl Bars {
         }
         match self.layout.hit(x, y) {
             Some(index) => {
-                let menu = menu::app_menu(&self.apps[index], self.foreground);
+                let menu = self.app_menu(index);
                 let anchor = self.icon_anchor(index);
                 self.show_menu(menu, anchor)
             }
             None => self.bar_menu(),
         }
+    }
+
+    fn app_menu(&self, index: usize) -> Menu<Command> {
+        let app = &self.apps[index];
+        let window = app.current_window(self.foreground).map(|w| w.id);
+        let tray_menus = self.tray.app_menus(&app.app_id, window);
+        menu::app_menu(app, self.foreground, &tray_menus)
     }
 
     pub(super) fn bar_menu(&mut self) -> Result<bool> {
@@ -75,7 +83,16 @@ impl Bars {
     }
 
     pub(super) fn tray_menu(&mut self) -> Result<bool> {
-        let menu = self.tray_list();
+        // Registrations can arrive between the last paint and the overflow click.
+        self.tray.recover_icons();
+        if self.tray.update(true) {
+            self.restatus();
+            self.draw()?;
+        }
+        if self.status.overflow.is_none() {
+            return Ok(false);
+        }
+        let menu = self.tray_list(&mut 0, None);
         let anchor = self.tray_overflow_anchor()?;
         // The button flips to a collapse arrow while the menu is open.
         self.overflow_open = true;
@@ -90,7 +107,7 @@ impl Bars {
     }
 
     /// Every visible application tray icon, on the bar or not.
-    fn tray_list(&self) -> Menu<Command> {
+    fn tray_list(&self, page: &mut usize, focused_icon: Option<usize>) -> Menu<Command> {
         let entries = self
             .tray
             .icons()
@@ -104,7 +121,10 @@ impl Bars {
                 kept: !self.hidden.contains(&icon.key),
             })
             .collect::<Vec<_>>();
-        menu::tray_menu(&entries)
+        let available = self.monitor.bounds.y + self.monitor.bounds.height
+            - self.top_rect.y
+            - self.top_rect.height;
+        menu::tray_menu(&entries, page, focused_icon, available, self.monitor.dpi)
     }
 
     /// Where a click on tray icon `index` happens: its slot on the status bar, or the
@@ -240,17 +260,68 @@ impl Bars {
         // The slider entry being dragged.
         let mut drag: Option<usize> = None;
         let mut refresh_flyout = false;
-        // Wheel travel toward the calendar's next turn, 120 per notch.
+        let mut tray_page = 0usize;
+        let mut tray_buttons = [false; 2];
+        let mut refresh_tray = false;
+        let mut windows_changed = false;
+        // Accumulated wheel travel, 120 per notch.
         let mut wheel = 0;
+        let mut tray_context = None;
         let choice = loop {
             let mut target = hover;
             let mut chosen = None;
             let mut slide = None;
             // The menu's entries, rebuilt in place after a change it keeps open for.
             let mut rebuilt = None;
-            match platform::next_event()? {
-                Event::MenuPress(x, y) => {
-                    if let Hit::Slider(index, value) = layout.hit(&menu, x, y) {
+            let event = platform::next_event()?;
+            if tray_buttons.contains(&true)
+                && matches!(event, Event::MenuPick(..) | Event::MenuContext(..))
+            {
+                tray_buttons[usize::from(matches!(event, Event::MenuContext(..)))] = false;
+                if !tray_buttons.contains(&true) {
+                    window.release();
+                }
+            }
+            match event {
+                Event::MenuPress {
+                    x,
+                    y,
+                    right,
+                    double,
+                } => {
+                    if self.overflow_open {
+                        // Keep the target under the pointer stable through release, even
+                        // when it is dragged off the popup or a registration arrives.
+                        window.capture();
+                        tray_buttons[usize::from(right)] = true;
+                    }
+                    let hit = layout.hit(&menu, x, y);
+                    let command = hit.focus().and_then(|focus| {
+                        if right {
+                            menu.context_command(focus.index())
+                        } else {
+                            menu.focused_command(focus)
+                        }
+                    });
+                    let press = TrayInput::Press { right, double };
+                    match command {
+                        Some(Command::TrayActivate(index)) => {
+                            let rect = layout.place(anchor, self.monitor.bounds);
+                            self.tray_input(
+                                *index,
+                                press,
+                                POINT {
+                                    x: rect.x + x,
+                                    y: rect.y + y,
+                                },
+                            )?;
+                        }
+                        Some(Command::TrayMenu(index)) if self.overflow_open && right => {
+                            self.tray_anchored_input(*index, press)?;
+                        }
+                        _ => self.tray.cancel_click(),
+                    }
+                    if !right && let Hit::Slider(index, value) = hit {
                         window.capture();
                         drag = Some(index);
                         target = None;
@@ -266,13 +337,12 @@ impl Bars {
                     }
                 },
                 Event::MenuLeave if drag.is_none() => target = None,
-                // The wheel turns the calendar's month, down toward the next one.
                 Event::MenuScroll(delta) => {
                     wheel += i32::from(delta);
                     let notches = wheel / 120;
                     wheel -= notches * 120;
                     if notches != 0 {
-                        chosen = menu.calendar_step(notches < 0).cloned();
+                        chosen = menu.page_step(notches < 0).cloned();
                     }
                 }
                 // Releasing a slider, even outside the menu, only ends the drag.
@@ -289,6 +359,20 @@ impl Bars {
                         .focus()
                         .and_then(|focus| menu.focused_command(focus))
                         .cloned();
+                    if let Some(Command::TrayActivate(index)) = chosen {
+                        let rect = layout.place(anchor, self.monitor.bounds);
+                        self.tray_input(
+                            index,
+                            TrayInput::Release { right: false },
+                            POINT {
+                                x: rect.x + x,
+                                y: rect.y + y,
+                            },
+                        )?;
+                        // Double-click-only owners leave the list active for the next
+                        // click. Owners that open a window dismiss it by taking focus.
+                        chosen = None;
+                    }
                 }
                 // A row with a menu of its own opens that menu, as the same click on the
                 // status bar does; anywhere else a right click picks like a left one.
@@ -302,6 +386,13 @@ impl Bars {
                                     .or_else(|| menu.focused_command(focus))
                             })
                             .cloned();
+                        if self.overflow_open
+                            && let Some(Command::TrayMenu(index)) = chosen
+                        {
+                            // Dismiss our popup before the owner opens its context menu.
+                            tray_context = Some((index, TrayInput::Release { right: true }));
+                            break None;
+                        }
                     }
                 },
                 Event::MenuKey(key) => match key {
@@ -310,7 +401,7 @@ impl Bars {
                     MenuKey::Home => target = menu.step(None, true),
                     MenuKey::End => target = menu.step(None, false),
                     MenuKey::PageUp | MenuKey::PageDown => {
-                        chosen = menu.calendar_step(key == MenuKey::PageDown).cloned();
+                        chosen = menu.page_step(key == MenuKey::PageDown).cloned();
                     }
                     MenuKey::Left | MenuKey::Right => {
                         let forward = key == MenuKey::Right;
@@ -334,7 +425,11 @@ impl Bars {
                     }
                     MenuKey::Context => {
                         chosen =
-                            hover.and_then(|focus| menu.context_command(focus.index()).cloned())
+                            hover.and_then(|focus| menu.context_command(focus.index()).cloned());
+                        if let Some(Command::TrayMenu(index)) = chosen {
+                            tray_context = Some((index, TrayInput::ContextMenu));
+                            break None;
+                        }
                     }
                     MenuKey::Dismiss => break None,
                     _ => {}
@@ -345,8 +440,11 @@ impl Bars {
                         && (flyout == updated || flyout == Some(SystemItem::Control));
                 }
                 Event::MenuDismiss => break None,
-                Event::Press(_, right) => {
-                    // A right press goes on to open the menu of what it hit.
+                press @ Event::Press { right, .. } => {
+                    // Deliver the press as well as the release to the next tray target.
+                    if right {
+                        held.push(press);
+                    }
                     self.swallow_click = !right;
                     break None;
                 }
@@ -354,8 +452,16 @@ impl Bars {
                     held.push(Event::Quit);
                     break None;
                 }
+                Event::Tray if self.overflow_open => refresh_tray = true,
                 Event::Refresh => {
-                    held.push(Event::Refresh);
+                    if self.overflow_open {
+                        self.events.acknowledge();
+                        refresh_tray = true;
+                        windows_changed = true;
+                    }
+                    if !held.contains(&Event::Refresh) {
+                        held.push(Event::Refresh);
+                    }
                     // Without activation the menu cannot see clicks elsewhere; another
                     // window coming to the front stands in for them.
                     if !active && !window.is_foreground() && platform::foreground() != opened_over {
@@ -389,7 +495,17 @@ impl Bars {
                         failure = Some(error);
                         break None;
                     }
-                    rebuilt = Some(self.tray_list());
+                    rebuilt = Some(self.tray_list(&mut tray_page, None));
+                }
+                (Some(Command::TrayPage(_)), _) if tray_buttons.contains(&true) => {}
+                (Some(Command::TrayPage(forward)), _) => {
+                    if forward {
+                        tray_page += 1;
+                    } else {
+                        tray_page -= 1;
+                    }
+                    rebuilt = Some(self.tray_list(&mut tray_page, None));
+                    target = None;
                 }
                 // The calendar turns in place.
                 (Some(Command::Calendar(year, month)), _) => {
@@ -397,6 +513,45 @@ impl Bars {
                 }
                 (Some(command), _) => break Some(command),
                 (None, _) => {}
+            }
+            if refresh_tray && !tray_buttons.contains(&true) {
+                let mut focused = target
+                    .and_then(|focus| menu.focused_command(focus))
+                    .cloned();
+                let focused_icon = match focused {
+                    Some(Command::TrayActivate(i) | Command::TrayToggle(i)) => {
+                        Some(self.tray.icons()[i].registration)
+                    }
+                    _ => None,
+                };
+                if self.tray.update(windows_changed) {
+                    self.restatus();
+                    self.draw()?;
+                    if self.status.overflow.is_none() {
+                        break None;
+                    }
+                    let new_index = focused_icon.and_then(|id| {
+                        self.tray
+                            .icons()
+                            .iter()
+                            .position(|icon| icon.registration == id)
+                    });
+                    if let Some(Command::TrayActivate(index) | Command::TrayToggle(index)) =
+                        &mut focused
+                    {
+                        match new_index {
+                            Some(i) => *index = i,
+                            None => focused = None,
+                        }
+                    }
+                    let next = self.tray_list(&mut tray_page, new_index);
+                    target = focused
+                        .as_ref()
+                        .and_then(|command| next.tray_focus(command));
+                    rebuilt = Some(next);
+                }
+                refresh_tray = false;
+                windows_changed = false;
             }
             if refresh_flyout
                 && drag.is_none()
@@ -435,7 +590,13 @@ impl Bars {
             .expect("renderer bound to bars")
             .close_menu();
         drop(window);
+        if refresh_tray {
+            held.push(Event::Tray);
+        }
         platform::requeue(held);
+        if let Some((index, input)) = tray_context {
+            self.tray_anchored_input(index, input)?;
+        }
         if let Some(error) = failure {
             self.recover(error)?;
         }

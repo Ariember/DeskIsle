@@ -290,7 +290,7 @@ fn window_info(hwnd: HWND) -> Result<Option<WindowInfo>> {
     }
 }
 
-fn window_handles() -> Result<Vec<HWND>> {
+pub(super) fn window_handles() -> Result<Vec<HWND>> {
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
         // EnumWindows calls synchronously; this pointer belongs to the caller for that call.
         unsafe { (&mut *(data.0 as *mut Vec<HWND>)).push(hwnd) };
@@ -413,9 +413,8 @@ pub fn reveal(owner: HWND, path: &Path) -> Result<()> {
 }
 
 /// Asks each window of `app_id` to close, as the title bar's close button would; the
-/// application may still prompt to save. Returns how many windows accepted the request.
-pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<usize> {
-    let mut asked = 0;
+/// application may prompt to save, hide the window, or exit.
+pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<()> {
     let mut refused = None;
     for &id in ids {
         let hwnd = HWND(id as _);
@@ -423,7 +422,7 @@ pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<usize> {
         if window_info(hwnd)?.is_none_or(|info| info.app_id != app_id) {
             continue;
         }
-        match unsafe {
+        if let Err(error) = unsafe {
             PostMessageW(
                 Some(hwnd),
                 WM_SYSCOMMAND,
@@ -431,17 +430,16 @@ pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<usize> {
                 LPARAM(0),
             )
         } {
-            Ok(()) => asked += 1,
-            Err(error) => refused = Some(error),
+            refused = Some(error);
         }
     }
     match refused {
         // UIPI blocks messages to elevated applications.
-        Some(error) if asked == 0 => Err(Error::new(
+        Some(error) => Err(Error::new(
             error.code(),
             format!("无法关闭窗口，该应用可能以管理员权限运行：{error}"),
         )),
-        _ => Ok(asked),
+        None => Ok(()),
     }
 }
 
@@ -457,23 +455,6 @@ pub(super) fn window_process(hwnd: HWND) -> u32 {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
-}
-
-pub(super) fn tray_windows(pid: u32) -> Result<Vec<HWND>> {
-    let mut windows = Vec::new();
-    for hwnd in window_handles()? {
-        if window_process(hwnd) == pid && window_info(hwnd)?.is_some() {
-            windows.push(hwnd);
-        }
-    }
-    Ok(windows)
-}
-
-pub(super) fn activate_tray_window(pid: u32, windows: &[HWND]) -> Result<bool> {
-    match windows {
-        &[hwnd] if window_process(hwnd) == pid => activate_window(hwnd),
-        _ => Ok(false),
-    }
 }
 
 fn activate_window(hwnd: HWND) -> Result<bool> {
