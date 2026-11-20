@@ -897,7 +897,11 @@ pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
 /// A tray icon as the overflow menu lists it.
 pub struct TrayEntry<'a> {
     pub index: usize,
+    /// The application's name.
     pub label: &'a str,
+    /// Its tooltip, shown beside the name when it says something else, such as Clash
+    /// clients reporting the current speed.
+    pub status: &'a str,
     /// The user keeps it on the status bar; it still overflows when there is no room.
     pub kept: bool,
 }
@@ -918,8 +922,19 @@ pub fn tray_menu(icons: &[TrayEntry<'_>]) -> Menu<Command> {
         );
         item.icon_command = Some(Command::TrayToggle(icon.index));
         item.context = Some(Command::TrayMenu(icon.index));
+        item.detail = tray_status(icon.label, icon.status);
     }
     menu
+}
+
+/// A tooltip on one line, or nothing when it only repeats the name.
+fn tray_status(name: &str, tooltip: &str) -> String {
+    let line = tooltip.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line == name || line.is_empty() {
+        String::new()
+    } else {
+        line
+    }
 }
 
 #[cfg(test)]
@@ -1030,11 +1045,13 @@ mod tests {
             TrayEntry {
                 index: 0,
                 label: "a",
+                status: "a",
                 kept: true,
             },
             TrayEntry {
                 index: 3,
-                label: "b",
+                label: "Sparkle",
+                status: "\u{2191} 943 B/s\n\u{2193} 0 B/s",
                 kept: false,
             },
         ];
@@ -1046,6 +1063,19 @@ mod tests {
         );
         assert_eq!(menu.part_command(0, 0), Some(&Command::TrayToggle(0)));
         assert_eq!(menu.context_command(1), Some(&Command::TrayMenu(3)));
+        // The tooltip only shows when it adds something, on one line.
+        let details: Vec<_> = menu
+            .entries
+            .iter()
+            .map(|e| match e {
+                Entry::Item(item) => (item.label.as_str(), item.detail.as_str()),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            details,
+            [("a", ""), ("Sparkle", "\u{2191} 943 B/s \u{2193} 0 B/s")]
+        );
         assert!(matches!(
             menu.entries[..],
             [
@@ -1069,6 +1099,7 @@ mod tests {
         let icons = [TrayEntry {
             index: 2,
             label: "a",
+            status: "",
             kept: true,
         }];
         for dpi in [96, 120, 144, 192] {

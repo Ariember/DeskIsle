@@ -95,7 +95,8 @@ impl Bars {
             .filter(|(_, icon)| icon.visible())
             .map(|(index, icon)| TrayEntry {
                 index,
-                label: &icon.label,
+                label: &icon.name,
+                status: &icon.label,
                 kept: !self.hidden.contains(&icon.key),
             })
             .collect::<Vec<_>>();

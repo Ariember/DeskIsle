@@ -529,10 +529,13 @@ impl Renderer {
                 }
                 let label_left = row_left + 8. + layout.icon_column;
                 let label_right = row_right - menu::TEXT_INSET;
+                // Long details, such as live tooltips, end in an ellipsis and leave the
+                // label at least half the row.
                 let detail_width = if item.detail.is_empty() {
                     0.
                 } else {
-                    self.measure(&item.detail, menu::DETAIL_SIZE, false) + 16.
+                    (self.measure(&item.detail, menu::DETAIL_SIZE, false) + 16.)
+                        .min((label_right - label_left) / 2.)
                 };
                 c.draw_text(
                     &self.write,
@@ -548,7 +551,7 @@ impl Renderer {
                 c.draw_text(
                     &self.write,
                     &item.detail,
-                    c.rect(label_left, top, label_right, bottom),
+                    c.rect(label_right - detail_width + 16., top, label_right, bottom),
                     Text {
                         size: menu::DETAIL_SIZE,
                         align: DWRITE_TEXT_ALIGNMENT_TRAILING,

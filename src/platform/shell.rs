@@ -4,6 +4,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -17,6 +20,52 @@ use windows::core::{BOOL, Error, HSTRING, Owned, PCWSTR, PWSTR, Result, w};
 use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
 
 pub const WINDOWS_CHANGED: u32 = WM_APP + 1;
+
+/// The name an executable gives itself in its version resource: the product name, else
+/// the file description. `None` when it has neither or the file cannot be read.
+pub fn product_name(path: &Path) -> Option<String> {
+    let file = HSTRING::from(path.as_os_str());
+    let size = unsafe { GetFileVersionInfoSizeW(&file, None) };
+    if size == 0 {
+        return None;
+    }
+    let mut block = vec![0u8; size as usize];
+    unsafe { GetFileVersionInfoW(&file, None, size, block.as_mut_ptr().cast()) }.ok()?;
+    // Pointers returned by VerQueryValueW point into `block`, which outlives them here.
+    let query = |sub: &str| -> Option<(*const u8, u32)> {
+        let sub = HSTRING::from(sub);
+        let mut data = std::ptr::null_mut();
+        let mut len = 0;
+        let found = unsafe { VerQueryValueW(block.as_ptr().cast(), &sub, &mut data, &mut len) };
+        (found.as_bool() && !data.is_null() && len > 0).then_some((data as *const u8, len))
+    };
+    // Each translation is a language and code page pair; US English is a common default.
+    let mut languages = Vec::new();
+    if let Some((data, len)) = query(r"\VarFileInfo\Translation") {
+        let pairs = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), len as usize / 2) };
+        languages.extend(
+            pairs
+                .chunks_exact(2)
+                .map(|p| format!("{:04x}{:04x}", p[0], p[1])),
+        );
+    }
+    languages.extend(["040904b0".to_owned(), "040904e4".to_owned()]);
+    for key in ["ProductName", "FileDescription"] {
+        for language in &languages {
+            let Some((data, len)) = query(&format!(r"\StringFileInfo\{language}\{key}")) else {
+                continue;
+            };
+            // `len` counts UTF-16 units including the terminator.
+            let units = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), len as usize) };
+            let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+            let name = String::from_utf16_lossy(&units[..end]).trim().to_owned();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
 
 thread_local! {
     // OUTOFCONTEXT callbacks run on the subscribing message-loop thread.
@@ -464,5 +513,14 @@ mod tests {
             E_ACCESSDENIED
         );
         check_restricted_windows(Path::new("explorer.exe"), &windows).unwrap();
+    }
+
+    #[test]
+    fn executables_name_themselves_from_their_version_resource() {
+        let mut cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        cmd.push(r"System32\cmd.exe");
+        let name = product_name(&cmd).expect("Windows binaries carry a version resource");
+        assert!(!name.is_empty() && !name.contains('\0'));
+        assert_eq!(product_name(Path::new(r"Z:\missing\none.exe")), None);
     }
 }

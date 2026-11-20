@@ -117,6 +117,10 @@ thread_local! {
 pub struct TrayIcon {
     /// Stable across runs: executable path plus the icon's GUID or ID.
     pub key: String,
+    /// What the application calls itself: its product name, else the first line of its
+    /// first tooltip, else its file name.
+    pub name: String,
+    /// The current tooltip, which many applications use for live status.
     pub label: String,
     /// Changes when the displayed image or attention mark changes.
     pub stamp: u64,
@@ -398,10 +402,14 @@ impl TrayHost {
                 let guid = (n.flags & NIF_GUID != 0).then_some(n.guid);
                 let exe = owner_path(n.owner);
                 let ident = guid.map_or_else(|| format!("id:{}", n.id), |g| format!("{g:?}"));
+                let stem = exe
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned());
+                let product = exe.as_deref().and_then(shell::product_name);
+                let name = display_name(product, &n.tip, stem.as_deref());
                 let label = if n.tip.is_empty() {
-                    exe.as_ref()
-                        .and_then(|p| p.file_stem())
-                        .map_or_else(|| "托盘图标".into(), |s| s.to_string_lossy().into_owned())
+                    name.clone()
                 } else {
                     n.tip
                 };
@@ -416,6 +424,7 @@ impl TrayHost {
                         exe.map(|p| p.to_string_lossy().to_lowercase())
                             .unwrap_or_default()
                     ),
+                    name,
                     label,
                     stamp: self.next_stamp,
                     registration: self.next_stamp,
@@ -697,6 +706,20 @@ fn click_callbacks(
     })
 }
 
+/// A tray icon's name for lists: the product name, else the tooltip's first line, else
+/// the executable's file name.
+fn display_name(product: Option<String>, tip: &str, stem: Option<&str>) -> String {
+    product
+        .or_else(|| {
+            tip.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| stem.map(str::to_owned))
+        .unwrap_or_else(|| "托盘图标".into())
+}
+
 /// Posts TaskbarCreated to the owner of `n`, once per owner until the next broadcast.
 /// Applications answer it by adding their icons again, as after an Explorer restart.
 /// Windows' own indicators are left alone.
@@ -828,6 +851,21 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_icons_are_named_by_their_product_not_their_status_text() {
+        let speed = "\u{2191} 943 B/s\n\u{2193} 0 B/s";
+        assert_eq!(
+            display_name(Some("Sparkle".into()), speed, Some("Sparkle")),
+            "Sparkle"
+        );
+        assert_eq!(
+            display_name(None, "\n NVIDIA GeForce\r\n2 programs", Some("nvcontainer")),
+            "NVIDIA GeForce"
+        );
+        assert_eq!(display_name(None, "", Some("QQ")), "QQ");
+        assert_eq!(display_name(None, " ", None), "托盘图标");
+    }
 
     #[test]
     fn updates_for_unknown_icons_ask_their_owner_to_add_them_once() -> Result<()> {
