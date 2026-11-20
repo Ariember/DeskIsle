@@ -7,9 +7,10 @@ use windows::Win32::{
 };
 use windows::core::Result;
 
+use crate::ui::icon::Symbol;
 use crate::ui::menu::{self, Entry, Icon, Menu, MenuLayout, Slider};
 use crate::ui::panel::Area;
-use crate::ui::system::PLAYER_GLYPH;
+use crate::ui::system::PLAYER_SYMBOL;
 
 use super::canvas::{Canvas, Rgb, Text, paint, text_format};
 use super::{Renderer, ease};
@@ -18,10 +19,14 @@ use super::{Renderer, ease};
 /// uses a radius that keeps both corners concentric.
 const MENU_RADIUS: f32 = 12.;
 const HIGHLIGHT_RADIUS: f32 = MENU_RADIUS - menu::PADDING;
-/// Diameter of the round backing every glyph icon of a menu row sits on.
+/// Diameter of the round backing every icon of a menu row sits on.
 const ICON_BADGE: f32 = 24.;
+/// How much of its round backing an icon covers.
+const BADGE_ICON: f32 = 0.58;
+/// The icon at the start of a slider's track.
+const SLIDER_ICON: f32 = 15.;
 /// Marks a window in an application's list; filled for the foreground window.
-const WINDOW_GLYPH: &str = "\u{E922}";
+const WINDOW_SYMBOL: Symbol = Symbol::Window;
 const OPEN_DURATION: f32 = 0.12;
 const HOVER_DURATION: f32 = 0.09;
 
@@ -221,7 +226,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// A slider's track, fill, knob and glyph, `(width, height, dpi)` in size.
+    /// A slider's track, fill, knob and icon, `(width, height, dpi)` in size.
     fn slider_surface<C>(
         &self,
         slider: &Slider<C>,
@@ -232,9 +237,9 @@ impl Renderer {
         paint(&self.device, self.palette, size.0, size.1, dpi, |c| {
             let radius = h / 2.;
             c.fill(0., 0., w, h, radius, c.p.line, 0.1)?;
-            let glyph = Area::new(0., 0., h, h);
+            let button = Area::new(0., 0., h, h);
             let Some(value) = slider.value else {
-                return self.glyph_at(c, slider.glyph, glyph, 13., c.p.muted, 0.6);
+                return c.symbol_in(slider.symbol, button, SLIDER_ICON, c.p.muted, 0.6);
             };
             let x = radius + (w - h) * f32::from(value.min(100)) / 100.;
             c.fill(0., 0., x + radius, h, radius, c.p.accent, 1.)?;
@@ -257,9 +262,9 @@ impl Renderer {
                 c.p.line,
                 0.25,
             )?;
-            // The knob covers the glyph at the low end of the range.
+            // The knob covers the icon at the low end of the range.
             let ink = if x < h { c.p.ink } else { c.p.on_accent };
-            self.glyph_at(c, slider.glyph, glyph, 13., ink, 1.)
+            c.symbol_in(slider.symbol, button, SLIDER_ICON, ink, 1.)
         })
     }
 
@@ -277,30 +282,6 @@ impl Renderer {
             }
         }
         Ok(())
-    }
-
-    fn glyph_at(
-        &self,
-        c: &Canvas,
-        glyph: &str,
-        a: Area,
-        size: f32,
-        ink: Rgb,
-        alpha: f32,
-    ) -> Result<()> {
-        c.draw_text(
-            &self.write,
-            glyph,
-            c.rect(a.left, a.top, a.right, a.bottom),
-            Text {
-                size,
-                glyph: true,
-                align: DWRITE_TEXT_ALIGNMENT_CENTER,
-                ..Text::default()
-            },
-            ink,
-            alpha,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -328,8 +309,8 @@ impl Renderer {
         )
     }
 
-    /// A glyph in a circle, filled with the accent when `on`.
-    fn badge(&self, c: &Canvas, glyph: &str, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
+    /// An icon in a circle, filled with the accent when `on`.
+    fn badge(&self, c: &Canvas, symbol: Symbol, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
         let r = size / 2.;
         if on {
             c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)?;
@@ -337,17 +318,16 @@ impl Renderer {
             c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)?;
         }
         let ink = if on { c.p.on_accent } else { c.p.ink };
-        let area = Area::new(x - r, y - r, x + r, y + r);
-        self.glyph_at(c, glyph, area, size * 0.5, ink, 1.)
+        c.symbol(symbol, x, y, size * BADGE_ICON, ink, 1.)
     }
 
-    /// A glyph of a command row on a faint circle of its own `tint`, so a destructive
+    /// The icon of a command row on a faint circle of its own `tint`, so a destructive
     /// command reads red and a disabled one fades with its label.
     #[allow(clippy::too_many_arguments)]
     fn soft_badge(
         &self,
         c: &Canvas,
-        glyph: &str,
+        symbol: Symbol,
         x: f32,
         y: f32,
         tint: Rgb,
@@ -355,8 +335,7 @@ impl Renderer {
     ) -> Result<()> {
         let r = ICON_BADGE / 2.;
         c.fill(x - r, y - r, x + r, y + r, r, tint, 0.1 * alpha)?;
-        let area = Area::new(x - r, y - r, x + r, y + r);
-        self.glyph_at(c, glyph, area, ICON_BADGE * 0.5, tint, alpha)
+        c.symbol(symbol, x, y, ICON_BADGE * BADGE_ICON, tint, alpha)
     }
 
     fn paint_entry<C>(
@@ -385,7 +364,7 @@ impl Renderer {
                     c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
                     let y = (t + b) / 2.;
                     // Three tiles share the fixed dropdown width; keep their text room.
-                    self.badge(c, tile.glyph, l + 6. + 14., y, 28., tile.on)?;
+                    self.badge(c, tile.symbol, l + 6. + 14., y, 28., tile.on)?;
                     let text = Area::new(l + 42., t, r - 4., y + 1.);
                     let alpha = if tile.command.is_some() { 1. } else { 0.5 };
                     self.text_at(
@@ -416,7 +395,7 @@ impl Renderer {
                 let y = (t + b) / 2.;
                 c.fill(l + 8., y - 18., l + 44., y + 18., 8., c.p.line, 0.08)?;
                 let art = Area::new(l + 8., y - 18., l + 44., y + 18.);
-                self.glyph_at(c, PLAYER_GLYPH, art, 16., c.p.muted, 1.)?;
+                c.symbol_in(PLAYER_SYMBOL, art, 18., c.p.muted, 1.)?;
                 let text_right = if buttons.is_empty() {
                     r - 8.
                 } else {
@@ -427,10 +406,10 @@ impl Renderer {
                 self.text_at(c, title, name, menu::LABEL_SIZE, true, c.p.ink, 1.)?;
                 let by = Area::new(l + 54., y, text_right, y + 20.);
                 self.text_at(c, detail, by, menu::DETAIL_SIZE, false, c.p.muted, 0.85)?;
-                for (part, (glyph, command)) in buttons.iter().enumerate() {
+                for (part, &(symbol, ref command)) in buttons.iter().enumerate() {
                     let (bl, bt, br, bb) = layout.player_button(index, part, buttons.len());
                     let alpha = if command.is_some() { 1. } else { 0.35 };
-                    self.glyph_at(c, glyph, Area::new(bl, bt, br, bb), 15., c.p.ink, alpha)?;
+                    c.symbol_in(symbol, Area::new(bl, bt, br, bb), 16., c.p.ink, alpha)?;
                 }
                 Ok(())
             }
@@ -490,16 +469,16 @@ impl Renderer {
                     (false, true) => (c.p.ink, 1.),
                 };
                 match &item.icon {
-                    // Glyphs, options and windows all sit on the same round backing.
-                    Icon::Glyph(glyph) => {
+                    // Icons, options and windows all sit on the same round backing.
+                    Icon::Symbol(symbol) => {
                         let tint = if item.danger { c.p.danger } else { c.p.ink };
-                        self.soft_badge(c, glyph, icon_x, middle, tint, alpha)?;
+                        self.soft_badge(c, *symbol, icon_x, middle, tint, alpha)?;
                     }
-                    Icon::Choice { glyph, on } => {
-                        self.badge(c, glyph, icon_x, middle, ICON_BADGE, *on)?;
+                    Icon::Choice { symbol, on } => {
+                        self.badge(c, *symbol, icon_x, middle, ICON_BADGE, *on)?;
                     }
                     Icon::Window { active } => {
-                        self.badge(c, WINDOW_GLYPH, icon_x, middle, ICON_BADGE, *active)?;
+                        self.badge(c, WINDOW_SYMBOL, icon_x, middle, ICON_BADGE, *active)?;
                     }
                     icon => {
                         let size = 18.;
@@ -550,13 +529,7 @@ impl Renderer {
                 )?;
                 if item.checked == Some(true) {
                     let x = row_right - menu::TEXT_INSET - menu::CHECK_COLUMN / 2.;
-                    c.glyph(
-                        &self.write,
-                        "\u{E73E}",
-                        c.rect(x - 10., top, x + 10., bottom),
-                        13.,
-                        c.p.accent,
-                    )?;
+                    c.symbol(Symbol::Check, x, middle, 14., c.p.accent, 1.)?;
                 }
                 Ok(())
             }
@@ -576,16 +549,11 @@ impl Renderer {
         let bitmap = match icon {
             Icon::File(path) => self.shell_icon(path).ok().flatten(),
             Icon::Tray(index) => tray(*index).and_then(|icon| self.hicon_bitmap(icon).ok()),
-            Icon::Glyph(glyph) => {
-                // Round like every other glyph backing in the menus.
-                c.fill(x, y, x + size, y + size, size / 2., c.p.accent, 0.12)?;
-                c.glyph(
-                    &self.write,
-                    glyph,
-                    c.rect(x, y, x + size, y + size),
-                    size * 0.5,
-                    c.p.accent,
-                )?;
+            Icon::Symbol(symbol) => {
+                // Round like every other icon backing in the menus.
+                let r = size / 2.;
+                c.fill(x, y, x + size, y + size, r, c.p.accent, 0.12)?;
+                c.symbol(*symbol, x + r, y + r, size * 0.55, c.p.accent, 1.)?;
                 return Ok(true);
             }
             Icon::None | Icon::Window { .. } | Icon::Choice { .. } => None,

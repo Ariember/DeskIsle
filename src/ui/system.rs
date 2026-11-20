@@ -1,8 +1,9 @@
-//! The status bar's system controls: which ones appear, the glyph each shows for the
+//! The status bar's system controls: which ones appear, the icon each shows for the
 //! current state, and the flyout each opens. The flyouts are menus whose commands
 //! change a system feature and leave the flyout open, rebuilt from fresh state.
 
 use crate::system::{Audio, Battery, Display, Media, MediaAction, Network, PowerPlan, RadioKind};
+use crate::ui::icon::Symbol;
 use crate::ui::layout::SystemItem;
 use crate::ui::menu::{Command, DROPDOWN_WIDTH, Entry, Icon, Menu, Slider, SliderTarget, Tile};
 
@@ -31,15 +32,10 @@ pub struct SystemStatus {
 /// How a system control is drawn on the status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
-    /// A Segoe Fluent Icons glyph, drawn faded when `dim`.
-    Glyph { glyph: &'static str, dim: bool },
-    /// The battery glyph followed by the charge, when the battery reports it.
-    Battery {
-        glyph: &'static str,
-        percent: Option<u8>,
-    },
-    /// Two stacked switches, the control center's own mark.
-    Switches,
+    /// An icon of DeskIsle's set, drawn faded when `dim`.
+    Icon { symbol: Symbol, dim: bool },
+    /// The battery icon followed by the charge, when the battery reports it.
+    Battery { symbol: Symbol, percent: Option<u8> },
 }
 
 impl SystemStatus {
@@ -55,34 +51,37 @@ impl SystemStatus {
     }
 
     pub fn mark(&self, item: SystemItem) -> Mark {
-        let glyph = |glyph| Mark::Glyph { glyph, dim: false };
+        let icon = |symbol| Mark::Icon { symbol, dim: false };
         match item {
-            SystemItem::Network if self.network.ssid.is_some() => glyph(WIFI),
-            SystemItem::Network if self.network.cellular => glyph("\u{EC05}"),
-            SystemItem::Network if self.network.wired => glyph("\u{E839}"),
-            SystemItem::Network => Mark::Glyph {
-                glyph: WIFI,
+            SystemItem::Network if self.network.ssid.is_some() => icon(Symbol::Wifi),
+            SystemItem::Network if self.network.cellular => icon(Symbol::Cellular),
+            SystemItem::Network if self.network.wired => icon(Symbol::Ethernet),
+            SystemItem::Network => Mark::Icon {
+                symbol: Symbol::Wifi,
                 dim: true,
             },
-            SystemItem::Display => glyph(DISPLAY),
+            SystemItem::Display => icon(Symbol::Display),
             SystemItem::Battery => match self.battery {
                 Some(battery) => Mark::Battery {
-                    glyph: battery_glyph(battery),
+                    symbol: battery_symbol(battery),
                     percent: battery.percent.map(|p| p.min(100)),
                 },
                 None => Mark::Battery {
-                    glyph: BATTERY_UNKNOWN,
+                    symbol: Symbol::Battery {
+                        percent: None,
+                        charging: false,
+                    },
                     percent: None,
                 },
             },
             SystemItem::Sound => match &self.audio {
-                Some(audio) => glyph(volume_glyph(audio.volume, audio.muted)),
-                None => Mark::Glyph {
-                    glyph: MUTE,
+                Some(audio) => icon(volume_symbol(audio.volume, audio.muted)),
+                None => Mark::Icon {
+                    symbol: Symbol::Muted,
                     dim: true,
                 },
             },
-            SystemItem::Control => Mark::Switches,
+            SystemItem::Control => icon(Symbol::Controls),
         }
     }
 }
@@ -113,63 +112,34 @@ pub fn wheel_volume(audio: &Audio, notches: i32) -> Option<u8> {
     (volume != audio.volume || audio.muted).then_some(volume)
 }
 
-const WIFI: &str = "\u{E701}";
-const ETHERNET: &str = "\u{E839}";
-const BLUETOOTH: &str = "\u{E702}";
-const DISPLAY: &str = "\u{E7F4}";
-const SETTINGS: &str = "\u{E713}";
-const BRIGHTNESS: &str = "\u{E706}";
-const MOON: &str = "\u{E708}";
-const CONTRAST: &str = "\u{E793}";
-const HDR: &str = "\u{E790}";
-const SPEAKER: &str = "\u{E7F5}";
-const MUTE: &str = "\u{E74F}";
-const POWER: &str = "\u{E945}";
-const BATTERY_UNKNOWN: &str = "\u{E996}";
-const PROJECT: &str = "\u{EBC6}";
-const MUSIC: &str = "\u{E8D6}";
-
-pub fn volume_glyph(volume: u8, muted: bool) -> &'static str {
+pub fn volume_symbol(volume: u8, muted: bool) -> Symbol {
     match volume {
-        _ if muted => MUTE,
-        0 => "\u{E992}",
-        1..=33 => "\u{E993}",
-        34..=66 => "\u{E994}",
-        _ => "\u{E995}",
+        _ if muted => Symbol::Muted,
+        0 => Symbol::Volume(0),
+        1..=33 => Symbol::Volume(1),
+        34..=66 => Symbol::Volume(2),
+        _ => Symbol::Volume(3),
     }
 }
 
-/// Battery glyphs fill in tenths; charging ones carry a bolt.
-pub fn battery_glyph(battery: Battery) -> &'static str {
-    const LEVELS: [&str; 11] = [
-        "\u{E850}", "\u{E851}", "\u{E852}", "\u{E853}", "\u{E854}", "\u{E855}", "\u{E856}",
-        "\u{E857}", "\u{E858}", "\u{E859}", "\u{E83F}",
-    ];
-    const CHARGING: [&str; 11] = [
-        "\u{E85A}", "\u{E85B}", "\u{E85C}", "\u{E85D}", "\u{E85E}", "\u{E85F}", "\u{E860}",
-        "\u{E861}", "\u{E862}", "\u{E83E}", "\u{EA93}",
-    ];
-    let Some(percent) = battery.percent else {
-        return BATTERY_UNKNOWN;
-    };
-    let level = usize::from(percent.min(100) + 5) / 10;
-    if battery.charging || battery.plugged {
-        CHARGING[level]
-    } else {
-        LEVELS[level]
+/// The battery fills with the charge; on external power it carries a bolt.
+pub fn battery_symbol(battery: Battery) -> Symbol {
+    Symbol::Battery {
+        percent: battery.percent.map(|p| p.min(100)),
+        charging: battery.charging || battery.plugged,
     }
 }
 
 fn choice(
     menu: &mut Menu<Command>,
     label: impl Into<String>,
-    glyph: &'static str,
+    symbol: Symbol,
     on: bool,
     command: Option<SystemCommand>,
 ) {
     menu.item(
         label,
-        Icon::Choice { glyph, on },
+        Icon::Choice { symbol, on },
         command.map(Command::System),
     );
 }
@@ -178,7 +148,9 @@ pub fn volume_slider(state: Option<(u8, bool)>) -> Slider<Command> {
     Slider {
         target: SliderTarget::Volume,
         value: state.map(|(volume, muted)| if muted { 0 } else { volume }),
-        glyph: state.map_or(MUTE, |(volume, muted)| volume_glyph(volume, muted)),
+        symbol: state.map_or(Symbol::Muted, |(volume, muted)| {
+            volume_symbol(volume, muted)
+        }),
         button: state.map(|(_, muted)| Command::System(SystemCommand::SetMuted(!muted))),
     }
 }
@@ -193,7 +165,7 @@ fn brightness_slider(menu: &mut Menu<Command>, display: &Display) {
     menu.entries.push(Entry::Slider(Slider {
         target: SliderTarget::Brightness,
         value: display.brightness,
-        glyph: BRIGHTNESS,
+        symbol: Symbol::Sun,
         button: None,
     }));
 }
@@ -213,7 +185,7 @@ pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
                 choice(
                     &mut menu,
                     output.name.clone(),
-                    SPEAKER,
+                    Symbol::Speaker,
                     output.default,
                     command,
                 );
@@ -226,7 +198,7 @@ pub fn sound_flyout(audio: Option<&Audio>) -> Menu<Command> {
     menu.separator();
     menu.item(
         "声音设置",
-        Icon::Glyph(SETTINGS),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:sound")),
     );
     menu
@@ -254,7 +226,7 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
             choice(
                 &mut menu,
                 plan.name.clone(),
-                POWER,
+                Symbol::Bolt,
                 plan.active,
                 Some(SystemCommand::SetPlan(plan.id)),
             );
@@ -264,19 +236,19 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
     if battery.is_some() {
         menu.item(
             "电池设置",
-            Icon::Glyph(SETTINGS),
+            Icon::Symbol(Symbol::Settings),
             Some(Command::Open("ms-settings:batterysaver")),
         );
     }
     menu.item(
         "电源和睡眠设置",
-        Icon::Glyph(SETTINGS),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:powersleep")),
     );
     menu
 }
 
-/// Brightness, dark mode, HDR and the display settings.
+/// Brightness, dark mode, Symbol::Hdr and the display settings.
 pub fn display_flyout(display: &Display) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.label("显示器");
@@ -288,17 +260,23 @@ pub fn display_flyout(display: &Display) -> Menu<Command> {
     choice(
         &mut menu,
         "深色模式",
-        CONTRAST,
+        Symbol::Contrast,
         display.dark,
         Some(SystemCommand::SetDark(!display.dark)),
     );
     if let Some(on) = display.hdr {
-        choice(&mut menu, "HDR", HDR, on, Some(SystemCommand::SetHdr(!on)));
+        choice(
+            &mut menu,
+            "Symbol::Hdr",
+            Symbol::Hdr,
+            on,
+            Some(SystemCommand::SetHdr(!on)),
+        );
     }
     menu.separator();
     menu.item(
         "显示设置",
-        Icon::Glyph(SETTINGS),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:display")),
     );
     menu
@@ -317,18 +295,18 @@ fn radio_detail(on: Option<bool>, connected: Option<&str>) -> String {
 pub fn network_flyout(network: &Network) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.label("网络");
-    for (kind, label, glyph, on, connected) in [
+    for (kind, label, symbol, on, connected) in [
         (
             RadioKind::WiFi,
             "Wi-Fi",
-            WIFI,
+            Symbol::Wifi,
             network.wifi,
             network.ssid.as_deref(),
         ),
         (
             RadioKind::Bluetooth,
             "蓝牙",
-            BLUETOOTH,
+            Symbol::Bluetooth,
             network.bluetooth,
             None,
         ),
@@ -339,7 +317,7 @@ pub fn network_flyout(network: &Network) -> Menu<Command> {
         };
         menu.item(
             label,
-            Icon::Choice { glyph, on },
+            Icon::Choice { symbol, on },
             Some(Command::System(SystemCommand::SetRadio(kind, !on))),
         )
         .detail = radio_detail(Some(on), connected);
@@ -348,7 +326,7 @@ pub fn network_flyout(network: &Network) -> Menu<Command> {
         menu.item(
             "以太网",
             Icon::Choice {
-                glyph: ETHERNET,
+                symbol: Symbol::Ethernet,
                 on: true,
             },
             None,
@@ -358,12 +336,12 @@ pub fn network_flyout(network: &Network) -> Menu<Command> {
     menu.separator();
     menu.item(
         "网络和 Internet 设置",
-        Icon::Glyph(SETTINGS),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:network")),
     );
     menu.item(
         "蓝牙和其他设备",
-        Icon::Glyph(SETTINGS),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:bluetooth")),
     );
     menu
@@ -372,12 +350,12 @@ pub fn network_flyout(network: &Network) -> Menu<Command> {
 fn radio_tile(
     kind: RadioKind,
     title: &str,
-    glyph: &'static str,
+    symbol: Symbol,
     on: Option<bool>,
     connected: Option<&str>,
 ) -> Tile<Command> {
     Tile {
-        glyph,
+        symbol,
         title: title.into(),
         detail: radio_detail(on, connected),
         on: on == Some(true),
@@ -403,42 +381,42 @@ pub fn control_flyout(
         radio_tile(
             RadioKind::WiFi,
             "Wi-Fi",
-            WIFI,
+            Symbol::Wifi,
             network.wifi,
             network.ssid.as_deref(),
         ),
         radio_tile(
             RadioKind::Bluetooth,
             "蓝牙",
-            BLUETOOTH,
+            Symbol::Bluetooth,
             network.bluetooth,
             None,
         ),
     ]));
     menu.entries.push(Entry::Tiles(vec![
         Tile {
-            glyph: CONTRAST,
+            symbol: Symbol::Contrast,
             title: "深色".into(),
             detail: if display.dark { "打开" } else { "关闭" }.into(),
             on: display.dark,
             command: Some(Command::System(SystemCommand::SetDark(!display.dark))),
         },
         Tile {
-            glyph: MOON,
+            symbol: Symbol::Moon,
             title: "专注".into(),
             detail: "设置".into(),
             on: false,
             command: Some(Command::Open("ms-settings:quiethours")),
         },
         Tile {
-            glyph: PROJECT,
+            symbol: Symbol::Cast,
             title: "投影".into(),
             detail: "选择模式".into(),
             on: false,
             command: Some(Command::Open("ms-settings-displays-topology:projection")),
         },
     ]));
-    // Each slider carries its own glyph, so the rows need no headings, and a monitor
+    // Each slider carries its own icon, so the rows need no headings, and a monitor
     // without DDC/CI gets no brightness row at all.
     if display.brightness.is_some() {
         brightness_slider(&mut menu, display);
@@ -446,7 +424,7 @@ pub fn control_flyout(
     add_volume(&mut menu, status.audio.as_ref());
     // The player appears only while something plays; the flyout is rebuilt when the
     // media query answers.
-    let control = |glyph, action| (glyph, Some(Command::System(SystemCommand::Media(action))));
+    let control = |symbol, action| (symbol, Some(Command::System(SystemCommand::Media(action))));
     if let Some(media) = media {
         menu.entries.push(Entry::Player {
             title: if media.title.is_empty() {
@@ -456,16 +434,16 @@ pub fn control_flyout(
             },
             detail: media.artist.clone(),
             buttons: vec![
-                control("\u{E892}", MediaAction::Previous),
+                control(Symbol::Previous, MediaAction::Previous),
                 control(
                     if media.playing {
-                        "\u{E769}"
+                        Symbol::Pause
                     } else {
-                        "\u{E768}"
+                        Symbol::Play
                     },
                     MediaAction::TogglePlay,
                 ),
-                control("\u{E893}", MediaAction::Next),
+                control(Symbol::Next, MediaAction::Next),
             ],
         });
     }
@@ -473,7 +451,7 @@ pub fn control_flyout(
 }
 
 /// The music note the player shows beside the title.
-pub const PLAYER_GLYPH: &str = MUSIC;
+pub const PLAYER_SYMBOL: Symbol = Symbol::Music;
 
 #[cfg(test)]
 mod tests {
@@ -501,8 +479,8 @@ mod tests {
         assert!(!status.items().contains(&SystemItem::Battery));
         assert_eq!(
             status.mark(SystemItem::Network),
-            Mark::Glyph {
-                glyph: WIFI,
+            Mark::Icon {
+                symbol: Symbol::Wifi,
                 dim: true
             }
         );
@@ -514,8 +492,8 @@ mod tests {
         status.network.cellular = true;
         assert_eq!(
             status.mark(SystemItem::Network),
-            Mark::Glyph {
-                glyph: "\u{EC05}",
+            Mark::Icon {
+                symbol: Symbol::Cellular,
                 dim: false
             }
         );
@@ -526,19 +504,28 @@ mod tests {
         assert_eq!(
             status.mark(SystemItem::Battery),
             Mark::Battery {
-                glyph: "\u{E856}",
+                symbol: Symbol::Battery {
+                    percent: Some(64),
+                    charging: false
+                },
                 percent: Some(64)
             }
         );
-        assert_eq!(volume_glyph(80, true), MUTE);
-        assert_eq!(volume_glyph(0, false), "\u{E992}");
-        assert_eq!(volume_glyph(100, false), "\u{E995}");
+        assert_eq!(volume_symbol(80, true), Symbol::Muted);
+        assert_eq!(volume_symbol(0, false), Symbol::Volume(0));
+        assert_eq!(volume_symbol(100, false), Symbol::Volume(3));
         let full = Battery {
             percent: Some(100),
             plugged: true,
             charging: false,
         };
-        assert_eq!(battery_glyph(full), "\u{EA93}");
+        assert_eq!(
+            battery_symbol(full),
+            Symbol::Battery {
+                percent: Some(100),
+                charging: true
+            }
+        );
     }
 
     #[test]

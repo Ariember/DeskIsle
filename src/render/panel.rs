@@ -5,6 +5,7 @@ use windows::Win32::{
 use windows::core::Result;
 
 use crate::settings::{Adjust, Key, PreviewKey, SECTIONS, Section};
+use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
 use super::Renderer;
@@ -25,6 +26,17 @@ fn section_color(section: Section) -> Rgb {
         Section::System => (87, 102, 116),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
+    }
+}
+
+/// The icon on a page's colored tile in the sidebar.
+fn section_symbol(section: Section) -> Symbol {
+    match section {
+        Section::Appearance => Symbol::Palette,
+        Section::Dock => Symbol::Dock,
+        Section::System => Symbol::Computer,
+        Section::Clock => Symbol::Clock,
+        Section::Monitor => Symbol::Chip,
     }
 }
 
@@ -187,40 +199,10 @@ impl Renderer {
         alpha: f32,
         align: DWRITE_TEXT_ALIGNMENT,
     ) -> Result<()> {
-        let style = Text {
-            size,
-            bold,
-            align,
-            ..Text::default()
-        };
+        let style = Text { size, bold, align };
         c.draw_text(
             &self.write,
             text,
-            c.rect(a.left, a.top, a.right, a.bottom),
-            style,
-            ink,
-            alpha,
-        )
-    }
-
-    fn glyph_in(
-        &self,
-        c: &Canvas,
-        glyph: &str,
-        a: Area,
-        size: f32,
-        ink: Rgb,
-        alpha: f32,
-    ) -> Result<()> {
-        let style = Text {
-            size,
-            glyph: true,
-            align: DWRITE_TEXT_ALIGNMENT_CENTER,
-            ..Text::default()
-        };
-        c.draw_text(
-            &self.write,
-            glyph,
             c.rect(a.left, a.top, a.right, a.bottom),
             style,
             ink,
@@ -299,7 +281,7 @@ impl Renderer {
         }
         if hover(Action::Close) {
             let cross = Area::new(x0 - 6., mid - 6., x0 + 6., mid + 6.);
-            self.glyph_in(c, "\u{E8BB}", cross, 7., CLOSE_CROSS, 0.9)?;
+            c.symbol_in(Symbol::Close, cross, 10., CLOSE_CROSS, 0.9)?;
         }
 
         for (index, &(a, section)) in layout.nav.iter().enumerate() {
@@ -334,7 +316,7 @@ impl Renderer {
                 BLACK,
                 0.08,
             )?;
-            self.glyph_in(c, section.glyph(), tile, 12., WHITE, 1.)?;
+            c.symbol_in(section_symbol(section), tile, 14., WHITE, 1.)?;
             let text = Area {
                 left: a.left + 37.,
                 right: a.right - 8.,
@@ -515,7 +497,7 @@ impl Renderer {
                     );
                     if *on {
                         c.round(l, tp, r, b, 4., t.accent)?;
-                        self.glyph_in(c, "\u{E73E}", *area, 10., WHITE, 1.)?;
+                        c.symbol_in(Symbol::Check, *area, 12., WHITE, 1.)?;
                     } else {
                         self.button_face(c, t, Area::new(l, tp, r, b), 4., false)?;
                     }
@@ -565,49 +547,14 @@ impl Renderer {
     }
 
     fn paint_monitor_icon(&self, c: &Canvas, key: Key, icon: Area) -> Result<()> {
-        let middle = icon.middle();
-        let x = (icon.left + icon.right) / 2.;
-        match key {
-            Key::Preview(PreviewKey::Temperature) => {
-                c.stroke(
-                    x - 3.5,
-                    middle - 15.,
-                    x + 3.5,
-                    middle + 7.,
-                    3.5,
-                    c.p.ink,
-                    1.,
-                )?;
-                c.round(x - 6., middle + 2., x + 6., middle + 14., 6., c.p.ink)?;
-                c.round(x - 1.5, middle - 6., x + 1.5, middle + 6., 1.5, c.p.ink)?;
-                for dy in [-10., -5., 0.] {
-                    c.round(x + 6., middle + dy, x + 10., middle + dy + 2., 1., c.p.ink)?;
-                }
-            }
-            Key::Preview(PreviewKey::Memory) => {
-                c.stroke(x - 15., middle - 8., x + 15., middle + 8., 3., c.p.ink, 1.)?;
-                for dx in [-10., -5., 0., 5., 10.] {
-                    for dy in [-12., 9.] {
-                        c.round(
-                            x + dx - 1.,
-                            middle + dy,
-                            x + dx + 1.,
-                            middle + dy + 3.,
-                            1.,
-                            c.p.ink,
-                        )?;
-                    }
-                }
-            }
-            Key::Preview(PreviewKey::Cpu) => {
-                self.glyph_in(c, "\u{E950}", icon, 29., c.p.ink, 1.)?
-            }
-            Key::Preview(PreviewKey::Disk) => {
-                self.glyph_in(c, "\u{EDA2}", icon, 29., c.p.ink, 1.)?
-            }
-            _ => {}
-        }
-        Ok(())
+        let symbol = match key {
+            Key::Preview(PreviewKey::Temperature) => Symbol::Thermometer,
+            Key::Preview(PreviewKey::Memory) => Symbol::Memory,
+            Key::Preview(PreviewKey::Cpu) => Symbol::Chip,
+            Key::Preview(PreviewKey::Disk) => Symbol::Disk,
+            _ => return Ok(()),
+        };
+        c.symbol_in(symbol, icon, 30., c.p.ink, 1.)
     }
 
     fn paint_panel_control(
@@ -655,14 +602,14 @@ impl Renderer {
                 can_down,
                 can_up,
             } => {
-                for (area, glyph, enabled, step) in [
-                    (minus, "\u{E738}", can_down, -1),
-                    (plus, "\u{E710}", can_up, 1),
+                for (area, symbol, enabled, step) in [
+                    (minus, Symbol::Minus, can_down, -1),
+                    (plus, Symbol::Plus, can_up, 1),
                 ] {
                     let lit = *enabled && hover(Adjust::Step(step));
                     self.button_face(c, t, *area, 6., lit)?;
                     let alpha = if *enabled { 0.9 } else { 0.3 };
-                    self.glyph_in(c, glyph, *area, 10., c.p.ink, alpha)?;
+                    c.symbol_in(symbol, *area, 12., c.p.ink, alpha)?;
                 }
                 self.label_aligned(
                     c,

@@ -10,6 +10,9 @@ use windows::Win32::{
 };
 use windows::core::{Result, w};
 
+use crate::ui::icon::{self, Paint, Step, Symbol, Tone};
+use crate::ui::panel::Area;
+
 pub(super) type Rgb = (u8, u8, u8);
 
 /// Monochrome colors for one appearance. Washes and hairlines use `line` at low alpha,
@@ -343,22 +346,134 @@ impl Canvas {
         self.draw_text(factory, text, rect, style, color, 1.)
     }
 
-    /// Draws an icon-font glyph centered in `rect`. Windows 11 ships Segoe Fluent Icons.
-    pub(super) fn glyph(
+    /// Draws `symbol` from DeskIsle's icon set in a `size` DIP square centered on `x`, `y`,
+    /// stroked as heavily as [`icon::weight`] gives for that size.
+    pub(super) fn symbol(
         &self,
-        factory: &IDWriteFactory,
-        glyph: &str,
-        rect: D2D_RECT_F,
+        symbol: Symbol,
+        x: f32,
+        y: f32,
         size: f32,
         color: Rgb,
+        alpha: f32,
     ) -> Result<()> {
-        let style = Text {
-            size,
-            glyph: true,
-            align: DWRITE_TEXT_ALIGNMENT_CENTER,
-            ..Text::default()
+        self.symbol_weighted(symbol, x, y, size, icon::weight(size), color, alpha)
+    }
+
+    /// Draws `symbol` centered in `area`.
+    pub(super) fn symbol_in(
+        &self,
+        symbol: Symbol,
+        area: Area,
+        size: f32,
+        color: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        let (x, y) = ((area.left + area.right) / 2., area.middle());
+        self.symbol(symbol, x, y, size, color, alpha)
+    }
+
+    /// Draws `symbol` with strokes `weight` DIPs wide, so icons of different sizes that
+    /// sit side by side can share one weight.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn symbol_weighted(
+        &self,
+        symbol: Symbol,
+        x: f32,
+        y: f32,
+        size: f32,
+        weight: f32,
+        color: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        let unit = size / icon::GRID * self.scale;
+        let left = self.origin.x as f32 + (x - size / 2.) * self.scale;
+        let top = self.origin.y as f32 + (y - size / 2.) * self.scale;
+        // The point type lives in a crate DeskIsle does not depend on directly.
+        let at = |(gx, gy): icon::Point| {
+            let mut point = D2D1_ELLIPSE::default().point;
+            point.X = left + gx * unit;
+            point.Y = top + gy * unit;
+            point
         };
-        self.draw_text(factory, glyph, rect, style, color, 1.)
+        unsafe {
+            // Geometry must come from the factory that created the device context.
+            let factory = self.ctx.GetFactory()?;
+            let style = factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 10.,
+                    dashStyle: D2D1_DASH_STYLE_SOLID,
+                    dashOffset: 0.,
+                },
+                None,
+            )?;
+            for shape in icon::sketch(symbol) {
+                let geometry = factory.CreatePathGeometry()?;
+                let sink = geometry.Open()?;
+                let begin = match shape.paint {
+                    Paint::Stroke => D2D1_FIGURE_BEGIN_HOLLOW,
+                    Paint::Fill => D2D1_FIGURE_BEGIN_FILLED,
+                };
+                sink.BeginFigure(at(shape.start), begin);
+                for step in &shape.steps {
+                    match *step {
+                        Step::Line(to) => sink.AddLine(at(to)),
+                        Step::Quad { control, to } => {
+                            sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
+                                point1: at(control),
+                                point2: at(to),
+                            })
+                        }
+                        Step::Arc {
+                            to,
+                            radius,
+                            clockwise,
+                            large,
+                        } => sink.AddArc(&D2D1_ARC_SEGMENT {
+                            point: at(to),
+                            size: D2D_SIZE_F {
+                                width: radius * unit,
+                                height: radius * unit,
+                            },
+                            rotationAngle: 0.,
+                            sweepDirection: if clockwise {
+                                D2D1_SWEEP_DIRECTION_CLOCKWISE
+                            } else {
+                                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE
+                            },
+                            arcSize: if large {
+                                D2D1_ARC_SIZE_LARGE
+                            } else {
+                                D2D1_ARC_SIZE_SMALL
+                            },
+                        }),
+                    }
+                }
+                sink.EndFigure(if shape.closed {
+                    D2D1_FIGURE_END_CLOSED
+                } else {
+                    D2D1_FIGURE_END_OPEN
+                });
+                sink.Close()?;
+                let tint = match shape.tone {
+                    Tone::Ink => color,
+                    Tone::Alert => self.p.danger,
+                };
+                let brush = self.brush_alpha(tint, alpha * shape.alpha)?;
+                match shape.paint {
+                    Paint::Stroke => {
+                        self.ctx
+                            .DrawGeometry(&geometry, &brush, weight * self.scale, &style)
+                    }
+                    Paint::Fill => self.ctx.FillGeometry(&geometry, &brush, None),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn draw_text(
@@ -401,7 +516,6 @@ fn color(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
 pub(super) struct Text {
     pub(super) size: f32,
     pub(super) bold: bool,
-    pub(super) glyph: bool,
     pub(super) align: DWRITE_TEXT_ALIGNMENT,
 }
 
@@ -410,7 +524,6 @@ impl Default for Text {
         Self {
             size: 13.,
             bold: false,
-            glyph: false,
             align: DWRITE_TEXT_ALIGNMENT_LEADING,
         }
     }
@@ -423,14 +536,9 @@ pub(super) fn text_format(
     style: Text,
     size: f32,
 ) -> Result<IDWriteTextFormat> {
-    let font = if style.glyph {
-        w!("Segoe Fluent Icons")
-    } else {
-        w!("Segoe UI")
-    };
     unsafe {
         let format = factory.CreateTextFormat(
-            font,
+            w!("Segoe UI"),
             None,
             if style.bold {
                 DWRITE_FONT_WEIGHT_SEMI_BOLD

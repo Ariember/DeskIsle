@@ -29,6 +29,7 @@ use windows::Win32::{
 use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
+use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{StatusHit, StatusLayout, SystemItem};
 use crate::ui::system::Mark;
 
@@ -125,6 +126,10 @@ struct IconLayer {
 const DURATION: f32 = 0.14;
 /// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
 const PILL_RADIUS: f32 = 7.;
+/// Size of the system icons on the status bar, in DIPs. The battery is drawn larger with
+/// the same stroke weight, so its body reads at the bar's height.
+const BAR_ICON: f32 = 16.;
+const BATTERY_ICON: f32 = 22.;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
 fn ease(
@@ -286,12 +291,6 @@ impl Renderer {
             let (l, r) = (dip(slot.x) + 2., dip(slot.x + slot.width) - 2.);
             c.fill(l, 4., r, h - 4., PILL_RADIUS, c.p.line, alpha)
         };
-        let glyph_text = Text {
-            size: 15.,
-            glyph: true,
-            align: DWRITE_TEXT_ALIGNMENT_CENTER,
-            ..Text::default()
-        };
         let surface = paint(
             &self.device,
             self.palette,
@@ -342,33 +341,32 @@ impl Renderer {
                     }
                 }
                 if let Some(r) = layout.overflow {
-                    c.glyph(
-                        &self.write,
-                        "\u{E70D}",
-                        c.rect(dip(r.x), 0., dip(r.x + r.width), h),
-                        10.,
-                        c.p.muted,
-                    )?;
+                    let x = (dip(r.x) + dip(r.x + r.width)) / 2.;
+                    c.symbol(Symbol::ChevronDown, x, h / 2., 12., c.p.muted, 1.)?;
                 }
                 for (&(_, r), mark) in layout.system.iter().zip(marks) {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));
+                    let (x, y) = ((l + right) / 2., h / 2.);
                     match *mark {
-                        Mark::Glyph { glyph, dim } => c.draw_text(
-                            &self.write,
-                            glyph,
-                            c.rect(l, 0., right, h),
-                            glyph_text,
-                            c.p.ink,
-                            if dim { 0.4 } else { 1. },
-                        )?,
-                        Mark::Battery { glyph, percent } => {
+                        Mark::Icon { symbol, dim } => {
+                            let alpha = if dim { 0.4 } else { 1. };
+                            c.symbol(symbol, x, y, BAR_ICON, c.p.ink, alpha)?;
+                        }
+                        Mark::Battery { symbol, percent } => {
+                            let weight = icon::weight(BAR_ICON);
                             let Some(percent) = percent else {
-                                let area = c.rect(l, 0., right, h);
-                                c.draw_text(&self.write, glyph, area, glyph_text, c.p.ink, 1.)?;
+                                c.symbol_weighted(symbol, x, y, BATTERY_ICON, weight, c.p.ink, 1.)?;
                                 continue;
                             };
-                            let area = c.rect(l + 3., 0., l + 27., h);
-                            c.draw_text(&self.write, glyph, area, glyph_text, c.p.ink, 1.)?;
+                            c.symbol_weighted(
+                                symbol,
+                                l + 15.,
+                                y,
+                                BATTERY_ICON,
+                                weight,
+                                c.p.ink,
+                                1.,
+                            )?;
                             c.draw_text(
                                 &self.write,
                                 &format!("{percent}%"),
@@ -380,21 +378,6 @@ impl Renderer {
                                 c.p.ink,
                                 1.,
                             )?;
-                        }
-                        Mark::Switches => {
-                            // Two filled capsules with round knobs, the upper one on.
-                            let x = (l + right) / 2.;
-                            let y = h / 2.;
-                            for (top, on) in [(y - 7., true), (y + 1., false)] {
-                                let (bottom, alpha) = (top + 6., if on { 1. } else { 0.3 });
-                                c.fill(x - 7., top, x + 7., bottom, 3., c.p.ink, alpha)?;
-                                let (knob, color) = if on {
-                                    (x + 3.5, c.p.bar)
-                                } else {
-                                    (x - 3.5, c.p.ink)
-                                };
-                                c.round(knob - 2., top + 1., knob + 2., bottom - 1., 2., color)?;
-                            }
                         }
                     }
                 }

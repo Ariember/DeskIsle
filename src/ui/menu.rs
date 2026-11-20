@@ -6,12 +6,13 @@ use std::path::PathBuf;
 
 use crate::dock::AppGroup;
 use crate::geometry::Rect;
+use crate::ui::icon::Symbol;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Icon {
     None,
-    /// A Segoe Fluent Icons code point.
-    Glyph(&'static str),
+    /// An icon of DeskIsle's own set.
+    Symbol(Symbol),
     /// The Shell icon of a file.
     File(PathBuf),
     /// The current image of a tray icon, by index into the tray host's list.
@@ -20,9 +21,9 @@ pub enum Icon {
     Window {
         active: bool,
     },
-    /// A glyph in a circle that fills in when the option is on or selected.
+    /// An icon in a circle that fills in when the option is on or selected.
     Choice {
-        glyph: &'static str,
+        symbol: Symbol,
         on: bool,
     },
 }
@@ -46,8 +47,8 @@ pub struct Slider<C> {
     pub target: SliderTarget,
     /// Percent, or `None` when the feature is unavailable.
     pub value: Option<u8>,
-    pub glyph: &'static str,
-    /// Chosen by clicking the glyph at the start of the track, such as muting.
+    pub symbol: Symbol,
+    /// Chosen by clicking the icon at the start of the track, such as muting.
     pub button: Option<C>,
 }
 
@@ -60,7 +61,7 @@ pub enum SliderTarget {
 /// One of several quick toggles that share a row.
 #[derive(Clone, Debug)]
 pub struct Tile<C> {
-    pub glyph: &'static str,
+    pub symbol: Symbol,
     pub title: String,
     pub detail: String,
     pub on: bool,
@@ -83,7 +84,7 @@ pub enum Entry<C> {
     Player {
         title: String,
         detail: String,
-        buttons: Vec<(&'static str, Option<C>)>,
+        buttons: Vec<(Symbol, Option<C>)>,
     },
     Separator,
 }
@@ -158,7 +159,7 @@ impl<C> Menu<C> {
         }
     }
 
-    /// The command of part `part` of a tile row, the player, or a slider's glyph.
+    /// The command of part `part` of a tile row, the player, or a slider's icon.
     pub fn part_command(&self, index: usize, part: usize) -> Option<&C> {
         match self.entries.get(index)? {
             Entry::Tiles(tiles) => tiles.get(part)?.command.as_ref(),
@@ -265,7 +266,7 @@ pub enum Hit {
     /// A header, separator, disabled item or the panel padding.
     Inert,
     Item(usize),
-    /// Part of a tile row, the player or a slider's glyph, with an enabled command.
+    /// Part of a tile row, the player or a slider's icon, with an enabled command.
     Part(usize, usize),
     /// The track of an available slider, with the value at the pointer.
     Slider(usize, u8),
@@ -646,24 +647,24 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
         Some(path) if app.windows.is_empty() => {
             menu.item(
                 "打开",
-                Icon::Glyph("\u{E8A7}"),
+                Icon::Symbol(Symbol::Open),
                 Some(Command::Select(id.clone())),
             );
             menu.item(
                 "打开文件所在位置",
-                Icon::Glyph("\u{E838}"),
+                Icon::Symbol(Symbol::Folder),
                 Some(Command::Reveal(path.into())),
             );
         }
         Some(path) => {
             menu.item(
                 "新建窗口",
-                Icon::Glyph("\u{E710}"),
+                Icon::Symbol(Symbol::Plus),
                 Some(Command::NewInstance(path.into())),
             );
             menu.item(
                 "打开文件所在位置",
-                Icon::Glyph("\u{E838}"),
+                Icon::Symbol(Symbol::Folder),
                 Some(Command::Reveal(path.into())),
             );
         }
@@ -672,13 +673,13 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
     if app.pinned() {
         menu.item(
             "从 Dock 取消固定",
-            Icon::Glyph("\u{E77A}"),
+            Icon::Symbol(Symbol::Unpin),
             Some(Command::Unpin(id.clone())),
         );
     } else if let Some(path) = app.executable() {
         menu.item(
             "固定到 Dock",
-            Icon::Glyph("\u{E718}"),
+            Icon::Symbol(Symbol::Pin),
             Some(Command::Pin(path.into())),
         );
     }
@@ -692,7 +693,7 @@ pub fn app_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
         };
         menu.item(
             label,
-            Icon::Glyph("\u{E711}"),
+            Icon::Symbol(Symbol::Close),
             Some(Command::Close(id, ids)),
         )
         .danger = true;
@@ -716,7 +717,7 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
     menu.header(
         "DeskIsle",
         format!("{running} 个应用正在运行"),
-        Icon::Glyph("\u{E7C4}"),
+        Icon::Symbol(Symbol::Apps),
     );
     menu.separator();
     for app in apps.iter().take(LIST_LIMIT) {
@@ -747,19 +748,23 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
     menu.separator();
     menu.item(
         "任务管理器",
-        Icon::Glyph("\u{E9D9}"),
+        Icon::Symbol(Symbol::Activity),
         Some(Command::TaskManager),
     );
     menu.item(
         "显示桌面",
-        Icon::Glyph("\u{E7F4}"),
+        Icon::Symbol(Symbol::Desktop),
         Some(Command::ShowDesktop),
     );
     menu.separator();
-    menu.item("设置", Icon::Glyph("\u{E713}"), Some(Command::Settings));
+    menu.item(
+        "设置",
+        Icon::Symbol(Symbol::Settings),
+        Some(Command::Settings),
+    );
     menu.item(
         "退出 DeskIsle",
-        Icon::Glyph("\u{E7E8}"),
+        Icon::Symbol(Symbol::Power),
         Some(Command::Quit),
     )
     .danger = true;
@@ -772,57 +777,69 @@ pub fn mark_menu() -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.item(
         "关于本机",
-        Icon::Glyph("\u{E946}"),
+        Icon::Symbol(Symbol::Info),
         Some(Command::Open("ms-settings:about")),
     );
     menu.separator();
-    menu.item("管理面板", Icon::Glyph("\u{E80F}"), Some(Command::Settings));
+    menu.item(
+        "管理面板",
+        Icon::Symbol(Symbol::Sliders),
+        Some(Command::Settings),
+    );
     menu.item(
         "系统偏好设置",
-        Icon::Glyph("\u{E713}"),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::Open("ms-settings:")),
     );
     menu.item(
         "应用商店",
-        Icon::Glyph("\u{E719}"),
+        Icon::Symbol(Symbol::Store),
         Some(Command::Open("ms-windows-store:")),
     );
     menu.separator();
     menu.item(
         "任务管理器",
-        Icon::Glyph("\u{E9D9}"),
+        Icon::Symbol(Symbol::Activity),
         Some(Command::TaskManager),
     );
     menu.item(
         "显示桌面",
-        Icon::Glyph("\u{E7F4}"),
+        Icon::Symbol(Symbol::Desktop),
         Some(Command::ShowDesktop),
     );
     menu.separator();
-    menu.item("睡眠", Icon::Glyph("\u{E708}"), Some(Command::Sleep));
-    menu.item("重新启动", Icon::Glyph("\u{E72C}"), Some(Command::Restart))
-        .danger = true;
-    menu.item("关机", Icon::Glyph("\u{E7E8}"), Some(Command::ShutDown))
+    menu.item("睡眠", Icon::Symbol(Symbol::Moon), Some(Command::Sleep));
+    menu.item(
+        "重新启动",
+        Icon::Symbol(Symbol::Restart),
+        Some(Command::Restart),
+    )
+    .danger = true;
+    menu.item("关机", Icon::Symbol(Symbol::Power), Some(Command::ShutDown))
         .danger = true;
     menu.separator();
-    menu.item("锁定屏幕", Icon::Glyph("\u{E72E}"), Some(Command::Lock));
-    menu.item("注销", Icon::Glyph("\u{E748}"), Some(Command::SignOut))
-        .danger = true;
+    menu.item("锁定屏幕", Icon::Symbol(Symbol::Lock), Some(Command::Lock));
+    menu.item(
+        "注销",
+        Icon::Symbol(Symbol::SignOut),
+        Some(Command::SignOut),
+    )
+    .danger = true;
     menu
 }
 
 pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    menu.header(date, year, Icon::Glyph("\u{E787}"));
+    menu.header(date, year, Icon::Symbol(Symbol::Calendar));
     menu.separator();
     menu.item(
         "通知和日历",
-        Icon::Glyph("\u{E91C}"),
+        Icon::Symbol(Symbol::Bell),
         Some(Command::Notifications),
     );
     menu.item(
         "日期和时间设置",
-        Icon::Glyph("\u{E713}"),
+        Icon::Symbol(Symbol::Settings),
         Some(Command::DateTime),
     );
     menu
@@ -880,7 +897,8 @@ mod tests {
         menu.item("disabled", Icon::None, None);
         menu.separator();
         menu.separator();
-        menu.item("last", Icon::Glyph("\u{E711}"), Some(2)).danger = true;
+        menu.item("last", Icon::Symbol(Symbol::Close), Some(2))
+            .danger = true;
         menu.separator();
         menu
     }

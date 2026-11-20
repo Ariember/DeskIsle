@@ -60,17 +60,6 @@ impl Section {
         }
     }
 
-    /// A Segoe Fluent Icons code point for the navigation list.
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Section::Appearance => "\u{E790}",
-            Section::Dock => "\u{E771}",
-            Section::System => "\u{E770}",
-            Section::Clock => "\u{E823}",
-            Section::Monitor => "\u{E950}",
-        }
-    }
-
     pub fn is_preview(self) -> bool {
         matches!(self, Self::Clock | Self::Monitor)
     }
