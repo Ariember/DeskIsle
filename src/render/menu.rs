@@ -7,11 +7,11 @@ use windows::Win32::{
 };
 use windows::core::Result;
 
-use crate::ui::menu::{self, Entry, Icon, Menu, MenuLayout};
+use crate::ui::menu::{self, Entry, Icon, Menu, MenuLayout, Slider};
+use crate::ui::panel::Area;
+use crate::ui::system::PLAYER_GLYPH;
 
-use super::canvas::{
-    Canvas, DANGER, INK, MINT, MUTED, PANEL, PANEL_TOP, Rgb, Text, paint, text_format,
-};
+use super::canvas::{Canvas, Rgb, Text, paint, text_format};
 use super::{Renderer, ease};
 
 const MENU_RADIUS: f32 = 10.;
@@ -29,10 +29,15 @@ pub(super) struct MenuView {
     accent: IDCompositionSurface,
     danger: IDCompositionSurface,
     scale: f32,
-    rows: Vec<(f32, f32)>,
-    hover: Option<usize>,
+    highlight_width: f32,
+    highlight_scale: IDCompositionScaleTransform,
+    highlighted: bool,
     /// The highlight's vertical offset in pixels.
     y: Tween,
+    /// Each slider's own layer by entry index, repainted alone while it is dragged.
+    sliders: Vec<(usize, IDCompositionVisual2)>,
+    /// The track size of the sliders in DIPs and the DPI they were painted at.
+    track: (f32, f32, u32),
 }
 
 /// Mirrors an [`ease`] handed to the compositor, so a new one starts where it is now.
@@ -88,7 +93,8 @@ impl Renderer {
         measured.unwrap_or_else(|_| text.chars().count() as f32 * size * 0.62)
     }
 
-    /// Paints `menu` into `hwnd`, a hidden menu window sized to `layout`, and fades it in.
+    /// Paints `menu` into `hwnd`, a hidden menu window sized to `layout`, and fades it in
+    /// when `animate`; a flyout rebuilt after a change appears in place instead.
     /// `tray` resolves tray icon indices while the tray host keeps owning the handles.
     pub fn open_menu<C>(
         &mut self,
@@ -97,11 +103,12 @@ impl Renderer {
         layout: &MenuLayout,
         dpi: u32,
         tray: &dyn Fn(usize) -> Option<HICON>,
+        animate: bool,
     ) -> Result<()> {
         self.close_menu();
         let (width, height) = layout.pixels();
         let (left, top, right, bottom) = layout.panel();
-        let background = paint(&self.device, width, height, dpi, |c| {
+        let background = paint(&self.device, self.palette, width, height, dpi, |c| {
             c.shadow(left, top, right, bottom, MENU_RADIUS, menu::SHADOW - 2.)?;
             c.gradient(
                 left,
@@ -109,21 +116,38 @@ impl Renderer {
                 right,
                 bottom,
                 MENU_RADIUS,
-                (PANEL_TOP, 0.985),
-                (PANEL, 0.985),
+                (c.p.panel_top, 0.985),
+                (c.p.panel, 0.985),
             )?;
-            c.stroke(left, top, right, bottom, MENU_RADIUS, (255, 255, 255), 0.12)
+            c.stroke(left, top, right, bottom, MENU_RADIUS, c.p.line, 0.12)
         })?;
-        let content = paint(&self.device, width, height, dpi, |c| {
-            for (entry, &(row_top, row_bottom)) in menu.entries.iter().zip(&layout.rows) {
-                self.paint_entry(c, entry, layout, row_top, row_bottom, tray)?;
+        let content = paint(&self.device, self.palette, width, height, dpi, |c| {
+            for (index, entry) in menu.entries.iter().enumerate() {
+                self.paint_entry(c, entry, layout, index, tray)?;
             }
             Ok(())
         })?;
+        let mut sliders = Vec::new();
+        let mut track = (0., 0., dpi);
+        for (index, entry) in menu.entries.iter().enumerate() {
+            if let Entry::Slider(slider) = entry {
+                let (l, t, r, b) = layout.track(index);
+                track = (r - l, b - t, dpi);
+                let surface = self.slider_surface(slider, track)?;
+                unsafe {
+                    let visual = self.device.CreateVisual()?;
+                    visual.SetContent(&surface)?;
+                    visual.SetOffsetX2((l * layout.scale).round())?;
+                    visual.SetOffsetY2((t * layout.scale).round())?;
+                    sliders.push((index, visual));
+                }
+            }
+        }
         let (row_left, _, row_right, _) = layout.row(0);
         let highlight = |accent: Rgb| {
             paint(
                 &self.device,
+                self.palette,
                 ((row_right - row_left) * layout.scale).round() as i32,
                 (menu::ITEM_HEIGHT * layout.scale).round() as i32,
                 dpi,
@@ -136,8 +160,8 @@ impl Renderer {
                 },
             )
         };
-        let accent = highlight(MINT)?;
-        let danger = highlight(DANGER)?;
+        let accent = highlight(self.palette.accent)?;
+        let danger = highlight(self.palette.danger)?;
         unsafe {
             let target = self.device.CreateTargetForHwnd(hwnd, true)?;
             let root = self.device.CreateVisual()?;
@@ -145,6 +169,8 @@ impl Renderer {
             let glow = self.device.CreateVisual()?;
             glow.SetContent(&accent)?;
             glow.SetOffsetX2((row_left * layout.scale).round())?;
+            let highlight_scale = self.device.CreateScaleTransform()?;
+            glow.SetTransform(&highlight_scale)?;
             let glow_fade = self.device.CreateEffectGroup()?;
             glow_fade.SetOpacity2(0.)?;
             glow.SetEffect(&glow_fade)?;
@@ -152,18 +178,23 @@ impl Renderer {
             text.SetContent(&content)?;
             root.AddVisual(&glow, true, None)?;
             root.AddVisual(&text, true, None)?;
+            for (_, visual) in &sliders {
+                root.AddVisual(visual, true, None)?;
+            }
 
-            // Open with a quick fade and a slight zoom toward the full size.
-            let fade = self.device.CreateEffectGroup()?;
-            fade.SetOpacity(&ease(&self.device, 0., 1., OPEN_DURATION)?)?;
-            root.SetEffect(&fade)?;
-            let zoom = self.device.CreateScaleTransform()?;
-            zoom.SetCenterX2(width as f32 / 2.)?;
-            zoom.SetCenterY2(height as f32 / 2.)?;
-            let grow = ease(&self.device, 0.96, 1., OPEN_DURATION)?;
-            zoom.SetScaleX(&grow)?;
-            zoom.SetScaleY(&grow)?;
-            root.SetTransform(&zoom)?;
+            if animate {
+                // Open with a quick fade and a slight zoom toward the full size.
+                let fade = self.device.CreateEffectGroup()?;
+                fade.SetOpacity(&ease(&self.device, 0., 1., OPEN_DURATION)?)?;
+                root.SetEffect(&fade)?;
+                let zoom = self.device.CreateScaleTransform()?;
+                zoom.SetCenterX2(width as f32 / 2.)?;
+                zoom.SetCenterY2(height as f32 / 2.)?;
+                let grow = ease(&self.device, 0.96, 1., OPEN_DURATION)?;
+                zoom.SetScaleX(&grow)?;
+                zoom.SetScaleY(&grow)?;
+                root.SetTransform(&zoom)?;
+            }
             target.SetRoot(&root)?;
             self.device.Commit()?;
             self.menu = Some(MenuView {
@@ -174,12 +205,141 @@ impl Renderer {
                 accent,
                 danger,
                 scale: layout.scale,
-                rows: layout.rows.clone(),
-                hover: None,
+                highlight_width: row_right - row_left,
+                highlight_scale,
+                highlighted: false,
                 y: Tween::at(0.),
+                sliders,
+                track,
             });
         }
         Ok(())
+    }
+
+    /// A slider's track, fill, knob and glyph, `(width, height, dpi)` in size.
+    fn slider_surface<C>(
+        &self,
+        slider: &Slider<C>,
+        (w, h, dpi): (f32, f32, u32),
+    ) -> Result<IDCompositionSurface> {
+        let s = dpi as f32 / 96.;
+        let size = ((w * s).round() as i32, (h * s).round() as i32);
+        paint(&self.device, self.palette, size.0, size.1, dpi, |c| {
+            let radius = h / 2.;
+            c.fill(0., 0., w, h, radius, c.p.line, 0.1)?;
+            let glyph = Area::new(0., 0., h, h);
+            let Some(value) = slider.value else {
+                return self.glyph_at(c, slider.glyph, glyph, 13., c.p.muted, 0.6);
+            };
+            let x = radius + (w - h) * f32::from(value.min(100)) / 100.;
+            c.fill(0., 0., x + radius, h, radius, c.p.accent, 1.)?;
+            let knob = radius - 1.5;
+            c.fill(
+                x - knob,
+                radius - knob,
+                x + knob,
+                radius + knob,
+                knob,
+                c.p.panel_top,
+                1.,
+            )?;
+            c.stroke(
+                x - knob,
+                radius - knob,
+                x + knob,
+                radius + knob,
+                knob,
+                c.p.line,
+                0.25,
+            )?;
+            // The knob covers the glyph at the low end of the range.
+            let ink = if x < h { c.p.ink } else { c.p.on_accent };
+            self.glyph_at(c, slider.glyph, glyph, 13., ink, 1.)
+        })
+    }
+
+    /// Repaints the slider of entry `index` after its value changed.
+    pub fn menu_slider<C>(&mut self, index: usize, slider: &Slider<C>) -> Result<()> {
+        let Some(track) = self.menu.as_ref().map(|view| view.track) else {
+            return Ok(());
+        };
+        let surface = self.slider_surface(slider, track)?;
+        let view = self.menu.as_ref().expect("menu checked above");
+        if let Some((_, visual)) = view.sliders.iter().find(|(i, _)| *i == index) {
+            unsafe {
+                visual.SetContent(&surface)?;
+                self.device.Commit()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn glyph_at(
+        &self,
+        c: &Canvas,
+        glyph: &str,
+        a: Area,
+        size: f32,
+        ink: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        c.draw_text(
+            &self.write,
+            glyph,
+            c.rect(a.left, a.top, a.right, a.bottom),
+            Text {
+                size,
+                glyph: true,
+                align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                ..Text::default()
+            },
+            ink,
+            alpha,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn text_at(
+        &self,
+        c: &Canvas,
+        text: &str,
+        a: Area,
+        size: f32,
+        bold: bool,
+        ink: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        c.draw_text(
+            &self.write,
+            text,
+            c.rect(a.left, a.top, a.right, a.bottom),
+            Text {
+                size,
+                bold,
+                ..Text::default()
+            },
+            ink,
+            alpha,
+        )
+    }
+
+    /// A glyph in a circle, filled with the accent when `on`.
+    fn badge(&self, c: &Canvas, glyph: &str, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
+        let r = size / 2.;
+        if on {
+            c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)?;
+        } else {
+            c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)?;
+        }
+        let ink = if on { c.p.on_accent } else { c.p.ink };
+        self.glyph_at(
+            c,
+            glyph,
+            Area::new(x - r, y - r, x + r, y + r),
+            size * 0.5,
+            ink,
+            1.,
+        )
     }
 
     fn paint_entry<C>(
@@ -187,22 +347,82 @@ impl Renderer {
         c: &Canvas,
         entry: &Entry<C>,
         layout: &MenuLayout,
-        top: f32,
-        bottom: f32,
+        index: usize,
         tray: &dyn Fn(usize) -> Option<HICON>,
     ) -> Result<()> {
-        let (_, _, row_right, _) = layout.row(0);
-        let (row_left, _, _, _) = layout.row(0);
+        let (row_left, _, row_right, _) = layout.row(0);
+        let (top, bottom) = layout.rows[index];
         let middle = (top + bottom) / 2.;
         let icon_x = row_left + 8. + 12.;
         match entry {
+            Entry::Label(text) => {
+                let area = Area::new(row_left + 8., top + 4., row_right - 8., bottom);
+                self.text_at(c, text, area, menu::DETAIL_SIZE, true, c.p.muted, 1.)
+            }
+            // Drawn on its own layer.
+            Entry::Slider(_) => Ok(()),
+            Entry::Tiles(tiles) => {
+                for (part, tile) in tiles.iter().enumerate() {
+                    let (l, t, r, b) = layout.tile(index, part, tiles.len());
+                    c.fill(l, t, r, b, 10., c.p.line, 0.055)?;
+                    c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
+                    let y = (t + b) / 2.;
+                    self.badge(c, tile.glyph, l + 8. + 15., y, 30., tile.on)?;
+                    let text = Area::new(l + 46., t, r - 6., y + 1.);
+                    let alpha = if tile.command.is_some() { 1. } else { 0.5 };
+                    self.text_at(
+                        c,
+                        &tile.title,
+                        Area {
+                            top: y - 17.,
+                            ..text
+                        },
+                        12.,
+                        true,
+                        c.p.ink,
+                        alpha,
+                    )?;
+                    let detail = Area::new(l + 46., y, r - 6., y + 16.);
+                    self.text_at(c, &tile.detail, detail, 11., false, c.p.muted, 0.9)?;
+                }
+                Ok(())
+            }
+            Entry::Player {
+                title,
+                detail,
+                buttons,
+            } => {
+                let (l, t, r, b) = layout.block(index);
+                c.fill(l, t, r, b, 10., c.p.line, 0.055)?;
+                c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
+                let y = (t + b) / 2.;
+                c.fill(l + 8., y - 18., l + 44., y + 18., 8., c.p.line, 0.08)?;
+                let art = Area::new(l + 8., y - 18., l + 44., y + 18.);
+                self.glyph_at(c, PLAYER_GLYPH, art, 16., c.p.muted, 1.)?;
+                let text_right = if buttons.is_empty() {
+                    r - 8.
+                } else {
+                    layout.player_button(index, 0, buttons.len()).0 - 4.
+                };
+                let lines = if detail.is_empty() { 0. } else { 9. };
+                let name = Area::new(l + 54., y - 12. - lines, text_right, y + 12. - lines);
+                self.text_at(c, title, name, menu::LABEL_SIZE, true, c.p.ink, 1.)?;
+                let by = Area::new(l + 54., y, text_right, y + 20.);
+                self.text_at(c, detail, by, menu::DETAIL_SIZE, false, c.p.muted, 0.85)?;
+                for (part, (glyph, command)) in buttons.iter().enumerate() {
+                    let (bl, bt, br, bb) = layout.player_button(index, part, buttons.len());
+                    let alpha = if command.is_some() { 1. } else { 0.35 };
+                    self.glyph_at(c, glyph, Area::new(bl, bt, br, bb), 15., c.p.ink, alpha)?;
+                }
+                Ok(())
+            }
             Entry::Separator => c.fill(
                 row_left + 8.,
                 middle - 0.5,
                 row_right - 8.,
                 middle + 0.5,
                 0.,
-                (255, 255, 255),
+                c.p.line,
                 0.09,
             ),
             Entry::Header {
@@ -229,7 +449,7 @@ impl Renderer {
                         bold: true,
                         ..Text::default()
                     },
-                    INK,
+                    c.p.ink,
                     1.,
                 )?;
                 c.draw_text(
@@ -240,16 +460,16 @@ impl Renderer {
                         size: menu::DETAIL_SIZE,
                         ..Text::default()
                     },
-                    MUTED,
+                    c.p.muted,
                     0.85,
                 )
             }
             Entry::Item(item) => {
                 let enabled = item.command.is_some();
                 let (ink, alpha) = match (item.danger, enabled) {
-                    (_, false) => (MUTED, 0.5),
-                    (true, true) => (DANGER, 1.),
-                    (false, true) => (INK, 1.),
+                    (_, false) => (c.p.muted, 0.5),
+                    (true, true) => (c.p.danger, 1.),
+                    (false, true) => (c.p.ink, 1.),
                 };
                 match &item.icon {
                     Icon::Glyph(glyph) => c.draw_text(
@@ -262,11 +482,18 @@ impl Renderer {
                             align: DWRITE_TEXT_ALIGNMENT_CENTER,
                             ..Text::default()
                         },
-                        if item.danger { DANGER } else { MUTED },
+                        if item.danger { c.p.danger } else { c.p.muted },
                         alpha,
                     )?,
+                    Icon::Choice { glyph, on } => {
+                        self.badge(c, glyph, icon_x, middle, 24., *on)?;
+                    }
                     Icon::Window { active } => {
-                        let (half, color) = if *active { (3.5, MINT) } else { (2.5, MUTED) };
+                        let (half, color) = if *active {
+                            (3.5, c.p.accent)
+                        } else {
+                            (2.5, c.p.muted)
+                        };
                         c.fill(
                             icon_x - half,
                             middle - half,
@@ -321,7 +548,7 @@ impl Renderer {
                         align: DWRITE_TEXT_ALIGNMENT_TRAILING,
                         ..Text::default()
                     },
-                    MUTED,
+                    c.p.muted,
                     0.75 * alpha,
                 )?;
                 if item.checked == Some(true) {
@@ -331,7 +558,7 @@ impl Renderer {
                         "\u{E73E}",
                         c.rect(x - 10., top, x + 10., bottom),
                         13.,
-                        MINT,
+                        c.p.accent,
                     )?;
                 }
                 Ok(())
@@ -353,17 +580,17 @@ impl Renderer {
             Icon::File(path) => self.shell_icon(path).ok().flatten(),
             Icon::Tray(index) => tray(*index).and_then(|icon| self.hicon_bitmap(icon).ok()),
             Icon::Glyph(glyph) => {
-                c.fill(x, y, x + size, y + size, size * 0.28, MINT, 0.16)?;
+                c.fill(x, y, x + size, y + size, size * 0.28, c.p.accent, 0.16)?;
                 c.glyph(
                     &self.write,
                     glyph,
                     c.rect(x, y, x + size, y + size),
                     size * 0.5,
-                    MINT,
+                    c.p.accent,
                 )?;
                 return Ok(true);
             }
-            Icon::None | Icon::Window { .. } => None,
+            Icon::None | Icon::Window { .. } | Icon::Choice { .. } => None,
         };
         match bitmap {
             Some(bitmap) => {
@@ -376,25 +603,26 @@ impl Renderer {
         }
     }
 
-    /// Moves the highlight to entry `index`, sliding from the previous one.
-    pub fn menu_hover(&mut self, index: Option<usize>, danger: bool) -> Result<()> {
+    /// Moves the highlight to an enabled item, button or track.
+    pub fn menu_hover(&mut self, bounds: Option<(f32, f32, f32, f32)>, danger: bool) -> Result<()> {
         let Some(view) = self.menu.as_mut() else {
             return Ok(());
         };
-        if view.hover == index {
-            return Ok(());
-        }
         unsafe {
-            match (view.hover, index) {
-                (_, None) => {
-                    view.glow_fade
-                        .SetOpacity(&ease(&self.device, 1., 0., HOVER_DURATION)?)?
-                }
-                (previous, Some(index)) => {
-                    let y = (view.rows[index].0 * view.scale).round();
+            match bounds {
+                None => view
+                    .glow_fade
+                    .SetOpacity(&ease(&self.device, 1., 0., HOVER_DURATION)?)?,
+                Some((l, t, r, b)) => {
+                    let y = (t * view.scale).round();
+                    view.glow.SetOffsetX2((l * view.scale).round())?;
+                    view.highlight_scale
+                        .SetScaleX2((r - l) / view.highlight_width)?;
+                    view.highlight_scale
+                        .SetScaleY2((b - t) / menu::ITEM_HEIGHT)?;
                     view.glow
                         .SetContent(if danger { &view.danger } else { &view.accent })?;
-                    if previous.is_some() {
+                    if view.highlighted {
                         let from = view.y.now();
                         view.glow
                             .SetOffsetY(&ease(&self.device, from, y, HOVER_DURATION)?)?;
@@ -409,7 +637,7 @@ impl Renderer {
             }
             self.device.Commit()?;
         }
-        view.hover = index;
+        view.highlighted = bounds.is_some();
         Ok(())
     }
 

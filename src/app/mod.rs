@@ -1,29 +1,36 @@
 mod commands;
 mod menus;
 mod settings;
+mod system;
 
 use std::collections::BTreeSet;
 
 use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
+use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::TrayHost;
-use crate::platform::{self, AppBar, Bar, Event, Monitor, shell};
+use crate::platform::{self, AppBar, Bar, Event, Monitor, audio, shell};
 use crate::render::{DockIcon, Renderer, is_device_lost};
 use crate::settings::{Key, Settings};
 use crate::storage;
-use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout};
+use crate::system::Media;
+use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem};
+use crate::ui::system::SystemStatus;
 use windows::core::{Error, Result};
 
 struct Bars {
-    // Unsubscribe first, then release composition targets, the appbar reservation and
-    // the tray host before the bar HWNDs.
+    // Destroy the tray host before removing the AppBar so Shell32 addresses Explorer.
     events: shell::WindowEvents,
     renderer: Option<Renderer>,
     /// Released after the renderer, which drops the panel's composition target first.
     panel: Option<settings::Panel>,
-    appbar: AppBar,
     tray: TrayHost,
+    appbar: AppBar,
+    /// Both audio subscriptions must end before the status HWND is destroyed.
+    audio_watch: Option<audio::AudioWatch>,
+    /// Worker notifications stop before the status window goes away.
+    worker: SystemWorker,
     top: Bar,
     bottom: Bar,
     pins: Vec<PinnedApp>,
@@ -44,6 +51,11 @@ struct Bars {
     /// A left press on a bar dismissed the open menu; its release must not click.
     swallow_click: bool,
     settings: Settings,
+    /// What the status bar's system controls show.
+    system: SystemStatus,
+    media: Option<Media>,
+    /// The system control whose flyout is open, highlighted on the bar.
+    open_flyout: Option<SystemItem>,
     /// Restored after the bars are gone, on exit or when the user turns hiding off.
     native_taskbar: NativeTaskbar,
 }
@@ -84,8 +96,6 @@ pub(crate) fn run() -> Result<()> {
     let _desktop = platform::Desktop::init()?;
     let (top, bottom) = platform::create_bars()?;
     let events = shell::WindowEvents::subscribe(bottom.0)?;
-    let appbar = AppBar::new(top.0);
-    let tray = TrayHost::new()?;
     let hidden = storage::load_hidden().unwrap_or_else(|error| {
         // Unreadable settings leave every icon on the bar; the file is rewritten only
         // when the user changes a choice.
@@ -96,11 +106,14 @@ pub(crate) fn run() -> Result<()> {
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
     let mut native_taskbar = NativeTaskbar::default();
+    let monitor = platform::monitor()?;
+    let mut appbar = AppBar::new(top.0);
+    let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi))?;
     if settings.enabled(Key::HideTaskbar) {
         native_taskbar.hide()?;
     }
     let monitor = platform::monitor()?;
-    let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi));
+    let tray = TrayHost::new()?;
     // The shell may have announced an already full-screen app before registration.
     // Only an application from the window snapshot qualifies (the desktop also fills the screen).
     let fullscreen = apps.iter().any(|app| app.active)
@@ -109,10 +122,20 @@ pub(crate) fn run() -> Result<()> {
         icon: settings.icon_size(),
         gap: settings.dock_gap(),
     };
-    let layout = Layout::new(monitor.work, monitor.dpi, apps.len(), 0, style);
+    let layout = Layout::new(
+        native_taskbar.dock_work_area(&monitor)?,
+        monitor.dpi,
+        apps.len(),
+        0,
+        style,
+    );
     let time = platform::clock(top.0)?;
-    let renderer = Some(Renderer::new(top.0, bottom.0)?);
+    let renderer = Some(Renderer::new(top.0, bottom.0, settings::dark(&settings))?);
+    let audio_watch = audio::AudioWatch::new(top.0).ok();
+    let mut worker = SystemWorker::new(top.0)?;
+    worker.refresh_network()?;
     let mut bars = Bars {
+        worker,
         events,
         renderer,
         panel: None,
@@ -123,7 +146,7 @@ pub(crate) fn run() -> Result<()> {
         pins,
         apps,
         foreground,
-        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0),
+        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0, &[]),
         monitor,
         top_rect,
         fullscreen,
@@ -134,6 +157,10 @@ pub(crate) fn run() -> Result<()> {
         time,
         swallow_click: false,
         settings,
+        system: system::status(Default::default()),
+        media: None,
+        audio_watch,
+        open_flyout: None,
         native_taskbar,
     };
     bars.restatus();
@@ -159,11 +186,11 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Display => bars.display(false)?,
             Event::AppBarMoved => bars.display(true)?,
-            Event::ShellRestart => {
+            Event::ShellRestart if bars.appbar.shell_changed() => {
                 bars.hide_taskbar()?;
-                bars.appbar.register();
-                bars.tray.raise();
                 bars.display(true)?;
+                // Repeat Explorer's notification with our tray host back on top.
+                bars.tray.request_icons()?;
             }
             Event::FullScreen(fullscreen) => {
                 bars.fullscreen = fullscreen;
@@ -178,6 +205,17 @@ pub(crate) fn run() -> Result<()> {
                     bars.time = time;
                     bars.draw()?;
                 }
+                // Network changes have no notification here; the minute tick catches them.
+                bars.refresh_system()?;
+            }
+            Event::Audio => bars.refresh_audio()?,
+            Event::DefaultOutput => {
+                bars.watch_audio();
+                bars.refresh_audio()?;
+            }
+            Event::Power => bars.refresh_power()?,
+            Event::SystemUpdate => {
+                bars.system_updated(bars.top.0)?;
             }
             Event::Move(hwnd, x, y) if hwnd == bars.bottom.0 => {
                 platform::track_leave(hwnd)?;
@@ -202,6 +240,7 @@ pub(crate) fn run() -> Result<()> {
                         false
                     }
                     StatusHit::Overflow => bars.tray_menu()?,
+                    StatusHit::System(item) => bars.flyout(item)?,
                     StatusHit::Clock => bars.clock_menu()?,
                     StatusHit::Title | StatusHit::Bar => bars.bar_menu()?,
                 };
@@ -248,24 +287,32 @@ impl Bars {
         let monitor = platform::monitor()?;
         let replace =
             replace || monitor.bounds != self.monitor.bounds || monitor.dpi != self.monitor.dpi;
-        self.monitor = monitor;
         if replace {
-            self.top_rect = self
-                .appbar
-                .place(self.monitor.bounds, status_height(self.monitor.dpi));
+            self.top_rect = self.tray.with_explorer_taskbar(|| {
+                self.appbar
+                    .place(monitor.bounds, status_height(monitor.dpi))
+            })?;
+            // Only undo a bottom reservation that appeared during this negotiation.
+            // A previously occupied strip can belong to another desktop utility.
+            if monitor.work.y + monitor.work.height == monitor.bounds.y + monitor.bounds.height {
+                self.native_taskbar.refresh_work_area()?;
+            }
         }
+        self.monitor = platform::monitor()?;
         (self.apps, self.foreground) = applications(&self.pins)?;
         self.restatus();
         self.relayout(self.layout.first)?;
         self.position()?;
         self.time = platform::clock(self.top.0)?;
+        // Windows announces a change of its app mode as a setting change.
+        self.apply_theme()?;
         self.draw()?;
         self.relayout_panel()
     }
 
     fn relayout(&mut self, first: usize) -> Result<bool> {
         let layout = Layout::new(
-            self.monitor.work,
+            self.native_taskbar.dock_work_area(&self.monitor)?,
             self.monitor.dpi,
             self.apps.len(),
             first,
@@ -296,6 +343,7 @@ impl Bars {
             self.monitor.dpi,
             self.shown.len(),
             visible,
+            &self.system.items(),
         );
     }
 
@@ -355,7 +403,7 @@ impl Bars {
                 // Release the previous targets before binding a new device to these HWNDs.
                 self.renderer.take();
                 self.renderer = Some(
-                    Renderer::new(self.top.0, self.bottom.0)
+                    Renderer::new(self.top.0, self.bottom.0, self.dark())
                         .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
                 );
                 self.draw_frame()?;
@@ -384,7 +432,21 @@ impl Bars {
                 (icon.icon(), icon.stamp)
             })
             .collect::<Vec<_>>();
-        renderer.draw_top(&self.status, dpi, active, &self.time, &tray)?;
+        let marks = self
+            .status
+            .system
+            .iter()
+            .map(|&(item, _)| self.system.mark(item))
+            .collect::<Vec<_>>();
+        renderer.draw_top(
+            &self.status,
+            dpi,
+            active,
+            &self.time,
+            &tray,
+            &marks,
+            self.open_flyout,
+        )?;
         let icons = self
             .layout
             .slots

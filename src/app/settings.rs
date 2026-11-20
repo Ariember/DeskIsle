@@ -2,9 +2,9 @@
 //! bars, the system and the settings file.
 
 use super::Bars;
-use crate::platform::{self, Event, PanelKey, PanelWindow, startup};
+use crate::platform::{self, Event, PanelKey, PanelWindow, display, startup};
 use crate::render::is_device_lost;
-use crate::settings::{Key, SCHEMA, SECTIONS, Settings, Store};
+use crate::settings::{Key, SCHEMA, SECTIONS, Settings, Store, Theme};
 use crate::storage;
 use crate::ui::layout::DockStyle;
 use crate::ui::panel::{Action, Nav, PanelLayout, PanelState};
@@ -44,6 +44,16 @@ pub(super) fn load() -> Settings {
     settings
 }
 
+/// Whether to draw with the dark palette. An unreadable system preference counts as
+/// light, the mode Windows itself assumes without one.
+pub(super) fn dark(settings: &Settings) -> bool {
+    match settings.theme() {
+        Theme::System => display::system_dark().unwrap_or(false),
+        Theme::Light => false,
+        Theme::Dark => true,
+    }
+}
+
 fn nav(key: PanelKey) -> Option<Nav> {
     Some(match key {
         PanelKey::Tab { back: false } | PanelKey::Down => Nav::Next,
@@ -66,6 +76,29 @@ impl Bars {
         }
     }
 
+    pub(super) fn dark(&self) -> bool {
+        dark(&self.settings)
+    }
+
+    /// Switches the palette after the theme setting or Windows' app mode changed. The
+    /// bars repaint on their next draw; the open panel repaints here.
+    pub(super) fn apply_theme(&mut self) -> Result<()> {
+        let dark = self.dark();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        if !renderer.set_dark(dark) {
+            return Ok(());
+        }
+        match &self.panel {
+            Some(panel) => {
+                panel.window.set_dark(dark);
+                self.draw_panel()
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Message boxes belong to the panel while it is open.
     fn settings_owner(&self) -> HWND {
         self.panel
@@ -82,7 +115,11 @@ impl Bars {
         let dpi = self.monitor.dpi;
         let mut state = PanelState::default();
         let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work.height);
-        let window = PanelWindow::create(layout.place(self.monitor.work), layout.caption_pixels())?;
+        let window = PanelWindow::create(
+            layout.place(self.monitor.work),
+            layout.caption_pixels(),
+            self.dark(),
+        )?;
         self.panel = Some(Panel {
             window,
             state,
@@ -201,10 +238,14 @@ impl Bars {
     fn apply_settings(&mut self, next: Settings) -> Result<()> {
         let previous = std::mem::replace(&mut self.settings, next);
         let changed: Vec<_> = self.settings.changed(&previous).collect();
-        let (mut relayout, mut redisplay, mut save) = (false, false, false);
+        let (mut relayout, mut redisplay, mut save, mut retheme) = (false, false, false, false);
         for spec in changed {
             let enabled = self.settings.enabled(spec.key);
             let result = match spec.key {
+                Key::Theme => {
+                    retheme = true;
+                    Ok(())
+                }
                 Key::IconSize | Key::DockGap => {
                     relayout = true;
                     Ok(())
@@ -232,11 +273,16 @@ impl Bars {
             // The change still applies for this session.
             platform::report_error(Some(self.settings_owner()), &error);
         }
+        if retheme {
+            self.apply_theme()?;
+        }
         if redisplay {
             // Showing or hiding the taskbar changes the work area the Dock sits in.
             self.display(false)
         } else if relayout {
             self.relayout(self.layout.first)?;
+            self.draw()
+        } else if retheme {
             self.draw()
         } else {
             Ok(())

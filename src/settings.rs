@@ -6,6 +6,7 @@
 /// [`Settings`]; the panel and the settings file go through [`SCHEMA`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
+    Theme,
     IconSize,
     DockGap,
     HoverZoom,
@@ -16,16 +17,18 @@ pub enum Key {
 /// A page of the settings panel, in navigation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    Appearance,
     Dock,
     System,
 }
 
-pub const SECTIONS: &[Section] = &[Section::Dock, Section::System];
+pub const SECTIONS: &[Section] = &[Section::Appearance, Section::Dock, Section::System];
 
 impl Section {
     pub fn title(self) -> &'static str {
         match self {
-            Section::Dock => "Dock 外观",
+            Section::Appearance => "外观",
+            Section::Dock => "Dock",
             Section::System => "系统行为",
         }
     }
@@ -33,6 +36,7 @@ impl Section {
     /// A Segoe Fluent Icons code point for the navigation list.
     pub fn glyph(self) -> &'static str {
         match self {
+            Section::Appearance => "\u{E790}",
             Section::Dock => "\u{E771}",
             Section::System => "\u{E770}",
         }
@@ -98,7 +102,41 @@ pub const HOVER_ZOOM: &[Choice] = &[
     },
 ];
 
+/// The colors DeskIsle draws with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Theme {
+    /// Follows Windows' app mode and switches when it changes.
+    System,
+    Light,
+    Dark,
+}
+
+pub const THEMES: &[Choice] = &[
+    Choice {
+        id: "system",
+        label: "跟随系统",
+    },
+    Choice {
+        id: "light",
+        label: "浅色",
+    },
+    Choice {
+        id: "dark",
+        label: "深色",
+    },
+];
+
 pub const SCHEMA: &[Spec] = &[
+    Spec {
+        key: Key::Theme,
+        id: "appearance.theme",
+        section: Section::Appearance,
+        label: "颜色主题",
+        help: "双栏、菜单和设置面板的黑白配色",
+        control: Control::Choice(THEMES),
+        default: 0,
+        store: Store::File,
+    },
     Spec {
         key: Key::IconSize,
         id: "dock.icon_size",
@@ -322,6 +360,10 @@ impl Settings {
         self.get(Key::DockGap)
     }
 
+    pub fn theme(&self) -> Theme {
+        [Theme::System, Theme::Light, Theme::Dark][self.get(Key::Theme) as usize]
+    }
+
     /// The scale of a hovered Dock icon.
     pub fn hover_scale(&self) -> f32 {
         [1.0, 1.12, 1.24][self.get(Key::HoverZoom) as usize]
@@ -380,6 +422,8 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(settings.set_text("dock.icon_size", "40"), Ok(()));
         assert_eq!(settings.set_text("dock.hover_zoom", "subtle"), Ok(()));
+        assert_eq!(settings.set_text("appearance.theme", "dark"), Ok(()));
+        assert_eq!(settings.theme(), Theme::Dark);
         assert_eq!(settings.set_text("future.option", "x"), Ok(()));
         assert!(settings.set_text("dock.bottom_gap", "999").is_err());
         assert!(settings.set_text("system.hide_taskbar", "yes").is_err());

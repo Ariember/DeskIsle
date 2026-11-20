@@ -175,9 +175,13 @@ impl TrayHost {
             // Applications add their icons again on TaskbarCreated, now through this host.
             // UIPI keeps the broadcast from elevated processes; their icons appear on their
             // next update.
-            SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0))?;
+            host.request_icons()?;
             Ok(host)
         }
+    }
+
+    pub fn request_icons(&self) -> Result<()> {
+        unsafe { SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0)) }
     }
 
     /// Keeps this host first for `FindWindow`. Explorer raises its taskbar when the user
@@ -199,6 +203,26 @@ impl TrayHost {
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             )
         };
+    }
+
+    /// Shell32 looks up Shell_TrayWnd when negotiating an AppBar. Its position
+    /// requests use memory shared with that process, so Explorer must receive
+    /// them directly, including after a display change or Explorer restart.
+    pub fn with_explorer_taskbar<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )?;
+        }
+        let result = action();
+        self.raise();
+        result
     }
 
     pub fn icons(&self) -> &[TrayIcon] {

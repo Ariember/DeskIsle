@@ -7,6 +7,7 @@ mod platform;
 mod render;
 mod settings;
 mod storage;
+mod system;
 mod ui;
 
 fn main() -> std::process::ExitCode {

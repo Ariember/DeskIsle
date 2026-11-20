@@ -1,5 +1,11 @@
+pub mod audio;
+pub mod display;
+pub mod media;
+pub mod network;
+pub mod power;
 pub mod shell;
 pub mod startup;
+pub mod system_worker;
 pub mod taskbar;
 pub mod tray;
 
@@ -16,7 +22,11 @@ use windows::Win32::{
         },
         Gdi::*,
     },
-    System::{Com::*, LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemInformation::GetLocalTime,
+        WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
+    },
     UI::{
         Controls::MARGINS,
         HiDpi::*,
@@ -36,7 +46,7 @@ impl Desktop {
     pub fn init() -> Result<Self> {
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            RoInitialize(RO_INIT_SINGLETHREADED)?;
         }
         Ok(Self)
     }
@@ -44,7 +54,7 @@ impl Desktop {
 
 impl Drop for Desktop {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        unsafe { RoUninitialize() };
     }
 }
 
@@ -148,7 +158,6 @@ pub fn monitor() -> Result<Monitor> {
         if work.width <= 0 || work.height <= 0 || bounds.width <= 0 || dpi == 0 {
             return Err(Error::new(E_FAIL, "显示器未提供有效的工作区或 DPI"));
         }
-        let work = taskbar::dock_work_area(bounds, work);
         Ok(Monitor { bounds, work, dpi })
     }
 }
@@ -157,13 +166,16 @@ pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 
 /// Reserves the top edge of the primary monitor for the status bar, so maximized
 /// windows keep their caption buttons below it.
-pub struct AppBar(HWND);
+pub struct AppBar {
+    hwnd: HWND,
+    explorer: Option<(HWND, u32)>,
+}
 
 impl AppBar {
     fn data(&self) -> APPBARDATA {
         APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: self.0,
+            hWnd: self.hwnd,
             uCallbackMessage: APPBAR_CHANGED,
             uEdge: ABE_TOP,
             ..Default::default()
@@ -172,50 +184,87 @@ impl AppBar {
 
     /// `hwnd` is the status bar and outlives the registration.
     pub fn new(hwnd: HWND) -> Self {
-        let bar = Self(hwnd);
-        bar.register();
-        bar
+        Self {
+            hwnd,
+            explorer: None,
+        }
     }
 
-    /// Registers again after Explorer restarts. Without Explorer, or when the bar is
-    /// already registered, the shell returns FALSE and the bar keeps its position.
-    pub fn register(&self) {
+    fn shell_id(tray: HWND) -> (HWND, u32) {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(tray, Some(&mut pid)) };
+        (tray, pid)
+    }
+
+    pub fn shell_changed(&self) -> bool {
+        self.explorer != taskbar::explorer_tray().map(Self::shell_id)
+    }
+
+    fn register(&mut self, id: (HWND, u32)) -> Result<()> {
+        if self.explorer == Some(id) {
+            return Ok(());
+        }
         let mut data = self.data();
-        unsafe { SHAppBarMessage(ABM_NEW, &mut data) };
+        if unsafe { SHAppBarMessage(ABM_NEW, &mut data) } == 0 {
+            return Err(Error::new(E_FAIL, "Explorer 未注册顶部状态栏"));
+        }
+        self.explorer = Some(id);
+        Ok(())
     }
 
-    /// Returns the strip granted along the top edge, or the requested strip when the
-    /// shell does not answer.
-    pub fn place(&self, bounds: Rect, height: i32) -> Rect {
+    /// Returns the strip Explorer granted along the top edge.
+    pub fn place(&mut self, bounds: Rect, height: i32) -> Result<Rect> {
         let requested = RECT {
             left: bounds.x,
             top: bounds.y,
             right: bounds.x + bounds.width,
             bottom: bounds.y + height,
         };
+        // Explorer may be between instances at logon or during a restart.
+        // TaskbarCreated will negotiate the actual reservation once it is ready.
+        let Some(tray) = taskbar::explorer_tray() else {
+            self.explorer = None;
+            return Ok(to_rect(requested));
+        };
+        let id = Self::shell_id(tray);
+        match self.reserve(id, requested, height) {
+            Err(_) if taskbar::explorer_tray().map(Self::shell_id) != Some(id) => {
+                self.explorer = None;
+                Ok(to_rect(requested))
+            }
+            result => result,
+        }
+    }
+
+    fn reserve(&mut self, id: (HWND, u32), requested: RECT, height: i32) -> Result<Rect> {
+        self.register(id)?;
         let mut data = self.data();
         data.rc = requested;
         unsafe {
             if SHAppBarMessage(ABM_QUERYPOS, &mut data) == 0 {
-                return to_rect(requested);
+                return Err(Error::new(E_FAIL, "无法查询顶部状态栏的可用位置"));
             }
             // QUERYPOS moves the strip below other top-edge appbars; keep our own height.
             data.rc.bottom = data.rc.top + height;
-            SHAppBarMessage(ABM_SETPOS, &mut data);
+            if SHAppBarMessage(ABM_SETPOS, &mut data) == 0 {
+                return Err(Error::new(E_FAIL, "Explorer 未预留顶部状态栏工作区"));
+            }
         }
         let granted = to_rect(data.rc);
         if granted.width <= 0 || granted.height <= 0 {
-            to_rect(requested)
+            Err(Error::new(E_FAIL, "Explorer 返回了无效的顶部状态栏位置"))
         } else {
-            granted
+            Ok(granted)
         }
     }
 }
 
 impl Drop for AppBar {
     fn drop(&mut self) {
-        let mut data = self.data();
-        unsafe { SHAppBarMessage(ABM_REMOVE, &mut data) };
+        if self.explorer.is_some() {
+            let mut data = self.data();
+            unsafe { SHAppBarMessage(ABM_REMOVE, &mut data) };
+        }
     }
 }
 
@@ -244,6 +293,8 @@ impl Bar {
 pub enum MenuKey {
     Down,
     Up,
+    Left,
+    Right,
     Home,
     End,
     Select,
@@ -285,6 +336,8 @@ pub enum Event {
     Press(HWND, bool),
     /// Pointer input in the open menu window, in its client pixels.
     MenuMove(i32, i32),
+    /// The left button went down in the menu, which may start dragging a slider.
+    MenuPress(i32, i32),
     MenuLeave,
     MenuPick(i32, i32),
     MenuKey(MenuKey),
@@ -297,6 +350,14 @@ pub enum Event {
     /// Explorer started again and expects appbars and tray icons to register.
     ShellRestart,
     Tray,
+    /// The default output's volume or mute changed.
+    Audio,
+    /// The worker completed a network or media request.
+    SystemUpdate,
+    /// Windows selected a different default playback endpoint (possibly none).
+    DefaultOutput,
+    /// The power source or battery charge changed.
+    Power,
     Scroll(i16),
     /// Pointer input in the settings panel, in its client pixels.
     PanelMove(i32, i32),
@@ -315,6 +376,7 @@ impl Event {
         matches!(
             self,
             Event::MenuMove(..)
+                | Event::MenuPress(..)
                 | Event::MenuLeave
                 | Event::MenuPick(..)
                 | Event::MenuKey(_)
@@ -356,6 +418,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         shell::WINDOWS_CHANGED => Event::Refresh,
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => Event::Display,
+        WM_POWERBROADCAST if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize => Event::Power,
+        audio::AUDIO_CHANGED if wp.0 != 0 => Event::DefaultOutput,
+        audio::AUDIO_CHANGED => Event::Audio,
+        system_worker::UPDATED => Event::SystemUpdate,
         m if m != 0 && m == TASKBAR_CREATED.get() => Event::ShellRestart,
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),
@@ -384,10 +450,12 @@ fn queue(hwnd: HWND, event: Event) {
             || matches!(
                 event,
                 Event::Click(..)
+                    | Event::SystemUpdate
                     | Event::RightClick(..)
                     | Event::Press(..)
                     | Event::Scroll(_)
                     | Event::MenuPick(..)
+                    | Event::MenuPress(..)
                     | Event::MenuKey(_)
                     | Event::PanelClick(..)
                     | Event::PanelScroll(_)
@@ -500,6 +568,31 @@ impl MenuWindow {
     pub fn is_foreground(&self) -> bool {
         unsafe { GetForegroundWindow() == self.0 }
     }
+
+    /// Keeps pointer input coming while a slider is dragged outside the menu.
+    pub fn capture(&self) {
+        unsafe { SetCapture(self.0) };
+    }
+
+    pub fn release(&self) {
+        let _ = unsafe { ReleaseCapture() };
+    }
+
+    /// Moves and resizes the menu after its content changed, in screen pixels.
+    pub fn place(&self, r: Rect) {
+        // A failed move leaves the old size; the next rebuild tries again.
+        let _ = unsafe {
+            SetWindowPos(
+                self.0,
+                Some(HWND_TOPMOST),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                SWP_NOACTIVATE,
+            )
+        };
+    }
 }
 
 impl Drop for MenuWindow {
@@ -524,10 +617,15 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             Event::MenuMove(x, y)
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::MenuLeave,
+        WM_LBUTTONDOWN => Event::MenuPress(x, y),
         WM_LBUTTONUP | WM_RBUTTONUP => Event::MenuPick(x, y),
         WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
             VK_DOWN => MenuKey::Down,
             VK_UP => MenuKey::Up,
+            VK_TAB if (unsafe { GetKeyState(VK_SHIFT.0 as i32) }) < 0 => MenuKey::Up,
+            VK_TAB => MenuKey::Down,
+            VK_LEFT => MenuKey::Left,
+            VK_RIGHT => MenuKey::Right,
             VK_HOME => MenuKey::Home,
             VK_END => MenuKey::End,
             VK_RETURN | VK_SPACE => MenuKey::Select,
@@ -549,7 +647,7 @@ pub struct PanelWindow(pub HWND);
 impl PanelWindow {
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
     /// height and the left edge of the close button, in client pixels.
-    pub fn create(r: Rect, caption: (i32, i32)) -> Result<Self> {
+    pub fn create(r: Rect, caption: (i32, i32), dark: bool) -> Result<Self> {
         PANEL_CAPTION.set(caption);
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -567,14 +665,9 @@ impl PanelWindow {
                 Some(instance.into()),
                 None,
             )?;
-            // Cosmetic only: builds without these attributes keep square corners.
-            let dark = BOOL::from(true);
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&raw const dark).cast(),
-                size_of::<BOOL>() as u32,
-            );
+            let window = Self(hwnd);
+            window.set_dark(dark);
+            // Cosmetic only: builds without this attribute keep square corners.
             let round = DWMWCP_ROUND;
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -589,8 +682,22 @@ impl PanelWindow {
                 cyBottomHeight: 1,
             };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-            Ok(Self(hwnd))
+            Ok(window)
         }
+    }
+
+    /// Matches the frame DWM draws around the panel, such as its border, to the palette.
+    pub fn set_dark(&self, dark: bool) {
+        let dark = BOOL::from(dark);
+        // Cosmetic only: older builds ignore the attribute.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.0,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const dark).cast(),
+                size_of::<BOOL>() as u32,
+            )
+        };
     }
 
     /// Shows the panel, or brings it back to the front when it is already open.
