@@ -6,6 +6,8 @@
 //! icons it receives and forwards registrations to Explorer. The system tray keeps
 //! working while DeskIsle runs and after it exits.
 
+mod attention;
+mod filter;
 mod menu;
 mod placement;
 
@@ -18,6 +20,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -26,6 +30,7 @@ use windows::core::{Error, GUID, Result, w};
 use super::taskbar::explorer_tray;
 use super::{Event, TASKBAR_CREATED, queue, shell};
 use crate::geometry::Rect;
+use attention::{Attention, Pixels};
 
 // shellapi.h. Shell32 sends the 32-bit layout to the tray from 32- and 64-bit callers.
 const TRAY_SIGNATURE: u32 = 0x3475_3423;
@@ -38,6 +43,7 @@ const NIF_MESSAGE: u32 = 0x01;
 const NIF_ICON: u32 = 0x02;
 const NIF_TIP: u32 = 0x04;
 const NIF_STATE: u32 = 0x08;
+const NIF_INFO: u32 = 0x10;
 const NIF_GUID: u32 = 0x20;
 const NIS_HIDDEN: u32 = 0x01;
 const NIN_SELECT: u32 = WM_USER;
@@ -87,6 +93,8 @@ impl Drop for OwnedIcon {
 }
 
 struct Notify {
+    received: Instant,
+    balloon: bool,
     message: u32,
     owner: isize,
     id: u32,
@@ -109,27 +117,58 @@ pub struct TrayIcon {
     /// Stable across runs: executable path plus the icon's GUID or ID.
     pub key: String,
     pub label: String,
-    /// Changes whenever the image or tooltip changes.
+    /// Changes when the displayed image or attention mark changes.
     pub stamp: u64,
     registration: u64,
+    attention: Attention,
     icon: Option<OwnedIcon>,
     owner: isize,
     id: u32,
     guid: Option<GUID>,
+    system_indicator: bool,
     callback: u32,
     version: u32,
     state: u32,
 }
 
 impl TrayIcon {
+    pub fn needs_attention(&self) -> bool {
+        self.attention.unread
+    }
+
+    fn set_image(
+        &mut self,
+        image: Option<OwnedIcon>,
+        received: Instant,
+        factory: &IWICImagingFactory,
+    ) -> bool {
+        if self.system_indicator {
+            return false;
+        }
+        let pixels = match &image {
+            None => Some(Pixels::default()),
+            Some(icon) => Pixels::read(factory, icon.0),
+        };
+        if let Some(pixels) = pixels {
+            if !self.attention.frame(pixels, received) {
+                return false;
+            }
+        } else {
+            // Failed to compare this image. Keep normal dynamic icon rendering.
+            self.attention.reset_frames();
+        }
+        self.icon = image;
+        true
+    }
+
     /// Owned by the tray host; valid until the next [`TrayHost::update`].
     pub fn icon(&self) -> Option<HICON> {
         self.icon.as_ref().map(|icon| icon.0)
     }
 
-    /// Applications hide an icon with `NIS_HIDDEN` while keeping it registered.
+    /// Application icons available to the bar and its overflow menu.
     pub fn visible(&self) -> bool {
-        self.state & NIS_HIDDEN == 0
+        !self.system_indicator && self.state & NIS_HIDDEN == 0
     }
 
     fn matches(&self, n: &Notify) -> bool {
@@ -142,6 +181,7 @@ impl TrayIcon {
 }
 
 pub struct TrayHost {
+    imaging: IWICImagingFactory,
     hwnd: HWND,
     icons: Vec<TrayIcon>,
     next_stamp: u64,
@@ -171,6 +211,7 @@ impl TrayHost {
     /// Call on the UI thread after `create_bars` registered the TaskbarCreated message.
     pub fn new() -> Result<Self> {
         unsafe {
+            let imaging = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
             let instance = GetModuleHandleW(None)?.into();
             let class = w!("Shell_TrayWnd");
             let wc = WNDCLASSW {
@@ -197,6 +238,7 @@ impl TrayHost {
                 None,
             )?;
             let host = Self {
+                imaging,
                 hwnd,
                 icons: Vec::new(),
                 next_stamp: 0,
@@ -315,22 +357,32 @@ impl TrayHost {
                 false
             }
             (NIM_MODIFY, Some(i)) => {
-                self.next_stamp += 1;
                 let icon = &mut self.icons[i];
-                icon.stamp = self.next_stamp;
+                let was_unread = icon.needs_attention();
+                let mut changed = false;
                 if n.flags & NIF_MESSAGE != 0 {
                     icon.callback = n.callback;
                 }
-                if n.flags & NIF_ICON != 0 {
-                    icon.icon = n.icon;
+                if n.balloon {
+                    icon.attention.notify(n.received);
                 }
-                if n.flags & NIF_TIP != 0 && !n.tip.is_empty() {
-                    icon.label = n.tip;
+                if n.flags & NIF_ICON != 0 {
+                    changed |= icon.set_image(n.icon, n.received, &self.imaging);
+                }
+                if n.flags & NIF_TIP != 0 {
+                    icon.attention.tooltip(&mut icon.label, n.tip, n.received);
                 }
                 if n.flags & NIF_STATE != 0 {
+                    let visible = icon.visible();
                     icon.state = (icon.state & !n.state_mask) | (n.state & n.state_mask);
+                    changed |= visible != icon.visible();
                 }
-                true
+                changed |= was_unread != icon.needs_attention();
+                if changed {
+                    self.next_stamp += 1;
+                    icon.stamp = self.next_stamp;
+                }
+                changed
             }
             // DeskIsle may start after an icon was added. Accept the first update that
             // carries an image so icons from applications ignoring TaskbarCreated appear.
@@ -351,7 +403,7 @@ impl TrayHost {
                 } else {
                     0
                 };
-                let icon = TrayIcon {
+                let mut icon = TrayIcon {
                     key: format!(
                         "{}|{ident}",
                         exe.map(|p| p.to_string_lossy().to_lowercase())
@@ -360,10 +412,12 @@ impl TrayHost {
                     label,
                     stamp: self.next_stamp,
                     registration: self.next_stamp,
-                    icon: n.icon,
+                    attention: Attention::default(),
+                    icon: None,
                     owner: n.owner,
                     id: n.id,
                     guid,
+                    system_indicator: filter::is_system_indicator(guid, HWND(n.owner as _)),
                     callback: if n.flags & NIF_MESSAGE != 0 {
                         n.callback
                     } else {
@@ -372,6 +426,10 @@ impl TrayHost {
                     version: 0,
                     state,
                 };
+                icon.attention.unread = n.balloon;
+                if n.flags & NIF_ICON != 0 {
+                    icon.set_image(n.icon, n.received, &self.imaging);
+                }
                 if let Some(index) = found {
                     self.icons[index] = icon;
                 } else {
@@ -384,8 +442,9 @@ impl TrayHost {
     }
 
     /// Activates an app window or forwards the click. `at` is a screen-pixel menu anchor.
-    /// Returns whether the icon list changed because its owner had closed.
+    /// Returns whether the visible tray changed after activation or acknowledgement.
     pub fn click(&mut self, index: usize, right: bool, at: POINT) -> Result<bool> {
+        let clicked_at = Instant::now();
         self.cancel_click();
         let icon = &self.icons[index];
         let pid = shell::window_process(HWND(icon.owner as _));
@@ -402,10 +461,10 @@ impl TrayHost {
         if let Some(windows) = &mut previous_windows {
             let root = unsafe { GetAncestor(foreground, GA_ROOTOWNER) };
             if windows.contains(&foreground) || windows.contains(&root) {
-                return Ok(false);
+                return Ok(self.acknowledge(index, clicked_at));
             }
             if icon.callback == 0 && shell::activate_tray_window(pid, windows)? {
-                return Ok(false);
+                return Ok(self.acknowledge(index, clicked_at));
             }
             windows.retain(|&hwnd| !unsafe { IsIconic(hwnd) }.as_bool());
         }
@@ -445,7 +504,17 @@ impl TrayHost {
                 deadline: Instant::now() + Duration::from_millis(u64::from(ACTIVATION_WAIT_MS)),
             });
         }
-        Ok(changed)
+        Ok(changed || (!right && self.acknowledge(index, clicked_at)))
+    }
+
+    fn acknowledge(&mut self, index: usize, clicked_at: Instant) -> bool {
+        let icon = &mut self.icons[index];
+        if icon.attention.acknowledge(clicked_at) {
+            self.next_stamp += 1;
+            icon.stamp = self.next_stamp;
+            return true;
+        }
+        false
     }
 
     pub fn cancel_click(&mut self) {
@@ -659,18 +728,25 @@ unsafe fn parse(data: &COPYDATASTRUCT) -> Option<Notify> {
     if message.signature != TRAY_SIGNATURE || message.message > NIM_SETVERSION {
         return None;
     }
-    let n = message.data;
+    let mut n = message.data;
     let icon = if n.flags & NIF_ICON != 0 && n.icon != 0 {
         // Handles are 32-bit values shared across processes; sign-extend them. The sender
         // may destroy its icon as soon as this message returns, so copy it now.
-        unsafe { CopyIcon(HICON(n.icon as i32 as isize as *mut c_void)) }
-            .ok()
-            .map(OwnedIcon)
+        match unsafe { CopyIcon(HICON(n.icon as i32 as isize as *mut c_void)) } {
+            Ok(icon) => Some(OwnedIcon(icon)),
+            Err(_) => {
+                // A stale handle is not an intentional blank phase.
+                n.flags &= !NIF_ICON;
+                None
+            }
+        }
     } else {
         None
     };
     let end = n.tip.iter().position(|&c| c == 0).unwrap_or(n.tip.len());
     Some(Notify {
+        received: Instant::now(),
+        balloon: n.flags & NIF_INFO != 0 && n.info[0] != 0,
         message: message.message,
         owner: n.hwnd as i32 as isize,
         id: n.id,
@@ -727,6 +803,15 @@ mod tests {
 
     #[test]
     fn unhandled_left_click_completes_double_click_before_requesting_menu() -> Result<()> {
+        use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe { RoUninitialize() };
+            }
+        }
+        unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
+        let _apartment = Apartment;
         // A message-only owner receives the same posted callbacks as a tray application,
         // without creating a taskbar host or changing the desktop's foreground window.
         let owner = unsafe {
@@ -747,12 +832,17 @@ mod tests {
         };
         const CALLBACK: u32 = WM_APP + 125;
         let mut host = TrayHost {
+            imaging: unsafe {
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?
+            },
             hwnd: owner,
             icons: Vec::new(),
             next_stamp: 0,
             activation: None,
         };
         let registration = || Notify {
+            received: Instant::now(),
+            balloon: false,
             message: NIM_ADD,
             owner: owner.0 as isize,
             id: 77,
@@ -779,7 +869,15 @@ mod tests {
             events
         };
         let anchor = POINT { x: -250, y: 48 };
-        host.click(0, false, anchor)?;
+        let balloon = || Notify {
+            message: NIM_MODIFY,
+            balloon: true,
+            ..registration()
+        };
+        assert!(host.apply(balloon()));
+        assert!(host.icons[0].needs_attention());
+        assert!(host.click(0, false, anchor)?);
+        assert!(!host.icons[0].needs_attention());
         let pending = host.activation.as_ref().unwrap();
         let (later, foreground) = (pending.deadline, pending.foreground);
         let first = receive();
@@ -806,6 +904,8 @@ mod tests {
         assert!(receive().is_empty());
 
         // Single-click handlers can foreground a window belonging to a helper process.
+        assert!(host.apply(balloon()));
+        assert!(host.icons[0].needs_attention());
         host.click(0, false, anchor)?;
         receive();
         let pending = host.activation.as_ref().unwrap();

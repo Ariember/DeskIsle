@@ -263,10 +263,16 @@ impl Canvas {
         Ok(())
     }
 
-    pub(super) fn panel(&self, w: f32, h: f32, radius: f32) -> Result<()> {
-        let p = self.p;
-        self.gradient(0., 0., w, h, radius, (p.panel_top, 0.97), (p.panel, 0.97))?;
-        self.stroke(0., 0., w, h, radius, p.line, 0.11)
+    pub(super) fn bar_glass(&self, w: f32, h: f32, radius: f32) -> Result<()> {
+        self.gradient(
+            0.,
+            0.,
+            w,
+            h,
+            radius,
+            (self.p.panel_top, 0.74),
+            (self.p.bar, 0.64),
+        )
     }
 
     /// Runs `draw` with output limited to `rect`.

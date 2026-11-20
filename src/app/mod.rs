@@ -11,7 +11,7 @@ use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::TrayHost;
 use crate::platform::{self, AppBar, Bar, Event, Monitor, audio, shell};
-use crate::render::{DockIcon, Renderer, is_device_lost};
+use crate::render::{DockIcon, Renderer, TrayImage, is_device_lost};
 use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
@@ -493,7 +493,11 @@ impl Bars {
             .iter()
             .map(|slot| {
                 let icon = &icons[self.shown[slot.index]];
-                (icon.icon(), icon.stamp)
+                TrayImage {
+                    icon: icon.icon(),
+                    stamp: icon.stamp,
+                    needs_attention: icon.needs_attention(),
+                }
             })
             .collect::<Vec<_>>();
         let marks = self

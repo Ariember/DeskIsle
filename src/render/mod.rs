@@ -52,6 +52,12 @@ pub struct DockIcon<'a> {
     pub active: bool,
 }
 
+pub struct TrayImage {
+    pub icon: Option<HICON>,
+    pub stamp: u64,
+    pub needs_attention: bool,
+}
+
 type Dimensions = (i32, i32, u32);
 
 pub struct Renderer {
@@ -234,7 +240,7 @@ impl Renderer {
         }
     }
 
-    /// `icons[i]` is drawn in `layout.tray[i]`; the stamp identifies its current image.
+    /// Each stamp identifies the current tray image and its attention indicator.
     /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the control
     /// whose flyout is `open`.
     #[allow(clippy::too_many_arguments)]
@@ -244,7 +250,7 @@ impl Renderer {
         dpi: u32,
         title: &str,
         time: &str,
-        icons: &[(Option<HICON>, u64)],
+        icons: &[TrayImage],
         marks: &[Mark],
         open: Option<SystemItem>,
     ) -> Result<()> {
@@ -253,7 +259,7 @@ impl Renderer {
             dpi,
             title: title.into(),
             time: time.into(),
-            stamps: icons.iter().map(|&(_, stamp)| stamp).collect(),
+            stamps: icons.iter().map(|image| image.stamp).collect(),
             marks: marks.to_vec(),
             open,
         };
@@ -271,9 +277,8 @@ impl Renderer {
             layout.height,
             dpi,
             |c| {
-                // Flush with the screen edge: a solid strip with a hairline toward the desktop.
-                c.round(0., 0., w, h, 0., c.p.bar)?;
-                c.round(0., h - 1., w, h, 0., c.p.edge)?;
+                c.bar_glass(w, h, 0.)?;
+                c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.16)?;
                 c.round(13., h / 2. - 5., 17., h / 2. + 5., 2., c.p.accent)?;
                 c.round(19., h / 2. - 2., 23., h / 2. + 5., 2., c.p.accent)?;
                 let t = layout.title;
@@ -286,9 +291,9 @@ impl Renderer {
                     c.p.ink,
                 )?;
                 let icon_size = (16. * s).round();
-                for (slot, &(icon, _)) in layout.tray.iter().zip(icons) {
+                for (slot, image) in layout.tray.iter().zip(icons) {
                     let r = slot.rect;
-                    let bitmap = icon.and_then(|icon| self.hicon_bitmap(icon).ok());
+                    let bitmap = image.icon.and_then(|icon| self.hicon_bitmap(icon).ok());
                     match bitmap {
                         Some(bitmap) => {
                             let left = (r.x as f32 + (r.width as f32 - icon_size) / 2.).round();
@@ -300,6 +305,12 @@ impl Renderer {
                             let x = dip(r.x + r.width / 2);
                             c.round(x - 3., h / 2. - 3., x + 3., h / 2. + 3., 3., c.p.muted)?
                         }
+                    }
+                    if image.needs_attention {
+                        let x = dip(r.x + r.width / 2) + 7.;
+                        let y = h / 2. - 7.;
+                        c.round(x - 3.5, y - 3.5, x + 3.5, y + 3.5, 3.5, c.p.bar)?;
+                        c.round(x - 2.5, y - 2.5, x + 2.5, y + 2.5, 2.5, c.p.danger)?;
                     }
                 }
                 if let Some(r) = layout.overflow {
@@ -390,7 +401,8 @@ impl Renderer {
             let w = width as f32 / s;
             let h = height as f32 / s;
             let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-                c.panel(w, h, 18.)?;
+                c.bar_glass(w, h, 18.)?;
+                c.stroke(0., 0., w, h, 18., c.p.line, 0.16)?;
                 for icon in items.iter().filter(|i| i.running) {
                     let x = icon.center_x as f32 / s;
                     let half = if icon.active { 5. } else { 2. };
