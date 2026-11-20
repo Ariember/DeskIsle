@@ -7,8 +7,9 @@ use windows::Win32::{
 };
 use windows::core::Result;
 
+use crate::ui::calendar::{self, Note};
 use crate::ui::icon::Symbol;
-use crate::ui::menu::{self, Entry, Icon, Menu, MenuLayout, Slider};
+use crate::ui::menu::{self, Calendar, Entry, Icon, Menu, MenuLayout, Slider};
 use crate::ui::panel::Area;
 use crate::ui::system::PLAYER_SYMBOL;
 
@@ -26,10 +27,17 @@ const BADGE_ICON: f32 = 0.58;
 /// A tray icon's image inside its round backing. Application images fill their
 /// square, so they are drawn a little larger than DeskIsle's line icons.
 const TRAY_BADGE_ICON: f32 = 16.;
+/// The circle behind a tray icon the user keeps on the status bar. The menu palette is
+/// monochrome, so its `accent` is near black (or white) and would swallow colorful
+/// application icons; this is the same system blue the settings panel uses.
+const TRAY_ON_LIGHT: Rgb = (0, 122, 255);
+const TRAY_ON_DARK: Rgb = (10, 132, 255);
 /// The icon at the start of a slider's track.
 const SLIDER_ICON: f32 = 15.;
 /// Marks a window in an application's list; filled for the foreground window.
 const WINDOW_SYMBOL: Symbol = Symbol::Window;
+/// The solid circle behind today in the calendar.
+const TODAY_RADIUS: f32 = 17.;
 const OPEN_DURATION: f32 = 0.12;
 const HOVER_DURATION: f32 = 0.09;
 
@@ -312,6 +320,100 @@ impl Renderer {
         )
     }
 
+    /// One line of text centered in `a`.
+    #[allow(clippy::too_many_arguments)]
+    fn centered(
+        &self,
+        c: &Canvas,
+        text: &str,
+        a: Area,
+        size: f32,
+        bold: bool,
+        ink: Rgb,
+        alpha: f32,
+    ) -> Result<()> {
+        c.draw_text(
+            &self.write,
+            text,
+            c.rect(a.left, a.top, a.right, a.bottom),
+            Text {
+                size,
+                bold,
+                align: DWRITE_TEXT_ALIGNMENT_CENTER,
+            },
+            ink,
+            alpha,
+        )
+    }
+
+    /// The month and its buttons, the weekday names and six weeks of days. Today sits on
+    /// a solid circle; weekends are muted and days of the neighboring months faint. Under
+    /// each number, festivals read in red, solar terms in full ink and lunar days muted.
+    fn paint_calendar<C>(
+        &self,
+        c: &Canvas,
+        calendar: &Calendar<C>,
+        layout: &MenuLayout,
+        index: usize,
+    ) -> Result<()> {
+        let month = &calendar.month;
+        let (l, t, _, b) = layout.calendar_nav(index);
+        let (buttons_left, ..) = layout.calendar_button(index, menu::CALENDAR_PREVIOUS);
+        let title = Area::new(l + 6., t, buttons_left - 4., b);
+        self.text_at(c, &month.title(), title, 15., true, c.p.ink, 1.)?;
+        for (part, command) in calendar.buttons.iter().enumerate() {
+            let (bl, bt, br, bb) = layout.calendar_button(index, part);
+            let area = Area::new(bl, bt, br, bb);
+            if part == menu::CALENDAR_TODAY {
+                if command.is_some() {
+                    c.fill(bl + 3., bt + 3., br - 3., bb - 3., 11., c.p.line, 0.07)?;
+                    self.centered(c, "今天", area, 12., false, c.p.ink, 1.)?;
+                }
+                continue;
+            }
+            let symbol = if part == menu::CALENDAR_PREVIOUS {
+                Symbol::ChevronLeft
+            } else {
+                Symbol::ChevronRight
+            };
+            let alpha = if command.is_some() { 1. } else { 0.3 };
+            c.symbol_in(symbol, area, 16., c.p.ink, alpha)?;
+        }
+        for (column, name) in calendar::WEEKDAYS.iter().enumerate() {
+            let (wl, wt, wr, wb) = layout.calendar_weekday(index, column);
+            let alpha = if matches!(column, 0 | 6) { 0.65 } else { 1. };
+            let area = Area::new(wl, wt, wr, wb);
+            self.centered(c, name, area, 11.5, false, c.p.muted, alpha)?;
+        }
+        for (cell, day) in month.days.iter().enumerate() {
+            let (cl, ct, cr, cb) = layout.calendar_cell(index, cell);
+            let (x, y) = ((cl + cr) / 2., (ct + cb) / 2.);
+            let fade = if day.current { 1. } else { 0.32 };
+            let today = day.today && day.current;
+            if today {
+                let r = TODAY_RADIUS;
+                c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)?;
+            }
+            let (number, note, note_alpha) = match (today, day.kind) {
+                (true, _) => (c.p.on_accent, c.p.on_accent, 0.85),
+                (false, Note::Festival) => (c.p.ink, c.p.danger, 1.),
+                (false, Note::Term) => (c.p.ink, c.p.ink, 0.9),
+                (false, Note::Lunar) => (c.p.ink, c.p.muted, 0.8),
+            };
+            let number = if day.weekend && !today {
+                c.p.muted
+            } else {
+                number
+            };
+            let digits = Area::new(cl, y - 16., cr, y + 2.);
+            let text = day.day.to_string();
+            self.centered(c, &text, digits, 14.5, today, number, fade)?;
+            let below = Area::new(cl + 1., y + 2., cr - 1., y + 15.);
+            self.centered(c, &day.note, below, 9.5, false, note, note_alpha * fade)?;
+        }
+        Ok(())
+    }
+
     /// A circle of `size` centered on `x`, `y`: filled with the accent when `on`,
     /// otherwise a faint wash.
     fn backing(c: &Canvas, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
@@ -330,10 +432,14 @@ impl Renderer {
         c.symbol(symbol, x, y, size * BADGE_ICON, ink, 1.)
     }
 
-    /// A tray icon's image in a circle, filled with the accent while it is `on` the
-    /// status bar. Missing images leave the circle alone.
+    /// A tray icon's image, on a blue circle while the user keeps it `on` the status
+    /// bar and on nothing otherwise. Missing images leave the circle alone.
     fn tray_badge(&self, c: &Canvas, icon: Option<HICON>, x: f32, y: f32, on: bool) -> Result<()> {
-        Self::backing(c, x, y, ICON_BADGE, on)?;
+        if on {
+            let r = ICON_BADGE / 2.;
+            let tint = if c.p.dark { TRAY_ON_DARK } else { TRAY_ON_LIGHT };
+            c.fill(x - r, y - r, x + r, y + r, r, tint, 1.)?;
+        }
         let Some(bitmap) = icon.and_then(|icon| self.hicon_bitmap(icon).ok()) else {
             return Ok(());
         };
@@ -389,6 +495,7 @@ impl Renderer {
             }
             // Drawn on its own layer.
             Entry::Slider(_) => Ok(()),
+            Entry::Calendar(calendar) => self.paint_calendar(c, calendar, layout, index),
             Entry::Tiles(tiles) => {
                 for (part, tile) in tiles.iter().enumerate() {
                     let (l, t, r, b) = layout.tile(index, part, tiles.len());

@@ -26,6 +26,9 @@ pub enum Symbol {
     ChevronDown,
     /// The tray overflow button while its menu is open.
     ChevronUp,
+    /// The calendar's previous and next month.
+    ChevronLeft,
+    ChevronRight,
     Sun,
     Moon,
     Contrast,
@@ -239,6 +242,12 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
         }
         Symbol::ChevronUp => {
             s.line(&[(6.5, 14.75), (12., 9.25), (17.5, 14.75)]);
+        }
+        Symbol::ChevronLeft => {
+            s.line(&[(14.75, 6.5), (9.25, 12.), (14.75, 17.5)]);
+        }
+        Symbol::ChevronRight => {
+            s.line(&[(9.25, 6.5), (14.75, 12.), (9.25, 17.5)]);
         }
         Symbol::Sun => {
             s.circle(12., 12., 4., Stroke);
@@ -756,6 +765,8 @@ mod tests {
         Symbol::Controls,
         Symbol::ChevronDown,
         Symbol::ChevronUp,
+        Symbol::ChevronLeft,
+        Symbol::ChevronRight,
         Symbol::Sun,
         Symbol::Moon,
         Symbol::Contrast,

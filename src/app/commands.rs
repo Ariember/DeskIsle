@@ -43,6 +43,8 @@ impl Bars {
             Command::Settings => self.open_settings(),
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
+            // The clock menu turns its calendar itself while it is open.
+            Command::Calendar(..) => return Ok(false),
             Command::TrayActivate(index) => {
                 self.tray_activate(index, false, self.tray_anchor(index)?)?;
                 return Ok(false);

@@ -68,10 +68,10 @@ impl Bars {
     }
 
     pub(super) fn clock_menu(&mut self) -> Result<bool> {
-        let (date, year) = platform::date();
+        let today = platform::today();
         let clock = self.status.clock;
         let anchor = self.top_anchor(clock.x + clock.width / 2);
-        self.show_menu(menu::clock_menu(&date, &year), anchor)
+        self.show_menu(menu::clock_menu(today, (today.0, today.1)), anchor)
     }
 
     pub(super) fn tray_menu(&mut self) -> Result<bool> {
@@ -240,6 +240,8 @@ impl Bars {
         // The slider entry being dragged.
         let mut drag: Option<usize> = None;
         let mut refresh_flyout = false;
+        // Wheel travel toward the calendar's next turn, 120 per notch.
+        let mut wheel = 0;
         let choice = loop {
             let mut target = hover;
             let mut chosen = None;
@@ -264,6 +266,15 @@ impl Bars {
                     }
                 },
                 Event::MenuLeave if drag.is_none() => target = None,
+                // The wheel turns the calendar's month, down toward the next one.
+                Event::MenuScroll(delta) => {
+                    wheel += i32::from(delta);
+                    let notches = wheel / 120;
+                    wheel -= notches * 120;
+                    if notches != 0 {
+                        chosen = menu.calendar_step(notches < 0).cloned();
+                    }
+                }
                 // Releasing a slider, even outside the menu, only ends the drag.
                 Event::MenuPick(x, _) | Event::MenuContext(x, _) if drag.is_some() => {
                     let index = drag.take().expect("dragging");
@@ -298,6 +309,9 @@ impl Bars {
                     MenuKey::Up => target = menu.step(hover, false),
                     MenuKey::Home => target = menu.step(None, true),
                     MenuKey::End => target = menu.step(None, false),
+                    MenuKey::PageUp | MenuKey::PageDown => {
+                        chosen = menu.calendar_step(key == MenuKey::PageDown).cloned();
+                    }
                     MenuKey::Left | MenuKey::Right => {
                         let forward = key == MenuKey::Right;
                         if let Some(Focus::Slider(index)) = hover {
@@ -376,6 +390,10 @@ impl Bars {
                         break None;
                     }
                     rebuilt = Some(self.tray_list());
+                }
+                // The calendar turns in place.
+                (Some(Command::Calendar(year, month)), _) => {
+                    rebuilt = Some(menu::clock_menu(platform::today(), (year, month)));
                 }
                 (Some(command), _) => break Some(command),
                 (None, _) => {}

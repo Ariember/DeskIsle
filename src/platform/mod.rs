@@ -298,6 +298,9 @@ pub enum MenuKey {
     Right,
     Home,
     End,
+    /// Page Up and Page Down turn the calendar's month.
+    PageUp,
+    PageDown,
     Select,
     /// The menu key or Shift+F10 asks for the focused row's own menu.
     Context,
@@ -348,6 +351,8 @@ pub enum Event {
     MenuPick(i32, i32),
     /// The right button was released in the menu.
     MenuContext(i32, i32),
+    /// A wheel turn of `delta` (120 per notch) over the menu.
+    MenuScroll(i16),
     MenuKey(MenuKey),
     /// The menu lost activation or Windows cancelled modes.
     MenuDismiss,
@@ -390,6 +395,7 @@ impl Event {
                 | Event::MenuLeave
                 | Event::MenuPick(..)
                 | Event::MenuContext(..)
+                | Event::MenuScroll(_)
                 | Event::MenuKey(_)
                 | Event::MenuDismiss
         )
@@ -475,6 +481,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::MenuPick(..)
                     | Event::MenuContext(..)
                     | Event::MenuPress(..)
+                    | Event::MenuScroll(_)
                     | Event::MenuKey(_)
                     | Event::PanelClick(..)
                     | Event::PanelScroll(_)
@@ -639,6 +646,7 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_LBUTTONDOWN => Event::MenuPress(x, y),
         WM_LBUTTONUP => Event::MenuPick(x, y),
         WM_RBUTTONUP => Event::MenuContext(x, y),
+        WM_MOUSEWHEEL => Event::MenuScroll((wp.0 >> 16) as i16),
         WM_KEYDOWN | WM_SYSKEYDOWN => Event::MenuKey(match VIRTUAL_KEY(wp.0 as u16) {
             VK_DOWN => MenuKey::Down,
             VK_UP => MenuKey::Up,
@@ -648,6 +656,8 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             VK_RIGHT => MenuKey::Right,
             VK_HOME => MenuKey::Home,
             VK_END => MenuKey::End,
+            VK_PRIOR => MenuKey::PageUp,
+            VK_NEXT => MenuKey::PageDown,
             VK_RETURN | VK_SPACE => MenuKey::Select,
             VK_APPS => MenuKey::Context,
             VK_F10 if (unsafe { GetKeyState(VK_SHIFT.0 as i32) }) < 0 => MenuKey::Context,
@@ -908,15 +918,10 @@ pub fn requeue(held: Vec<Event>) {
     });
 }
 
-/// The local date for the clock menu, such as "11月19日 星期四".
-pub fn date() -> (String, String) {
+/// Today's local date: year, month and day.
+pub fn today() -> (i32, u8, u8) {
     let now = unsafe { GetLocalTime() };
-    const WEEKDAYS: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
-    let weekday = WEEKDAYS[usize::from(now.wDayOfWeek) % 7];
-    (
-        format!("{}月{}日 星期{weekday}", now.wMonth, now.wDay),
-        format!("{} 年", now.wYear),
-    )
+    (i32::from(now.wYear), now.wMonth as u8, now.wDay as u8)
 }
 
 pub fn report_error(owner: Option<HWND>, error: &Error) {

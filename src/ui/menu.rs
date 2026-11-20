@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use crate::dock::AppGroup;
 use crate::geometry::Rect;
+use crate::ui::calendar::{self, Month};
 use crate::ui::icon::Symbol;
+use crate::ui::lunar;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -75,6 +77,21 @@ pub struct Tile<C> {
     pub command: Option<C>,
 }
 
+/// A month of the calendar with buttons to the previous month, back to today and to the
+/// next month, in that order.
+#[derive(Clone, Debug)]
+pub struct Calendar<C> {
+    pub month: Month,
+    /// `None` hides the button back to today while today's month is shown, and disables
+    /// the arrows at the ends of the lunar tables.
+    pub buttons: [Option<C>; 3],
+}
+
+/// The calendar's buttons, as parts of its entry.
+pub const CALENDAR_PREVIOUS: usize = 0;
+pub const CALENDAR_TODAY: usize = 1;
+pub const CALENDAR_NEXT: usize = 2;
+
 #[derive(Clone, Debug)]
 pub enum Entry<C> {
     Header {
@@ -93,6 +110,7 @@ pub enum Entry<C> {
         detail: String,
         buttons: Vec<(Symbol, Option<C>)>,
     },
+    Calendar(Calendar<C>),
     Separator,
 }
 
@@ -183,8 +201,23 @@ impl<C> Menu<C> {
             Entry::Tiles(tiles) => tiles.get(part)?.command.as_ref(),
             Entry::Player { buttons, .. } => buttons.get(part)?.1.as_ref(),
             Entry::Slider(slider) if part == 0 => slider.button.as_ref(),
+            Entry::Calendar(calendar) => calendar.buttons.get(part)?.as_ref(),
             _ => None,
         }
+    }
+
+    /// The command that turns the calendar to the next month, or the previous one when
+    /// `forward` is false, as the wheel and Page Up and Page Down do.
+    pub fn calendar_step(&self, forward: bool) -> Option<&C> {
+        let part = if forward {
+            CALENDAR_NEXT
+        } else {
+            CALENDAR_PREVIOUS
+        };
+        self.entries.iter().find_map(|entry| match entry {
+            Entry::Calendar(calendar) => calendar.buttons[part].as_ref(),
+            _ => None,
+        })
     }
 
     pub fn focused_command(&self, focus: Focus) -> Option<&C> {
@@ -222,6 +255,7 @@ impl<C> Menu<C> {
                 }
                 Entry::Tiles(tiles) => tiles.len(),
                 Entry::Player { buttons, .. } => buttons.len(),
+                Entry::Calendar(calendar) => calendar.buttons.len(),
                 _ => continue,
             };
             controls.extend(
@@ -259,6 +293,14 @@ pub const TILE_HEIGHT: f32 = 60.;
 pub const TILE_GAP: f32 = 8.;
 pub const PLAYER_HEIGHT: f32 = 56.;
 pub const PLAYER_BUTTON: f32 = 34.;
+/// The calendar: its month and buttons, the weekday names, and six weeks of days.
+pub const CALENDAR_NAV: f32 = 38.;
+pub const CALENDAR_WEEKDAYS: f32 = 24.;
+pub const CALENDAR_CELL: f32 = 40.;
+pub const CALENDAR_ARROW: f32 = 28.;
+pub const CALENDAR_TODAY_WIDTH: f32 = 46.;
+pub const CALENDAR_HEIGHT: f32 =
+    CALENDAR_NAV + CALENDAR_WEEKDAYS + calendar::WEEKS as f32 * CALENDAR_CELL + 8.;
 /// Inset of sliders, tiles and the player from the panel's padding.
 pub const BLOCK_INSET: f32 = 6.;
 /// Horizontal room before the label for icons and window marks.
@@ -408,6 +450,10 @@ impl MenuLayout {
                     content = content.max(2. * BLOCK_INSET + 50. + text.min(180.) + controls + 12.);
                     PLAYER_HEIGHT
                 }
+                Entry::Calendar(_) => {
+                    content = content.max(7. * 40. + 2. * BLOCK_INSET);
+                    CALENDAR_HEIGHT
+                }
                 Entry::Separator => SEPARATOR_HEIGHT,
             };
             rows.push((y, y + height));
@@ -511,6 +557,43 @@ impl MenuLayout {
         (l, middle - half, l + PLAYER_BUTTON, middle + half)
     }
 
+    /// The month and buttons at the top of the calendar in entry `index`.
+    pub fn calendar_nav(&self, index: usize) -> (f32, f32, f32, f32) {
+        let (left, top, right, _) = self.block(index);
+        (left, top, right, top + CALENDAR_NAV)
+    }
+
+    /// Button `part` of the calendar in entry `index`: the arrows on either side of the
+    /// button back to today, at the trailing edge.
+    pub fn calendar_button(&self, index: usize, part: usize) -> (f32, f32, f32, f32) {
+        let (_, top, right, bottom) = self.calendar_nav(index);
+        let middle = (top + bottom) / 2.;
+        let next = right - CALENDAR_ARROW;
+        let today = next - CALENDAR_TODAY_WIDTH;
+        let (l, r) = match part {
+            CALENDAR_PREVIOUS => (today - CALENDAR_ARROW, today),
+            CALENDAR_TODAY => (today, next),
+            _ => (next, right),
+        };
+        let half = CALENDAR_ARROW / 2.;
+        (l, middle - half, r, middle + half)
+    }
+
+    /// The column of weekday `column` above the calendar's days, 0 for Sunday.
+    pub fn calendar_weekday(&self, index: usize, column: usize) -> (f32, f32, f32, f32) {
+        let (left, _, right, bottom) = self.calendar_nav(index);
+        let width = (right - left) / 7.;
+        let l = left + column as f32 * width;
+        (l, bottom, l + width, bottom + CALENDAR_WEEKDAYS)
+    }
+
+    /// Day `cell` of the calendar's six weeks, counted from the first Sunday.
+    pub fn calendar_cell(&self, index: usize, cell: usize) -> (f32, f32, f32, f32) {
+        let (l, _, r, bottom) = self.calendar_weekday(index, cell % 7);
+        let top = bottom + (cell / 7) as f32 * CALENDAR_CELL;
+        (l, top, r, top + CALENDAR_CELL)
+    }
+
     /// `x` and `y` are client pixels of the menu window.
     pub fn hit<C>(&self, menu: &Menu<C>, x: i32, y: i32) -> Hit {
         let pixel_x = x;
@@ -539,6 +622,9 @@ impl MenuLayout {
             Entry::Player { buttons, .. } => (0..buttons.len())
                 .find(|&i| inside(self.player_button(index, i, buttons.len())))
                 .map_or(Hit::Inert, part),
+            Entry::Calendar(calendar) => (0..calendar.buttons.len())
+                .find(|&i| inside(self.calendar_button(index, i)))
+                .map_or(Hit::Inert, part),
             Entry::Slider(slider) => {
                 let track = self.track(index);
                 if !inside(track) {
@@ -564,6 +650,7 @@ impl MenuLayout {
             Focus::Part(i, p) => match &menu.entries[i] {
                 Entry::Tiles(tiles) => self.tile(i, p, tiles.len()),
                 Entry::Player { buttons, .. } => self.player_button(i, p, buttons.len()),
+                Entry::Calendar(_) => self.calendar_button(i, p),
                 Entry::Item(_) => {
                     let (l, t, r, b) = self.icon_target(i);
                     (l, t, r - ICON_INSET / 2., b)
@@ -636,6 +723,8 @@ pub enum Command {
     Settings,
     DateTime,
     Notifications,
+    /// Turns the clock menu's calendar to a month; the menu stays open.
+    Calendar(i32, u8),
     /// Same as a left click on the tray icon in the status bar.
     TrayActivate(usize),
     /// Same as a right click on it: the application shows its own menu.
@@ -877,9 +966,25 @@ pub fn mark_menu() -> Menu<Command> {
     menu
 }
 
-pub fn clock_menu(date: &str, year: &str) -> Menu<Command> {
+/// The clock's menu: today's date in both calendars, then the calendar turned to `shown`,
+/// a year and month.
+pub fn clock_menu(today: (i32, u8, u8), shown: (i32, u8)) -> Menu<Command> {
+    let (year, month, day) = today;
+    let weekday = calendar::WEEKDAYS[usize::from(lunar::weekday(year, month, day))];
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    menu.header(date, year, Icon::Symbol(Symbol::Calendar));
+    menu.header(
+        format!("{month}月{day}日 星期{weekday}"),
+        calendar::describe(today),
+        Icon::Symbol(Symbol::Calendar),
+    );
+    // Headers usually run into the first group; the calendar wants a rule above it.
+    menu.entries.push(Entry::Separator);
+    let turn = |by| calendar::shift(shown.0, shown.1, by).map(|(y, m)| Command::Calendar(y, m));
+    let back = (shown != (year, month)).then_some(Command::Calendar(year, month));
+    menu.entries.push(Entry::Calendar(Calendar {
+        month: Month::new(shown.0, shown.1, today),
+        buttons: [turn(-1), back, turn(1)],
+    }));
     menu.separator();
     menu.item(
         "通知和日历",
@@ -1206,6 +1311,65 @@ mod tests {
         let mut empty = Menu::<u8>::fixed(DROPDOWN_WIDTH);
         empty.header("t", "", Icon::None);
         assert_eq!(empty.step(None, true), None);
+    }
+
+    #[test]
+    fn clock_menu_turns_its_calendar_and_offers_today_away_from_it() {
+        let today = (2026, 11, 21);
+        let menu = clock_menu(today, (2026, 11));
+        let Some(Entry::Header {
+            title, subtitle, ..
+        }) = menu.entries.first()
+        else {
+            panic!("the clock menu opens with today's date");
+        };
+        assert_eq!(title, "11月21日 星期六");
+        assert_eq!(subtitle, "农历十月十三 · 丙午马年");
+        let index = menu
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, Entry::Calendar(_)))
+            .expect("a calendar");
+        let turn = |y, m| Some(Command::Calendar(y, m));
+        assert_eq!(
+            menu.part_command(index, CALENDAR_PREVIOUS).cloned(),
+            turn(2026, 10)
+        );
+        assert_eq!(menu.part_command(index, CALENDAR_TODAY), None);
+        assert_eq!(menu.calendar_step(true).cloned(), turn(2026, 12));
+        let away = clock_menu(today, (2027, 3));
+        assert_eq!(
+            away.part_command(index, CALENDAR_TODAY).cloned(),
+            turn(2026, 11)
+        );
+        assert_eq!(clock_menu(today, (2100, 12)).calendar_step(true), None);
+        assert_eq!(clock_menu(today, (1901, 1)).calendar_step(false), None);
+        // Keyboard focus reaches the arrows and the way back to today.
+        let parts: Vec<_> = (0..4)
+            .scan(None, |focus, _| {
+                *focus = away.step(*focus, true);
+                *focus
+            })
+            .collect();
+        assert!(parts.contains(&Focus::Part(index, CALENDAR_TODAY)));
+
+        for dpi in [96, 144, 192] {
+            let mut menu = clock_menu(today, (2027, 3));
+            let layout = MenuLayout::new(&mut menu, dpi, measure);
+            let at = |(l, t, r, b): (f32, f32, f32, f32)| {
+                let s = layout.scale;
+                (((l + r) / 2. * s) as i32, ((t + b) / 2. * s) as i32)
+            };
+            for part in [CALENDAR_PREVIOUS, CALENDAR_TODAY, CALENDAR_NEXT] {
+                let (x, y) = at(layout.calendar_button(index, part));
+                assert_eq!(layout.hit(&menu, x, y), Hit::Part(index, part), "{dpi}");
+            }
+            let (x, y) = at(layout.calendar_cell(index, 10));
+            assert_eq!(layout.hit(&menu, x, y), Hit::Inert);
+            let last = layout.calendar_cell(index, calendar::WEEKS * 7 - 1);
+            assert!(last.3 <= layout.rows[index].1);
+            assert!(last.2 <= layout.panel().2 - PADDING);
+        }
     }
 
     #[test]
