@@ -61,7 +61,7 @@ impl Area {
         }
     }
 
-    fn contains(&self, x: f32, y: f32) -> bool {
+    pub(super) fn contains(&self, x: f32, y: f32) -> bool {
         (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
     }
 

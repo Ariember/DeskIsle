@@ -1,4 +1,5 @@
 mod canvas;
+mod launchpad;
 mod menu;
 mod panel;
 
@@ -45,7 +46,8 @@ pub(crate) fn is_device_lost(error: &Error) -> bool {
 }
 
 pub struct DockIcon<'a> {
-    pub path: &'a Path,
+    /// None draws the built-in launchpad.
+    pub path: Option<&'a Path>,
     pub label: &'a str,
     pub center_x: i32,
     pub center_y: i32,
@@ -74,6 +76,7 @@ pub struct Renderer {
     top_state: Option<TopState>,
     menu: Option<MenuView>,
     panel: Option<PanelView>,
+    launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
     mark: Option<MarkLayer>,
 }
@@ -120,7 +123,7 @@ struct MarkLayer {
 }
 
 struct IconLayer {
-    path: PathBuf,
+    path: Option<PathBuf>,
     label: String,
     size: i32,
     center: (i32, i32),
@@ -211,7 +214,7 @@ fn keyframes(
 
 impl IconLayer {
     fn matches(&self, icon: &DockIcon<'_>) -> bool {
-        self.path == icon.path && self.label == icon.label && self.size == icon.size
+        self.path.as_deref() == icon.path && self.label == icon.label && self.size == icon.size
     }
 
     fn animate(
@@ -275,6 +278,7 @@ impl Renderer {
                 top_state: None,
                 menu: None,
                 panel: None,
+                launchpad: None,
                 palette: Palette::new(dark),
                 mark: None,
             })
@@ -600,7 +604,26 @@ impl Renderer {
     fn icon(&self, item: &DockIcon<'_>) -> Result<IconLayer> {
         let size = item.size as f32;
         let surface = paint(&self.device, self.palette, item.size, item.size, 96, |c| {
-            if let Some(bitmap) = self.shell_icon(item.path)? {
+            let Some(path) = item.path else {
+                c.gradient(
+                    0.,
+                    0.,
+                    size,
+                    size,
+                    size * 0.24,
+                    ((108, 139, 250), 1.),
+                    ((67, 79, 188), 1.),
+                )?;
+                return c.symbol(
+                    Symbol::Apps,
+                    size * 0.5,
+                    size * 0.5,
+                    size * 0.83,
+                    (255, 255, 255),
+                    1.,
+                );
+            };
+            if let Some(bitmap) = self.shell_icon(path)? {
                 c.bitmap(&bitmap, c.rect(0., 0., size, size))?;
             } else {
                 // Shell can lose access to an executable after enumeration. Keep its slot identifiable.
@@ -627,7 +650,7 @@ impl Renderer {
             scale.SetScaleY2(1.)?;
             visual.SetTransform(&scale)?;
             Ok(IconLayer {
-                path: item.path.into(),
+                path: item.path.map(Path::to_owned),
                 label: item.label.into(),
                 size: item.size,
                 center: (0, 0),

@@ -52,6 +52,7 @@ pub enum Symbol {
     Close,
     Check,
     Apps,
+    Search,
     Activity,
     Desktop,
     Power,
@@ -135,6 +136,10 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
     use Paint::{Fill, Stroke};
     let mut s = Sketch(Vec::new());
     match symbol {
+        Symbol::Search => {
+            s.circle(10., 10., 6.5, Stroke);
+            s.line(&[(15., 15.), (20.5, 20.5)]);
+        }
         Symbol::Wifi => {
             for radius in [5., 9.5, 14.] {
                 s.arc(12., 18.5, radius, 225., 315.);
@@ -789,6 +794,7 @@ mod tests {
         Symbol::Close,
         Symbol::Check,
         Symbol::Apps,
+        Symbol::Search,
         Symbol::Activity,
         Symbol::Desktop,
         Symbol::Power,

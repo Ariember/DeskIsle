@@ -1,14 +1,21 @@
 #![cfg(windows)]
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize, IPersistFile,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
 };
-use windows::Win32::UI::Shell::ABN_FULLSCREENAPP;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
     GWL_EXSTYLE, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
@@ -16,17 +23,45 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA,
     SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+    SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, HSTRING, Interface, w};
+
+struct TestProfile(PathBuf);
+
+impl TestProfile {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("DeskIsle-bars-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("DeskIsle")).unwrap();
+        Self(root)
+    }
+}
+
+impl Drop for TestProfile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0.join("启动测试.lnk"));
+        let _ = fs::remove_file(self.0.join("launched.txt"));
+        let _ = fs::remove_file(self.0.join("DeskIsle/launchpad.txt"));
+        let _ = fs::remove_dir(self.0.join("DeskIsle"));
+        let _ = fs::remove_dir(&self.0);
+    }
+}
 
 struct TestInstance(Child);
 
 impl TestInstance {
-    fn start() -> Self {
+    fn start(appdata: &Path) -> Self {
         Self(
             Command::new(env!("CARGO_BIN_EXE_deskisle"))
+                .env("APPDATA", appdata)
                 .spawn()
                 .unwrap(),
         )
@@ -201,6 +236,7 @@ struct Bars {
     status: Option<HWND>,
     dock: Option<HWND>,
     menu: Option<HWND>,
+    launchpad: Option<HWND>,
 }
 
 impl Bars {
@@ -210,6 +246,7 @@ impl Bars {
             status: None,
             dock: None,
             menu: None,
+            launchpad: None,
         };
         unsafe { EnumWindows(Some(find_bar), LPARAM((&raw mut bars) as isize)) }.unwrap();
         bars
@@ -228,6 +265,7 @@ unsafe extern "system" fn find_bar(hwnd: HWND, data: LPARAM) -> BOOL {
             "DeskIsle Status" => bars.status = Some(hwnd),
             "DeskIsle Dock" => bars.dock = Some(hwnd),
             "DeskIsle Menu" => bars.menu = Some(hwnd),
+            "DeskIsle 启动台" => bars.launchpad = Some(hwnd),
             _ => {}
         }
     }
@@ -240,6 +278,78 @@ fn send_to_child(pid: u32, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
     assert_eq!(owner, pid, "target window no longer belongs to our child");
     let sent = unsafe { SendMessageTimeoutW(hwnd, msg, wp, lp, SMTO_ABORTIFHUNG, 2000, None) };
     assert_ne!(sent.0, 0, "child did not process message {msg:#x}");
+}
+
+fn launchpad_reopens_saved_shortcut(pid: u32, dock: HWND, profile: &Path) {
+    let open = || {
+        let dpi = unsafe { GetDpiForWindow(dock) } as i32;
+        let center = (32 * dpi + 48) / 96;
+        let point = LPARAM(((center << 16) | center) as isize);
+        send_to_child(pid, dock, WM_LBUTTONDOWN, WPARAM(1), point);
+        send_to_child(pid, dock, WM_LBUTTONUP, WPARAM(0), point);
+        wait_until("first Dock icon did not open the launchpad", || {
+            Bars::visible_for(pid).launchpad.is_some()
+        });
+        Bars::visible_for(pid).launchpad.unwrap()
+    };
+    let first = open();
+    let rect = window_rect(first);
+    assert!(rect.bottom > rect.top && rect.right > rect.left);
+    assert!(
+        rect.bottom <= window_rect(dock).top,
+        "launchpad covers the Dock"
+    );
+    send_to_child(
+        pid,
+        first,
+        WM_KEYDOWN,
+        WPARAM(VK_ESCAPE.0.into()),
+        LPARAM(0),
+    );
+    wait_until("Escape did not close the launchpad", || {
+        Bars::visible_for(pid).launchpad.is_none()
+    });
+
+    // Seed the isolated profile with a real shortcut. Its command needs both its
+    // arguments and working directory for the marker to appear in the right place.
+    let shortcut = profile.join("启动测试.lnk");
+    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        {
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetPath(&HSTRING::from(cmd.as_path())).unwrap();
+            link.SetArguments(w!("/d /c echo launched>launched.txt"))
+                .unwrap();
+            link.SetWorkingDirectory(&HSTRING::from(profile)).unwrap();
+            link.SetShowCmd(SW_HIDE).unwrap();
+            link.cast::<IPersistFile>()
+                .unwrap()
+                .Save(&HSTRING::from(shortcut.as_path()), true)
+                .unwrap();
+        }
+        CoUninitialize();
+    }
+    fs::write(
+        profile.join("DeskIsle/launchpad.txt"),
+        format!("{}\n", shortcut.display()),
+    )
+    .unwrap();
+    let reopened = open();
+    send_to_child(
+        pid,
+        reopened,
+        WM_KEYDOWN,
+        WPARAM(VK_RETURN.0.into()),
+        LPARAM(0),
+    );
+    wait_until("reopened launchpad did not run the saved shortcut", || {
+        fs::read_to_string(profile.join("launched.txt")).is_ok_and(|text| text.trim() == "launched")
+    });
+    wait_until("launchpad stayed open after launching the shortcut", || {
+        Bars::visible_for(pid).launchpad.is_none()
+    });
 }
 
 #[test]
@@ -276,7 +386,8 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     let probe = MaximizedWindow::create();
     let initial = window_rect(probe.0);
 
-    let mut app = TestInstance::start();
+    let profile = TestProfile::new();
+    let mut app = TestInstance::start(&profile.0);
     let (status, dock) = app.wait_for_bars();
 
     wait_until("native taskbar still visible with the Dock running", || {
@@ -352,6 +463,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "bar can take focus");
     }
     let pid = app.0.id();
+    launchpad_reopens_saved_shortcut(pid, dock, &profile.0);
     // Send Explorer's AppBar notification to the window that registered for it.
     let fullscreen = |open| {
         send_to_child(
@@ -438,12 +550,12 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         restored,
     );
     // A second launch must leave the active owner's windows and taskbar intact.
-    let mut owner = TestInstance::start();
+    let mut owner = TestInstance::start(&profile.0);
     let (status, dock) = owner.wait_for_bars();
     wait_until("restarted Dock did not hide the native taskbar", || {
         !unsafe { IsWindowVisible(taskbar.hwnd) }.as_bool()
     });
-    let mut duplicate = TestInstance::start();
+    let mut duplicate = TestInstance::start(&profile.0);
     wait_until("second launch did not exit", || {
         duplicate.0.try_wait().unwrap().is_some()
     });
@@ -501,7 +613,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     owner.0.wait().unwrap();
     // Start immediately after the main process dies. Its helper can still be
     // restoring Explorer, and the replacement must complete its own takeover.
-    let mut replacement = TestInstance::start();
+    let mut replacement = TestInstance::start(&profile.0);
     let (replacement_status, _) = replacement.wait_for_bars();
     wait_until(
         "rapid relaunch did not take over both desktop edges",
@@ -527,7 +639,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         // The Dock uses the vacant strip locally, without taking ownership of either.
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
         set_work_area(work).unwrap();
-        let mut prehidden = TestInstance::start();
+        let mut prehidden = TestInstance::start(&profile.0);
         let (status, dock) = prehidden.wait_for_bars();
         wait_until(
             "Dock did not use space above an externally hidden taskbar",

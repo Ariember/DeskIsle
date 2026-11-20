@@ -5,7 +5,7 @@ use crate::dock::{self, Action, group_apps};
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, power, shell};
 use crate::storage;
-use crate::ui::layout::{StatusHit, SystemItem};
+use crate::ui::layout::{DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{self, Command};
 use windows::Win32::Foundation::HWND;
 use windows::core::Result;
@@ -88,7 +88,7 @@ impl Bars {
             return Ok(());
         }
         let path = match self.layout.hit(x, y) {
-            Some(index) if owner == self.bottom.0 => {
+            Some(DockHit::App(index)) if owner == self.bottom.0 => {
                 self.apps[index].executable().map(Path::to_path_buf)
             }
             _ => None,

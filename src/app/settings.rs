@@ -301,7 +301,8 @@ impl Bars {
             self.display(false)
         } else if relayout {
             self.relayout(self.layout.first)?;
-            self.draw()
+            self.draw()?;
+            self.resize_launchpad()
         } else if retheme {
             self.draw()
         } else {

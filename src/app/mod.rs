@@ -1,4 +1,5 @@
 mod commands;
+mod launchpad;
 mod menus;
 mod settings;
 mod system;
@@ -15,7 +16,9 @@ use crate::render::{DockIcon, Renderer, TrayImage, is_device_lost};
 use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
-use crate::ui::layout::{DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem};
+use crate::ui::layout::{
+    DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
+};
 use crate::ui::system::SystemStatus;
 use windows::Win32::Foundation::POINT;
 use windows::core::{Error, Result};
@@ -26,6 +29,7 @@ struct Bars {
     renderer: Option<Renderer>,
     /// Released after the renderer, which drops the panel's composition target first.
     panel: Option<settings::Panel>,
+    launchpad: Option<launchpad::Launchpad>,
     tray: TrayHost,
     appbar: AppBar,
     /// Both audio subscriptions must end before the status HWND is destroyed.
@@ -47,7 +51,7 @@ struct Bars {
     shown: Vec<usize>,
     /// Keys of tray icons the user moved into the overflow menu.
     hidden: BTreeSet<String>,
-    hover: Option<usize>,
+    hover: Option<DockHit>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
     /// Wheel movement over the sound icon not yet turned into a volume step.
@@ -146,6 +150,7 @@ pub(crate) fn run() -> Result<()> {
         events,
         renderer,
         panel: None,
+        launchpad: None,
         appbar,
         tray,
         top,
@@ -290,13 +295,18 @@ pub(crate) fn run() -> Result<()> {
                     return Ok(());
                 }
             }
-            Event::Click(_, x, y) => {
-                if let Some(index) = bars.layout.hit(x, y) {
-                    bars.select(index)?;
+            Event::Click(owner, x, y) if owner == bars.bottom.0 => match bars.layout.hit(x, y) {
+                Some(DockHit::Launchpad) => {
+                    if let Err(error) = bars.open_launchpad() {
+                        platform::report_error(Some(owner), &error);
+                    }
                 }
-            }
+                Some(DockHit::App(index)) => bars.select(index)?,
+                None => {}
+            },
             Event::RightClick(owner, x, y) if bars.context_menu(owner, x, y)? => return Ok(()),
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
+            Event::Launchpad(input) => bars.launchpad_event(input)?,
             event @ (Event::PanelMove(..)
             | Event::PanelLeave
             | Event::PanelClick(..)
@@ -355,7 +365,8 @@ impl Bars {
         // Windows announces a change of its app mode as a setting change.
         self.apply_theme()?;
         self.draw()?;
-        self.relayout_panel()
+        self.relayout_panel()?;
+        self.resize_launchpad()
     }
 
     fn relayout(&mut self, first: usize) -> Result<bool> {
@@ -498,7 +509,7 @@ impl Bars {
         self.draw()
     }
 
-    fn set_hover(&mut self, hit: Option<usize>) -> Result<()> {
+    fn set_hover(&mut self, hit: Option<DockHit>) -> Result<()> {
         if self.hover != hit {
             self.hover = hit;
             self.draw()?;
@@ -519,18 +530,21 @@ impl Bars {
 
     fn draw(&mut self) -> Result<()> {
         match self.draw_frame() {
-            Err(e) if is_device_lost(&e) => {
-                // Release the previous targets before binding a new device to these HWNDs.
-                self.renderer.take();
-                self.renderer = Some(
-                    Renderer::new(self.top.0, self.bottom.0, self.dark())
-                        .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
-                );
-                self.draw_frame()?;
-                self.paint_panel()
-            }
+            Err(e) if is_device_lost(&e) => self.rebuild_renderer(),
             result => result,
         }
+    }
+
+    fn rebuild_renderer(&mut self) -> Result<()> {
+        // Release composition targets before binding a new device to these HWNDs.
+        self.renderer.take();
+        self.renderer = Some(
+            Renderer::new(self.top.0, self.bottom.0, self.dark())
+                .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
+        );
+        self.draw_frame()?;
+        self.paint_panel()?;
+        self.paint_launchpad()
     }
 
     fn draw_frame(&mut self) -> Result<()> {
@@ -579,16 +593,27 @@ impl Bars {
             .slots
             .iter()
             .map(|slot| {
-                let app = &self.apps[slot.index];
+                let (path, label, running, active) = match slot.target {
+                    DockHit::Launchpad => (None, "启动台", false, false),
+                    DockHit::App(index) => {
+                        let app = &self.apps[index];
+                        (
+                            Some(app.icon_path.as_path()),
+                            app.label.as_str(),
+                            !app.windows.is_empty(),
+                            app.active,
+                        )
+                    }
+                };
                 let r = slot.rect;
                 DockIcon {
-                    path: &app.icon_path,
-                    label: &app.label,
+                    path,
+                    label,
                     center_x: r.x + r.width / 2,
                     center_y: r.y + r.height / 2,
                     size: self.layout.icon,
-                    running: !app.windows.is_empty(),
-                    active: app.active,
+                    running,
+                    active,
                 }
             })
             .collect::<Vec<_>>();
@@ -596,7 +621,7 @@ impl Bars {
             .layout
             .slots
             .iter()
-            .position(|slot| Some(slot.index) == self.hover);
+            .position(|slot| Some(slot.target) == self.hover);
         let bottom = self.layout.bottom;
         let lift = self.settings.hover_scale();
         renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, lift)

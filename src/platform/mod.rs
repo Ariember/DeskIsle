@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod display;
+pub mod launchpad;
 pub mod media;
 pub mod network;
 pub mod power;
@@ -111,6 +112,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         if RegisterClassW(&panel) == 0 {
             return Err(Error::from_thread());
         }
+        launchpad::register_class(instance, wc.hCursor)?;
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -330,7 +332,7 @@ pub enum PanelKey {
     Other,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     Paint,
     Refresh,
@@ -396,6 +398,7 @@ pub enum Event {
     /// The panel moved to a monitor with this DPI and already took the suggested size.
     PanelDpi(u32),
     PanelClose,
+    Launchpad(launchpad::LaunchpadEvent),
     Quit,
 }
 
@@ -504,6 +507,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::PanelClick(..)
                     | Event::PanelScroll(_)
                     | Event::PanelKey(_)
+                    | Event::Launchpad(_)
             )
         {
             events.push_back(event);

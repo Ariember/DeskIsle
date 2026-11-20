@@ -3,6 +3,18 @@ use crate::geometry::Rect;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub index: usize,
+    pub rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockHit {
+    Launchpad,
+    App(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockSlot {
+    pub target: DockHit,
     /// Client pixels relative to the bottom bar.
     pub rect: Rect,
 }
@@ -11,7 +23,7 @@ pub struct Slot {
 pub struct Layout {
     /// Screen pixels in the target monitor's work area.
     pub bottom: Rect,
-    pub slots: Vec<Slot>,
+    pub slots: Vec<DockSlot>,
     pub first: usize,
     /// Edge of each icon in pixels.
     pub icon: i32,
@@ -37,13 +49,14 @@ fn scaled(dpi: u32) -> impl Fn(i32) -> i32 {
 
 impl Layout {
     /// `work` is a nonempty work area and `dpi` its effective DPI.
-    pub fn new(work: Rect, dpi: u32, count: usize, first: usize, style: DockStyle) -> Self {
+    pub fn new(work: Rect, dpi: u32, apps: usize, first: usize, style: DockStyle) -> Self {
         let px = scaled(dpi);
         let inset_x = px(8).min((work.width - 1) / 2);
         let available = work.width - 2 * inset_x;
         let padding = px(6).min((available - 1) / 2);
         let slot_width = px(style.icon + 18).min(available - 2 * padding).max(1);
         let capacity = ((available - 2 * padding) / slot_width) as usize;
+        let count = apps + 1;
         let visible = count.min(capacity);
         let first = first.min(count - visible);
 
@@ -58,14 +71,27 @@ impl Layout {
         };
         let inset_y = px(4).min((bottom.height - 1) / 2);
         let slots = (0..visible)
-            .map(|offset| Slot {
-                index: first + offset,
-                rect: Rect {
-                    x: padding + offset as i32 * slot_width,
-                    y: inset_y,
-                    width: slot_width,
-                    height: bottom.height - 2 * inset_y,
-                },
+            .map(|offset| {
+                // Keep the launchpad in front while apps scroll. On a one-slot display
+                // it scrolls with the apps so every target stays reachable.
+                let index = if offset == 0 && capacity > 1 {
+                    0
+                } else {
+                    first + offset
+                };
+                let target = match index {
+                    0 => DockHit::Launchpad,
+                    i => DockHit::App(i - 1),
+                };
+                DockSlot {
+                    target,
+                    rect: Rect {
+                        x: padding + offset as i32 * slot_width,
+                        y: inset_y,
+                        width: slot_width,
+                        height: bottom.height - 2 * inset_y,
+                    },
+                }
             })
             .collect();
         let icon = px(style.icon)
@@ -80,11 +106,11 @@ impl Layout {
         }
     }
 
-    pub fn hit(&self, x: i32, y: i32) -> Option<usize> {
+    pub fn hit(&self, x: i32, y: i32) -> Option<DockHit> {
         self.slots
             .iter()
             .find(|s| s.rect.contains(x, y))
-            .map(|s| s.index)
+            .map(|s| s.target)
     }
 }
 
@@ -279,9 +305,12 @@ mod tests {
                 8 * dpi as i32 / 96
             );
             let slot = layout.slots[1].rect;
-            assert_eq!(layout.hit(slot.x, slot.y), Some(1));
-            assert_eq!(layout.hit(slot.x - 1, slot.y), Some(0));
-            assert_eq!(layout.hit(slot.x + slot.width, slot.y), Some(2));
+            assert_eq!(layout.hit(slot.x, slot.y), Some(DockHit::App(0)));
+            assert_eq!(layout.hit(slot.x - 1, slot.y), Some(DockHit::Launchpad));
+            assert_eq!(
+                layout.hit(slot.x + slot.width, slot.y),
+                Some(DockHit::App(1))
+            );
             assert_eq!(layout.hit(slot.x, slot.y + slot.height), None);
         }
     }
@@ -298,11 +327,27 @@ mod tests {
         let last = layout.slots.last().unwrap().rect;
         assert!(layout.bottom.width <= work.width);
         assert!(layout.first > 0);
-        assert_eq!(layout.hit(last.x, last.y), Some(15));
+        assert_eq!(layout.hit(last.x, last.y), Some(DockHit::App(15)));
+        let first = layout.slots[0].rect;
+        assert_eq!(layout.hit(first.x, first.y), Some(DockHit::Launchpad));
         let layout = Layout::new(work, 144, 1, layout.first, DockStyle::default());
         assert_eq!(layout.first, 0);
-        let first = layout.slots[0].rect;
-        assert_eq!(layout.hit(first.x, first.y), Some(0));
+        let app = layout.slots[1].rect;
+        assert_eq!(layout.hit(app.x, app.y), Some(DockHit::App(0)));
+        let empty = Layout::new(work, 144, 0, 0, DockStyle::default());
+        assert_eq!(empty.slots.len(), 1);
+        assert_eq!(empty.hit(first.x, first.y), Some(DockHit::Launchpad));
+
+        let narrow = Rect { width: 60, ..work };
+        for (first, target) in [
+            (0, DockHit::Launchpad),
+            (1, DockHit::App(0)),
+            (2, DockHit::App(1)),
+        ] {
+            let layout = Layout::new(narrow, 144, 2, first, DockStyle::default());
+            let slot = layout.slots[0].rect;
+            assert_eq!(layout.hit(slot.x, slot.y), Some(target));
+        }
     }
 
     #[test]
@@ -320,7 +365,10 @@ mod tests {
         assert_eq!(layout.bottom.height, 117);
         assert_eq!(layout.bottom.y + layout.bottom.height, work.height);
         let slot = layout.slots[2].rect;
-        assert_eq!(layout.hit(slot.x + slot.width - 1, slot.y), Some(2));
+        assert_eq!(
+            layout.hit(slot.x + slot.width - 1, slot.y),
+            Some(DockHit::App(1))
+        );
     }
 
     #[test]

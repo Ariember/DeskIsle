@@ -2,7 +2,7 @@ use super::Bars;
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
-use crate::ui::layout::{StatusHit, SystemItem};
+use crate::ui::layout::{DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
 };
@@ -42,12 +42,12 @@ impl Bars {
             return Ok(false);
         }
         match self.layout.hit(x, y) {
-            Some(index) => {
+            Some(DockHit::App(index)) => {
                 let menu = self.app_menu(index);
                 let anchor = self.icon_anchor(index);
                 self.show_menu(menu, anchor)
             }
-            None => self.bar_menu(),
+            Some(DockHit::Launchpad) | None => self.bar_menu(),
         }
     }
 
@@ -159,7 +159,12 @@ impl Bars {
     /// Above the Dock icon of application `index`, or at the pointer when it scrolled out.
     pub(super) fn icon_anchor(&self, index: usize) -> Anchor {
         let bottom = self.layout.bottom;
-        match self.layout.slots.iter().find(|slot| slot.index == index) {
+        match self
+            .layout
+            .slots
+            .iter()
+            .find(|slot| slot.target == DockHit::App(index))
+        {
             Some(slot) => Anchor {
                 x: bottom.x + slot.rect.x + slot.rect.width / 2,
                 y: bottom.y,

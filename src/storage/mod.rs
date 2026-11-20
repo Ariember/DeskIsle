@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, HRESULT, Result};
 
@@ -6,6 +7,55 @@ use crate::dock::{PinnedApp, pinned};
 use crate::settings::Settings;
 
 const PINS_FILE: &str = "pins.txt";
+
+const LAUNCHPAD_FILE: &str = "launchpad.txt";
+
+pub fn load_launchpad() -> Result<Vec<PathBuf>> {
+    read_launchpad(&settings_path(LAUNCHPAD_FILE)?)
+}
+
+fn read_launchpad(path: &Path) -> Result<Vec<PathBuf>> {
+    let lines = read_lines(path)?.unwrap_or_default();
+    let mut entries = Vec::new();
+    let mut known = BTreeSet::new();
+    for line in lines {
+        let path = PathBuf::from(line);
+        if !crate::launchpad::supported(&path) {
+            return Err(Error::new(
+                E_FAIL,
+                format!("启动台列表包含无效路径：{}", path.display()),
+            ));
+        }
+        if known.insert(crate::dock::path_id(&path)) {
+            entries.push(path);
+        }
+    }
+    Ok(entries)
+}
+
+pub fn save_launchpad(entries: &[PathBuf]) -> Result<()> {
+    write_launchpad(&settings_path(LAUNCHPAD_FILE)?, entries)
+}
+
+fn write_launchpad(path: &Path, entries: &[PathBuf]) -> Result<()> {
+    let dir = path
+        .parent()
+        .expect("the launchpad file is in the settings directory");
+    std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(entry.to_str().expect("launchpad paths are valid Unicode"));
+        text.push('\n');
+    }
+    // DeskIsle has a single writer per session. Replace the list only after the full
+    // new contents are on disk, so a failed write leaves the previous list intact.
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| io_error(path, e))
+}
 
 /// The pinned applications the user saved, or `None` before the first change.
 pub fn load_pins() -> Result<Option<Vec<PinnedApp>>> {
@@ -87,8 +137,11 @@ fn io_error(path: &std::path::Path, error: std::io::Error) -> Error {
 /// Nonempty trimmed lines of a settings file under `%APPDATA%\DeskIsle`, or `None`
 /// when the user never saved one.
 fn read_setting(name: &str) -> Result<Option<Vec<String>>> {
-    let path = settings_path(name)?;
-    match std::fs::read_to_string(&path) {
+    read_lines(&settings_path(name)?)
+}
+
+fn read_lines(path: &Path) -> Result<Option<Vec<String>>> {
+    match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(
             text.lines()
                 .map(str::trim)
@@ -97,7 +150,7 @@ fn read_setting(name: &str) -> Result<Option<Vec<String>>> {
                 .collect(),
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error(&path, e)),
+        Err(e) => Err(io_error(path, e)),
     }
 }
 
@@ -108,4 +161,27 @@ fn write_setting<'a>(name: &str, lines: impl IntoIterator<Item = &'a str>) -> Re
     }
     let text: String = lines.into_iter().map(|line| format!("{line}\n")).collect();
     std::fs::write(&path, text).map_err(|e| io_error(&path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_launchpad_round_trips_shortcuts_and_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("deskisle-list-test-{}", std::process::id()));
+        let file = dir.join(LAUNCHPAD_FILE);
+        let entries = vec![
+            PathBuf::from(r"C:\应用\游戏.lnk"),
+            PathBuf::from(r"C:\Apps\Edit.EXE"),
+        ];
+        assert!(read_launchpad(&file).unwrap().is_empty());
+        write_launchpad(&file, &entries).unwrap();
+        assert_eq!(read_launchpad(&file).unwrap(), entries);
+        write_launchpad(&file, &[]).unwrap();
+        assert!(read_launchpad(&file).unwrap().is_empty());
+        assert!(!dir.join(PINS_FILE).exists());
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

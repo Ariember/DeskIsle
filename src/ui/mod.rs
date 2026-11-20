@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod icon;
+pub mod launchpad;
 pub mod layout;
 pub mod lunar;
 mod lunar_data;
