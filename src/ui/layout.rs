@@ -184,8 +184,18 @@ impl StatusLayout {
                 (item, rect)
             })
             .collect::<Vec<_>>();
-        let overflow = (total > 0).then(|| cell((system_start - px(6) - slot).max(0), slot));
-        let tray_end = overflow.map_or(system_start, |r| r.x);
+        // The overflow button keeps the tray's pitch on both sides: its center sits one
+        // slot from the last tray icon's and one slot from the first system control's, so
+        // the chevron is spaced evenly between its neighbors.
+        let first_center = system
+            .first()
+            .map_or(system_start + slot / 2, |(_, r)| r.x + r.width / 2);
+        let half = px(13).max(1);
+        let overflow = (total > 0).then(|| {
+            let center = (first_center - slot).max(half);
+            cell(center - half, 2 * half)
+        });
+        let tray_end = overflow.map_or(system_start, |r| r.x + r.width / 2 - slot / 2);
         // Keep room for the mark and the active application's name.
         let title_min = px(220);
         let capacity = ((tray_end - title_min).max(0) / slot) as usize;
@@ -326,6 +336,12 @@ mod tests {
             assert!(last.x + last.width <= overflow.x);
             let (first, sound) = (layout.system[0].1, layout.system[1].1);
             assert!(overflow.x + overflow.width <= first.x);
+            // The chevron sits on the tray's pitch, evenly between its neighbors.
+            let center = |r: Rect| r.x + r.width / 2;
+            let before = center(overflow) - center(last);
+            let after = center(first) - center(overflow);
+            assert!((before - after).abs() <= 1, "{dpi}: {before} vs {after}");
+            assert!((before - last.width).abs() <= 1);
             let (_, control) = layout.system[2];
             assert!(control.x + control.width <= layout.clock.x);
             assert_eq!(layout.hit(sound.x, 0), StatusHit::System(SystemItem::Sound));
@@ -336,8 +352,10 @@ mod tests {
             assert!(layout.clock.x + layout.clock.width <= width);
             assert!(layout.title.x + layout.title.width < layout.tray[0].rect.x);
             assert_eq!(layout.hit(last.x, 0), StatusHit::Tray(2));
-            assert_eq!(layout.hit(last.x + last.width, 0), StatusHit::Overflow);
-            assert_eq!(layout.hit(overflow.x - 1, height - 1), StatusHit::Tray(2));
+            assert_eq!(layout.hit(last.x + last.width - 1, 0), StatusHit::Tray(2));
+            assert_eq!(layout.hit(overflow.x, 0), StatusHit::Overflow);
+            let edge = overflow.x + overflow.width - 1;
+            assert_eq!(layout.hit(edge, height - 1), StatusHit::Overflow);
             assert_eq!(layout.hit(px(18), px(10)), StatusHit::Mark);
             assert_eq!(layout.hit(px(2), px(10)), StatusHit::Bar);
             assert_eq!(layout.hit(px(33), px(10)), StatusHit::Bar);
