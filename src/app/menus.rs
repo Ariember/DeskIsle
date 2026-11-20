@@ -86,7 +86,17 @@ impl Bars {
             })
             .collect::<Vec<_>>();
         let menu = menu::tray_menu(&entries);
-        self.show_menu(menu, self.tray_overflow_anchor()?)
+        let anchor = self.tray_overflow_anchor()?;
+        // The button flips to a collapse arrow while the menu is open.
+        self.overflow_open = true;
+        self.draw()?;
+        let choice = self.popup(menu, anchor, None);
+        self.overflow_open = false;
+        self.draw()?;
+        match choice? {
+            Some(command) => self.run_command(command),
+            None => Ok(false),
+        }
     }
 
     pub(super) fn tray_overflow_anchor(&self) -> Result<Anchor> {

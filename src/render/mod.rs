@@ -30,7 +30,7 @@ use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
 use crate::ui::icon::{self, Symbol};
-use crate::ui::layout::{StatusHit, StatusLayout, SystemItem};
+use crate::ui::layout::{StatusHit, StatusLayout};
 use crate::ui::system::Mark;
 
 use self::canvas::{Canvas, Palette, Text, paint};
@@ -85,7 +85,7 @@ struct TopState {
     time: String,
     stamps: Vec<u64>,
     marks: Vec<Mark>,
-    open: Option<SystemItem>,
+    open: Option<StatusHit>,
     hover: Option<StatusHit>,
 }
 
@@ -130,6 +130,8 @@ const PILL_RADIUS: f32 = 7.;
 /// the same stroke weight, so its body reads at the bar's height.
 const BAR_ICON: f32 = 16.;
 const BATTERY_ICON: f32 = 22.;
+/// The chevron of the tray overflow button, smaller than the icons beside it.
+const OVERFLOW_ICON: f32 = 13.;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
 fn ease(
@@ -250,8 +252,9 @@ impl Renderer {
     }
 
     /// Each stamp identifies the current tray image and its attention indicator.
-    /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the control
-    /// whose flyout is `open` and a fainter one behind the `hover` target.
+    /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the target whose
+    /// menu is `open` and a fainter one behind the `hover` target. The overflow button
+    /// points down while its menu is closed and up while it is open.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_top(
         &mut self,
@@ -261,7 +264,7 @@ impl Renderer {
         time: &str,
         icons: &[TrayImage],
         marks: &[Mark],
-        open: Option<SystemItem>,
+        open: Option<StatusHit>,
         hover: Option<StatusHit>,
     ) -> Result<()> {
         let state = TopState {
@@ -283,7 +286,7 @@ impl Renderer {
         let h = dip(layout.height);
         // Every target shares one rounded backing: faint while hovered, stronger while
         // its dropdown is open.
-        let open_slot = open.and_then(|item| layout.target(StatusHit::System(item)));
+        let open_slot = open.and_then(|hit| layout.target(hit));
         let hover_slot = hover
             .and_then(|hit| layout.target(hit))
             .filter(|&slot| Some(slot) != open_slot);
@@ -342,7 +345,13 @@ impl Renderer {
                 }
                 if let Some(r) = layout.overflow {
                     let x = (dip(r.x) + dip(r.x + r.width)) / 2.;
-                    c.symbol(Symbol::ChevronDown, x, h / 2., 12., c.p.muted, 1.)?;
+                    let expanded = open == Some(StatusHit::Overflow);
+                    let (symbol, ink) = match (expanded, hover == Some(StatusHit::Overflow)) {
+                        (true, _) => (Symbol::ChevronUp, c.p.ink),
+                        (false, true) => (Symbol::ChevronDown, c.p.ink),
+                        (false, false) => (Symbol::ChevronDown, c.p.muted),
+                    };
+                    c.symbol(symbol, x, h / 2., OVERFLOW_ICON, ink, 1.)?;
                 }
                 for (&(_, r), mark) in layout.system.iter().zip(marks) {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));

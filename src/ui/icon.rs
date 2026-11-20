@@ -22,7 +22,10 @@ pub enum Symbol {
     Muted,
     /// Two switches, the control center's mark.
     Controls,
+    /// The tray overflow button while its menu is closed: more icons below.
     ChevronDown,
+    /// The tray overflow button while its menu is open.
+    ChevronUp,
     Sun,
     Moon,
     Contrast,
@@ -230,8 +233,12 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
             s.rect(2.5, 13., 21.5, 20.5, 3.75, Stroke);
             s.circle(6.25, 16.75, 1.75, Fill).alpha = 0.45;
         }
+        // Mirror images around the grid's middle, so the button keeps its place as it flips.
         Symbol::ChevronDown => {
-            s.line(&[(6.5, 9.5), (12., 15.), (17.5, 9.5)]);
+            s.line(&[(6.5, 9.25), (12., 14.75), (17.5, 9.25)]);
+        }
+        Symbol::ChevronUp => {
+            s.line(&[(6.5, 14.75), (12., 9.25), (17.5, 14.75)]);
         }
         Symbol::Sun => {
             s.circle(12., 12., 4., Stroke);
@@ -748,6 +755,7 @@ mod tests {
         Symbol::Muted,
         Symbol::Controls,
         Symbol::ChevronDown,
+        Symbol::ChevronUp,
         Symbol::Sun,
         Symbol::Moon,
         Symbol::Contrast,
@@ -865,6 +873,15 @@ mod tests {
             charging: false,
         });
         assert_eq!(unknown.len(), 2);
+    }
+
+    #[test]
+    fn overflow_chevrons_mirror_each_other() {
+        let flipped: Vec<Point> = points(&sketch(Symbol::ChevronDown)[0])
+            .into_iter()
+            .map(|(x, y)| (x, GRID - y))
+            .collect();
+        assert_eq!(flipped, points(&sketch(Symbol::ChevronUp)[0]));
     }
 
     #[test]

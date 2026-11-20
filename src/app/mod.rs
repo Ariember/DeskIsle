@@ -62,6 +62,8 @@ struct Bars {
     media: Option<Media>,
     /// The system control whose flyout is open, highlighted on the bar.
     open_flyout: Option<SystemItem>,
+    /// The tray overflow menu is open; its button shows a collapse arrow meanwhile.
+    overflow_open: bool,
     /// Restored after the bars are gone, on exit or when the user turns hiding off.
     native_taskbar: NativeTaskbar,
 }
@@ -169,6 +171,7 @@ pub(crate) fn run() -> Result<()> {
         media: None,
         audio_watch,
         open_flyout: None,
+        overflow_open: false,
         native_taskbar,
     };
     bars.restatus();
@@ -543,7 +546,9 @@ impl Bars {
             &self.time,
             &tray,
             &marks,
-            self.open_flyout,
+            self.open_flyout
+                .map(StatusHit::System)
+                .or(self.overflow_open.then_some(StatusHit::Overflow)),
             self.top_hover,
         )?;
         let icons = self
