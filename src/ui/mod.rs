@@ -1,3 +1,4 @@
+pub mod about;
 pub mod calendar;
 pub mod icon;
 pub mod launchpad;

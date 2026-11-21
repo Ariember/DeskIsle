@@ -1,3 +1,4 @@
+mod about;
 mod canvas;
 mod launchpad;
 mod menu;
@@ -36,6 +37,7 @@ use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{StatusHit, StatusLayout};
 use crate::ui::system::Mark;
 
+use self::about::AboutView;
 use self::canvas::{Canvas, Palette, Text, paint};
 use self::menu::MenuView;
 use self::panel::PanelView;
@@ -79,6 +81,7 @@ pub struct Renderer {
     metric_layer: Option<metrics::MetricLayer>,
     menu: Option<MenuView>,
     panel: Option<PanelView>,
+    about: Option<AboutView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
     mark: Option<MarkLayer>,
@@ -282,6 +285,7 @@ impl Renderer {
                 metric_layer: None,
                 menu: None,
                 panel: None,
+                about: None,
                 launchpad: None,
                 palette: Palette::new(dark),
                 mark: None,

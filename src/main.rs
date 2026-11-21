@@ -5,6 +5,7 @@ mod dock;
 mod geometry;
 mod integrations;
 mod launchpad;
+mod machine;
 mod metrics;
 mod platform;
 mod render;

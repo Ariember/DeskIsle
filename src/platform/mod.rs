@@ -1,6 +1,8 @@
+pub mod about;
 pub mod audio;
 pub mod display;
 pub mod launchpad;
+pub mod machine;
 pub mod media;
 pub mod metrics;
 pub mod network;
@@ -114,6 +116,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
             return Err(Error::from_thread());
         }
         launchpad::register_class(instance, wc.hCursor)?;
+        about::register_class(instance, wc.hCursor)?;
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -415,6 +418,7 @@ pub enum Event {
     PanelDpi(u32),
     PanelClose,
     Launchpad(launchpad::LaunchpadEvent),
+    About(about::AboutEvent),
     Quit,
 }
 
@@ -529,6 +533,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::PanelScroll(_)
                     | Event::PanelKey(_)
                     | Event::Launchpad(_)
+                    | Event::About(_)
             )
         {
             events.push_back(event);

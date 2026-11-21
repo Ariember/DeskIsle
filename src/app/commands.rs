@@ -43,6 +43,7 @@ impl Bars {
             Command::SignOut => power::sign_out(),
             Command::Lock => power::lock(),
             Command::Settings => self.open_settings(),
+            Command::About => self.open_about(),
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
             // Navigation is handled inside the open menu.

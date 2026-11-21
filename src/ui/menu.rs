@@ -708,6 +708,8 @@ pub enum Command {
     /// Locks the screen.
     Lock,
     Settings,
+    /// Shows the About card with this computer's hardware and Windows release.
+    About,
     DateTime,
     Notifications,
     /// Turns the clock menu's calendar to a month; the menu stays open.
@@ -928,11 +930,7 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
 /// power and session commands. Those that end the session are marked as dangerous.
 pub fn mark_menu() -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
-    menu.item(
-        "关于本机",
-        Icon::Symbol(Symbol::Info),
-        Some(Command::Open("ms-settings:about")),
-    );
+    menu.item("关于本机", Icon::Symbol(Symbol::Info), Some(Command::About));
     menu.separator();
     menu.item(
         "管理面板",
@@ -1441,7 +1439,7 @@ mod tests {
         assert_eq!(
             commands(&menu),
             [
-                Command::Open("ms-settings:about"),
+                Command::About,
                 Command::Settings,
                 Command::Open("ms-settings:"),
                 Command::Open("ms-windows-store:"),

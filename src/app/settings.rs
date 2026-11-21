@@ -98,6 +98,7 @@ impl Bars {
             return Ok(());
         };
         let repalette = renderer.set_dark(dark);
+        self.retheme_about(dark, repalette)?;
         let Some(panel) = self.panel.as_mut() else {
             return Ok(());
         };

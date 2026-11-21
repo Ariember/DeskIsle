@@ -1,3 +1,4 @@
+mod about;
 mod commands;
 mod launchpad;
 mod menus;
@@ -32,6 +33,8 @@ struct Bars {
     renderer: Option<Renderer>,
     /// Released after the renderer, which drops the panel's composition target first.
     panel: Option<settings::Panel>,
+    /// Released after the renderer, like the panel.
+    about: Option<about::About>,
     launchpad: Option<launchpad::Launchpad>,
     tray: TrayHost,
     appbar: AppBar,
@@ -158,6 +161,7 @@ pub(crate) fn run() -> Result<()> {
         events,
         renderer,
         panel: None,
+        about: None,
         launchpad: None,
         appbar,
         tray,
@@ -325,6 +329,7 @@ pub(crate) fn run() -> Result<()> {
             Event::RightClick(owner, x, y) if bars.context_menu(owner, x, y)? => return Ok(()),
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
             Event::Launchpad(input) => bars.launchpad_event(input)?,
+            Event::About(input) => bars.about_event(input)?,
             event @ (Event::PanelMove(..)
             | Event::PanelLeave
             | Event::PanelClick(..)
@@ -579,6 +584,7 @@ impl Bars {
         );
         self.draw_frame()?;
         self.paint_panel()?;
+        self.paint_about()?;
         self.paint_launchpad()
     }
 
