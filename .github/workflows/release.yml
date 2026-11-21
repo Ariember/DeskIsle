@@ -1,0 +1,92 @@
+name: Windows CI and Release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Check and build Windows x64
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Read package version
+        id: package
+        run: |
+          $metadata = cargo +stable metadata --format-version 1 --no-deps --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "version=$($metadata.packages[0].version)" >> $env:GITHUB_OUTPUT
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Build release executable
+        run: cargo +stable build --release --locked
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'push'
+        with:
+          name: deskisle-windows-x64
+          path: target/release/deskisle.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-v${{ needs.build.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: deskisle-windows-x64
+
+      - name: Publish unpublished version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $tag = "v$env:VERSION"
+          $repoApi = "$env:GITHUB_API_URL/repos/$env:GH_REPO"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $release = Invoke-RestMethod "$repoApi/releases/tags/$tag" -Headers $headers -SkipHttpErrorCheck -StatusCodeVariable status
+          if ($status -eq 200) {
+            if ($release.draft) { throw "A draft release already exists for $tag." }
+            Write-Host "$tag is already published."
+            exit 0
+          }
+          if ($status -ne 404) { throw "Cannot look up release $tag (HTTP $status)." }
+
+          $refs = Invoke-RestMethod "$repoApi/git/matching-refs/tags/$tag" -Headers $headers
+          if ($refs.ref -ccontains "refs/tags/$tag") {
+            $commit = Invoke-RestMethod "$repoApi/commits/tags/$tag" -Headers $headers
+            if ($commit.sha -ne $env:GITHUB_SHA) { throw "Tag $tag points to a different commit." }
+          }
+
+          $options = @('--target', $env:GITHUB_SHA, '--generate-notes')
+          if (($env:VERSION -split '\+')[0].Contains('-')) { $options += '--prerelease' }
+          gh release create $tag deskisle.exe @options

@@ -41,6 +41,14 @@ cargo test --locked
 
 在交互式 Windows 桌面上，可运行 `cargo test --locked --test windows_bars -- --ignored` 验证双栏位置和工作区恢复。
 
+## 自动发布
+
+向 `main` 提交 PR 或推送代码时，GitHub Actions 会在 Windows x64 上运行格式检查、Clippy、测试和 Release 构建。需要交互式桌面的测试仍由开发者在本机运行。
+
+发布新版本时，更新 `Cargo.toml` 的 `[package].version`，运行 `cargo check` 同步 `Cargo.lock`，将两者一起合入 `main`。检查通过后，工作流会为尚未发布的版本在本次提交上创建 `v<版本号>` 标签和 GitHub Release，生成发布说明，并附上 `deskisle.exe`。首次启用时也会发布清单中的当前版本。已发布的版本会跳过，带预发布标识的版本（如 `0.2.0-beta.1`）会标记为预发布。
+
+## 项目文档
+
 - [开发选型](docs/technology.md)
 - [架构规范](docs/architecture.md)
 - [开发规范](AGENTS.md)
