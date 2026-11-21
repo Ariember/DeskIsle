@@ -35,6 +35,58 @@ pub struct PowerPlan {
     pub active: bool,
 }
 
+/// What a power plan trades off, so the UI can show it at a glance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanKind {
+    Saver,
+    /// Keeps the fans quiet, such as a laptop maker's Silent mode.
+    Quiet,
+    Balanced,
+    Performance,
+    /// Windows' Ultimate Performance or a maker's Turbo mode.
+    Ultimate,
+    /// A plan whose purpose neither its GUID nor its name reveals.
+    Custom,
+}
+
+/// The GUIDs of the plans Windows ships.
+const POWER_SAVER: u128 = 0xa1841308_3541_4fab_bc81_f71556f20b4a;
+const BALANCED: u128 = 0x381b4222_f694_41f0_9685_ff5bb260df2e;
+const HIGH_PERFORMANCE: u128 = 0x8c5e7fda_e8bf_4a96_9a85_a6e23a8c635c;
+const ULTIMATE_PERFORMANCE: u128 = 0xe9a42b02_d5df_448d_aa00_03f14749eb61;
+
+impl PowerPlan {
+    /// Windows' own plans are known by GUID. A plan copied from one gets a new GUID but
+    /// usually keeps a telling name, as do most manufacturer plans, so the name decides
+    /// next, matched without regard to case ("Silent", "TURBO"). Words for the top plan
+    /// are checked before "性能" and "performance", which names such as "卓越性能" and
+    /// "Turbo Performance" also contain.
+    pub fn kind(&self) -> PlanKind {
+        match self.id {
+            POWER_SAVER => return PlanKind::Saver,
+            BALANCED => return PlanKind::Balanced,
+            HIGH_PERFORMANCE => return PlanKind::Performance,
+            ULTIMATE_PERFORMANCE => return PlanKind::Ultimate,
+            _ => {}
+        }
+        let name = self.name.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|word| name.contains(word));
+        if has(&["卓越", "ultimate", "turbo", "野兽", "beast", "极速", "增强"]) {
+            PlanKind::Ultimate
+        } else if has(&["silent", "quiet", "静音", "安静"]) {
+            PlanKind::Quiet
+        } else if has(&["节能", "省电", "节电", "saver", "eco"]) {
+            PlanKind::Saver
+        } else if has(&["性能", "performance"]) {
+            PlanKind::Performance
+        } else if has(&["平衡", "均衡", "balanced"]) {
+            PlanKind::Balanced
+        } else {
+            PlanKind::Custom
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Display {
     /// Brightness of the primary monitor in percent, for monitors that support DDC/CI.
@@ -107,5 +159,34 @@ mod tests {
         }
         assert_eq!(to_percent(5, 5, 5), 100);
         assert_eq!(to_percent(999, 0, 100), 100);
+    }
+
+    #[test]
+    fn power_plans_are_known_by_guid_then_by_name() {
+        let plan = |id, name: &str| {
+            PowerPlan {
+                id,
+                name: name.into(),
+                active: false,
+            }
+            .kind()
+        };
+        // A built-in plan keeps its kind under any localized or renamed label.
+        assert_eq!(plan(POWER_SAVER, "My plan"), PlanKind::Saver);
+        assert_eq!(plan(BALANCED, "Balanced"), PlanKind::Balanced);
+        assert_eq!(plan(HIGH_PERFORMANCE, "高性能"), PlanKind::Performance);
+        assert_eq!(plan(ULTIMATE_PERFORMANCE, "卓越性能"), PlanKind::Ultimate);
+        assert_eq!(plan(1, "卓越性能 (副本)"), PlanKind::Ultimate);
+        assert_eq!(plan(1, "Lenovo 节能"), PlanKind::Saver);
+        assert_eq!(plan(1, "High Performance"), PlanKind::Performance);
+        assert_eq!(plan(1, "平衡（推荐）"), PlanKind::Balanced);
+        // Laptop makers' modes, often in English on a Chinese system.
+        assert_eq!(plan(1, "Silent"), PlanKind::Quiet);
+        assert_eq!(plan(1, "静音模式"), PlanKind::Quiet);
+        assert_eq!(plan(1, "Turbo"), PlanKind::Ultimate);
+        assert_eq!(plan(1, "TURBO Performance"), PlanKind::Ultimate);
+        assert_eq!(plan(1, "野兽模式"), PlanKind::Ultimate);
+        assert_eq!(plan(1, "均衡"), PlanKind::Balanced);
+        assert_eq!(plan(1, "游戏"), PlanKind::Custom);
     }
 }

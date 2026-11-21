@@ -3,7 +3,9 @@
 //! change a system feature and leave the flyout open, rebuilt from fresh state.
 
 use crate::settings::{Key, Settings};
-use crate::system::{Audio, Battery, Display, Media, MediaAction, Network, PowerPlan, RadioKind};
+use crate::system::{
+    Audio, Battery, Display, Media, MediaAction, Network, PlanKind, PowerPlan, RadioKind,
+};
 use crate::ui::icon::Symbol;
 use crate::ui::layout::SystemItem;
 use crate::ui::menu::{Command, DROPDOWN_WIDTH, Entry, Icon, Menu, Slider, SliderTarget, Tile};
@@ -250,7 +252,7 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
             choice(
                 &mut menu,
                 plan.name.clone(),
-                Symbol::Bolt,
+                plan_symbol(plan.kind()),
                 plan.active,
                 Some(SystemCommand::SetPlan(plan.id)),
             );
@@ -270,6 +272,19 @@ pub fn battery_flyout(battery: Option<Battery>, plans: &[PowerPlan]) -> Menu<Com
         Some(Command::Open("ms-settings:powersleep")),
     );
     menu
+}
+
+/// A leaf for saving energy, a gauge whose needle rises from quiet through balanced to
+/// performance, a rocket for the top plan, and the bolt for a plan of unknown purpose.
+fn plan_symbol(kind: PlanKind) -> Symbol {
+    match kind {
+        PlanKind::Saver => Symbol::Leaf,
+        PlanKind::Quiet => Symbol::Gauge(20),
+        PlanKind::Balanced => Symbol::Gauge(50),
+        PlanKind::Performance => Symbol::Gauge(80),
+        PlanKind::Ultimate => Symbol::Rocket,
+        PlanKind::Custom => Symbol::Bolt,
+    }
 }
 
 /// Brightness, dark mode, Symbol::Hdr and the display settings.

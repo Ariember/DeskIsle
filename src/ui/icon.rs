@@ -36,6 +36,13 @@ pub enum Symbol {
     Hdr,
     Speaker,
     Bolt,
+    // Power plans.
+    /// Saving energy.
+    Leaf,
+    /// A speedometer lit up to its needle, from 0 (rest) to 100 (flat out).
+    Gauge(u8),
+    /// The highest-performance plan.
+    Rocket,
     Cast,
     Music,
     Previous,
@@ -320,6 +327,67 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
                 true,
                 Stroke,
             );
+        }
+        Symbol::Leaf => {
+            // Mirrored about the diagonal from its stem to its tip.
+            s.push(
+                (5., 19.),
+                vec![
+                    Step::Quad {
+                        control: (4., 4.),
+                        to: (20., 4.),
+                    },
+                    Step::Quad {
+                        control: (20., 20.),
+                        to: (5., 19.),
+                    },
+                ],
+                true,
+                Stroke,
+            );
+            s.line(&[(3., 21.), (13.5, 10.5)]);
+        }
+        Symbol::Gauge(level) => {
+            // A 240° dial open at the bottom; the needle sweeps it clockwise.
+            let (x, y, radius) = (12., 14.5, 9.);
+            let needle = 150. + f32::from(level.min(100)) * 2.4;
+            if level < 100 {
+                s.arc(x, y, radius, needle, 390.).alpha = 0.35;
+            }
+            if level > 0 {
+                s.arc(x, y, radius, 150., needle);
+            }
+            s.line(&[(x, y), polar(x, y, 6., needle)]);
+            s.circle(x, y, 1.75, Fill);
+        }
+        Symbol::Rocket => {
+            s.push(
+                (12., 2.5),
+                vec![
+                    Step::Quad {
+                        control: (17., 7.),
+                        to: (15.5, 16.5),
+                    },
+                    Step::Line((8.5, 16.5)),
+                    Step::Quad {
+                        control: (7., 7.),
+                        to: (12., 2.5),
+                    },
+                ],
+                true,
+                Stroke,
+            );
+            s.circle(12., 9.5, 1.25, Fill);
+            for side in [-1., 1.] {
+                let x = |dx: f32| 12. + side * dx;
+                s.polyline(
+                    &[(x(3.8), 12.), (x(7.), 15.5), (x(7.), 19.), (x(3.5), 16.5)],
+                    0.8,
+                    false,
+                    Stroke,
+                );
+            }
+            s.line(&[(12., 19.5), (12., 21.5)]);
         }
         Symbol::Cast => {
             s.polyline(
@@ -871,6 +939,11 @@ mod tests {
         Symbol::Hdr,
         Symbol::Speaker,
         Symbol::Bolt,
+        Symbol::Leaf,
+        Symbol::Gauge(0),
+        Symbol::Gauge(50),
+        Symbol::Gauge(100),
+        Symbol::Rocket,
         Symbol::Cast,
         Symbol::Music,
         Symbol::Previous,
