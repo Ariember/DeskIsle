@@ -25,6 +25,9 @@ impl Bars {
             Command::Window(id, window) => shell::activate(&id, window).map(drop),
             Command::NewInstance(path) => shell::execute(owner, &path),
             Command::Reveal(path) => shell::reveal(owner, &path),
+            Command::RunAsAdmin(path) => shell::run_as_admin(owner, &path).map(drop),
+            Command::Properties(path) => shell::properties(owner, &path),
+            Command::LaunchpadRemove(path) => self.remove_launchpad_entry(&path),
             Command::Pin(path) => {
                 let mut pins = self.pins.clone();
                 dock::pin(&mut pins, &path);

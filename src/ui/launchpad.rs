@@ -23,6 +23,9 @@ pub struct LaunchpadLayout {
     pub width: i32,
     pub height: i32,
     pub dpi: u32,
+    /// Height in DIPs of the part above the Dock. The window reaches the bottom of the
+    /// screen behind the Dock, while the grid, page dots and hints stay above it.
+    pub content: f32,
     pub search: Area,
     pub tiles: Vec<Tile>,
     pub dots: Vec<(usize, Area)>,
@@ -31,16 +34,19 @@ pub struct LaunchpadLayout {
 }
 
 impl LaunchpadLayout {
+    /// `content_height` is how many pixels from the top stay clear of the Dock.
     pub fn new(
         width: i32,
         height: i32,
+        content_height: i32,
         dpi: u32,
         paths: &[PathBuf],
         query: &str,
         page: usize,
     ) -> Self {
         let scale = dpi as f32 / 96.;
-        let (w, h) = (width as f32 / scale, height as f32 / scale);
+        let w = width as f32 / scale;
+        let h = content_height.clamp(1, height.max(1)) as f32 / scale;
         let search_width = 216_f32.min(w * 0.8);
         let search_y = (h * 0.026).min(24.);
         let search = Area::new(
@@ -119,6 +125,7 @@ impl LaunchpadLayout {
             width,
             height,
             dpi,
+            content: h,
             search,
             tiles,
             dots,
@@ -156,7 +163,7 @@ mod tests {
     #[test]
     fn filtered_tile_launches_original_entry_at_scaled_coordinates() {
         let paths = ["editor.exe", "Studio Canary.lnk", "studio.exe"].map(PathBuf::from);
-        let layout = LaunchpadLayout::new(1440, 900, 144, &paths, "StUdIo", 4);
+        let layout = LaunchpadLayout::new(1440, 900, 900, 144, &paths, "StUdIo", 4);
         assert_eq!(layout.first_item(), Some(1));
         let icon = layout.tiles[1].icon;
         assert_eq!(
@@ -168,7 +175,7 @@ mod tests {
         );
         assert_eq!(layout.hit(0, 0), LaunchpadHit::Background);
         assert_eq!(
-            LaunchpadLayout::new(1440, 900, 144, &paths, "missing", 0).first_item(),
+            LaunchpadLayout::new(1440, 900, 900, 144, &paths, "missing", 0).first_item(),
             None
         );
     }
@@ -176,8 +183,8 @@ mod tests {
     #[test]
     fn page_dots_reach_last_entry_and_page_clamps_after_removal() {
         let paths: Vec<_> = (0..52).map(|i| PathBuf::from(format!("{i}.exe"))).collect();
-        let first = LaunchpadLayout::new(800, 600, 96, &paths, "", 0);
-        let last = LaunchpadLayout::new(800, 600, 96, &paths, "", usize::MAX);
+        let first = LaunchpadLayout::new(800, 600, 600, 96, &paths, "", 0);
+        let last = LaunchpadLayout::new(800, 600, 600, 96, &paths, "", usize::MAX);
         let dot = first.dots.last().unwrap().1;
         assert_eq!(
             first.hit(dot.left as i32 + 1, dot.middle() as i32),
@@ -185,8 +192,19 @@ mod tests {
         );
         assert_eq!(last.tiles.last().unwrap().index, 51);
         assert_eq!(
-            LaunchpadLayout::new(800, 600, 96, &paths[..1], "", last.page).page,
+            LaunchpadLayout::new(800, 600, 600, 96, &paths[..1], "", last.page).page,
             0
         );
+    }
+
+    #[test]
+    fn content_above_the_dock_stays_clear_of_the_covered_strip() {
+        let paths: Vec<_> = (0..80).map(|i| PathBuf::from(format!("{i}.exe"))).collect();
+        // A 1000 px window whose lowest 120 px sit behind the Dock.
+        let layout = LaunchpadLayout::new(1600, 1000, 880, 96, &paths, "", 0);
+        assert_eq!(layout.content, 880.);
+        assert!(layout.tiles.iter().all(|tile| tile.hit.bottom <= 880.));
+        assert!(layout.dots.iter().all(|(_, dot)| dot.bottom <= 880.));
+        assert_eq!(layout.hit(800, 950), LaunchpadHit::Background);
     }
 }

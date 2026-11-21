@@ -176,7 +176,7 @@ impl Renderer {
                     centered(c, &self.write, &tile.name, tile.label, 13., true, 1.)?;
                 }
                 if layout.tiles.is_empty() {
-                    let mid = h / 2.;
+                    let mid = layout.content / 2.;
                     if paths.is_empty() {
                         c.symbol(Symbol::Apps, w / 2., mid - 42., 44., WHITE, 0.78)?;
                         centered(

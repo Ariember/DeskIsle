@@ -304,6 +304,7 @@ pub const TITLE_SIZE: f32 = 14.;
 /// Standard width for status bar flyouts and application menus, in DIPs.
 pub const DROPDOWN_WIDTH: f32 = 320.;
 const MARK_MENU_WIDTH: f32 = 220.;
+const LAUNCHPAD_MENU_WIDTH: f32 = 240.;
 /// Distance between the menu and the target it was opened for, in DIPs.
 const GAP: f32 = 6.;
 
@@ -695,6 +696,12 @@ pub enum Command {
     Window(String, isize),
     NewInstance(PathBuf),
     Reveal(PathBuf),
+    /// Starts a program or shortcut with administrator rights after the UAC prompt.
+    RunAsAdmin(PathBuf),
+    /// The Shell's property sheet, where a shortcut's icon can be changed.
+    Properties(PathBuf),
+    /// Takes an entry out of the launchpad; the file itself stays.
+    LaunchpadRemove(PathBuf),
     Pin(PathBuf),
     Unpin(String),
     CloseWindow(String, isize),
@@ -863,6 +870,60 @@ pub fn window_menu(app: &AppGroup, foreground: Option<isize>) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     app_header(&mut menu, app, false);
     windows_list(&mut menu, app, foreground);
+    menu
+}
+
+/// The menu of a program in the launchpad.
+pub fn launchpad_menu(path: &std::path::Path) -> Menu<Command> {
+    let mut menu = Menu::fixed(LAUNCHPAD_MENU_WIDTH);
+    let name = path
+        .file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let (kind, shortcut) = match extension.as_str() {
+        "lnk" | "url" => ("快捷方式", true),
+        "exe" | "com" | "bat" | "cmd" => ("应用程序", false),
+        _ if path.is_dir() => ("文件夹", false),
+        _ => ("文件", false),
+    };
+    menu.header(name, kind, Icon::File(path.into()));
+    menu.separator();
+    menu.item(
+        "打开",
+        Icon::Symbol(Symbol::Open),
+        Some(Command::NewInstance(path.into())),
+    );
+    menu.item(
+        "以管理员身份运行",
+        Icon::Symbol(Symbol::Shield),
+        Some(Command::RunAsAdmin(path.into())),
+    );
+    menu.separator();
+    menu.item(
+        "打开文件所在位置",
+        Icon::Symbol(Symbol::Folder),
+        Some(Command::Reveal(path.into())),
+    );
+    let properties = menu.item(
+        "属性",
+        Icon::Symbol(Symbol::Info),
+        Some(Command::Properties(path.into())),
+    );
+    if shortcut {
+        properties.detail = "可更改图标".into();
+    }
+    menu.separator();
+    let remove = menu.item(
+        "从启动台移除",
+        Icon::Symbol(Symbol::Minus),
+        Some(Command::LaunchpadRemove(path.into())),
+    );
+    remove.danger = true;
     menu
 }
 
@@ -1642,6 +1703,45 @@ mod tests {
             let fixed = MenuLayout::new(&mut fixed, 96, measure);
             assert_eq!(fixed.width, DROPDOWN_WIDTH + 2. * SHADOW);
         }
+    }
+
+    #[test]
+    fn launchpad_menu_offers_launch_admin_location_and_safe_removal() {
+        let path = PathBuf::from(r"C:\Keil\UV4\uVision.lnk");
+        let menu = launchpad_menu(&path);
+        assert!(matches!(
+            &menu.entries[0],
+            Entry::Header { title, subtitle, .. } if title == "uVision" && subtitle == "快捷方式"
+        ));
+        assert_eq!(
+            commands(&menu),
+            [
+                Command::NewInstance(path.clone()),
+                Command::RunAsAdmin(path.clone()),
+                Command::Reveal(path.clone()),
+                Command::Properties(path.clone()),
+                Command::LaunchpadRemove(path.clone()),
+            ]
+        );
+        // Only removal is styled as destructive, and it is set apart at the end.
+        let danger: Vec<_> = menu
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Item(item) if item.danger => item.command.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(danger, [Command::LaunchpadRemove(path)]);
+        assert!(matches!(
+            menu.entries[menu.entries.len() - 2],
+            Entry::Separator
+        ));
+        let exe = launchpad_menu(std::path::Path::new(r"D:\Tools\editor.exe"));
+        assert!(matches!(
+            &exe.entries[0],
+            Entry::Header { subtitle, .. } if subtitle == "应用程序"
+        ));
     }
 
     #[test]

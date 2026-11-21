@@ -1,19 +1,22 @@
 use super::{EVENTS, Event, MK_LBUTTON, drop_files, queue, track_leave};
 use crate::geometry::Rect;
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use windows::Win32::{
     Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::ValidateRect,
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN},
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_LBUTTON, VK_NEXT, VK_PRIOR,
+            VK_RBUTTON, VK_RETURN,
+        },
         Shell::HDROP,
         WindowsAndMessaging::*,
     },
 };
-use windows::core::{Error, HSTRING, PCWSTR, Result, w};
+use windows::core::{Error, PCWSTR, Result, w};
 
 const CLASS: PCWSTR = w!("DeskIsle.Launchpad");
 
@@ -105,20 +108,13 @@ impl LaunchpadWindow {
     }
 }
 
-pub fn confirm_remove(owner: HWND, path: &Path) -> bool {
-    let name = path
-        .file_stem()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
-    let prompt = HSTRING::from(format!("从启动台移除“{name}”？原文件将保留。"));
-    unsafe {
-        MessageBoxW(
-            Some(owner),
-            PCWSTR(prompt.as_ptr()),
-            w!("启动台"),
-            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
-        ) == IDYES
-    }
+/// Whether the primary mouse button is held right now, as the hardware reports it.
+/// A menu dismissed by this press has not yet seen its button go up.
+pub fn primary_button_down() -> bool {
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    let button = if swapped { VK_RBUTTON } else { VK_LBUTTON };
+    let state = unsafe { GetAsyncKeyState(i32::from(button.0)) };
+    state < 0
 }
 
 // WM_CHAR delivers supplementary characters in two UTF-16 messages. There is one

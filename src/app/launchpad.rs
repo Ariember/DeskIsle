@@ -1,20 +1,25 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::Bars;
 use crate::dock::path_id;
 use crate::geometry::Rect;
-use crate::platform::launchpad::{LaunchpadEvent, LaunchpadKey, LaunchpadWindow, confirm_remove};
+use crate::platform::launchpad::{
+    LaunchpadEvent, LaunchpadKey, LaunchpadWindow, primary_button_down,
+};
 use crate::platform::{self, shell};
 use crate::render::is_device_lost;
 use crate::storage;
 use crate::ui::launchpad::{LaunchpadHit, LaunchpadLayout};
 use crate::ui::layout::DockDrop;
+use crate::ui::menu::{self, Anchor, Command};
 use windows::core::Result;
 
 pub(super) struct Launchpad {
     window: LaunchpadWindow,
     rect: Rect,
+    /// Pixels from the top of the window that stay clear of the Dock.
+    content: i32,
     dpi: u32,
     paths: Vec<PathBuf>,
     query: String,
@@ -22,6 +27,8 @@ pub(super) struct Launchpad {
     wheel: i32,
     hover: Option<usize>,
     pressed: bool,
+    /// The click that dismissed a tile's menu, which must not also close the launchpad.
+    swallow_press: bool,
 }
 
 impl Launchpad {
@@ -33,6 +40,7 @@ impl Launchpad {
         self.layout = LaunchpadLayout::new(
             self.rect.width,
             self.rect.height,
+            self.content,
             self.dpi,
             &self.paths,
             &self.query,
@@ -75,14 +83,21 @@ impl Bars {
         Ok(())
     }
 
-    fn launchpad_rect(&self) -> Rect {
+    /// The window covers everything below the status bar down to the bottom of the
+    /// screen, including the strip Explorer's hidden taskbar leaves behind. The Dock is
+    /// topmost and stays above it; the second value is the height left above the Dock.
+    fn launchpad_rect(&self) -> (Rect, i32) {
         let work = self.monitor.work;
+        let bounds = self.monitor.bounds;
         let top = work.y.max(self.top_rect.y + self.top_rect.height);
-        Rect {
+        let bottom = (bounds.y + bounds.height).max(top + 1);
+        let rect = Rect {
             y: top,
-            height: (self.layout.bottom.y - top).max(1),
+            height: bottom - top,
             ..work
-        }
+        };
+        let content = (self.layout.bottom.y - top).clamp(1, rect.height);
+        (rect, content)
     }
 
     pub(super) fn open_launchpad(&mut self) -> Result<()> {
@@ -91,13 +106,14 @@ impl Bars {
             return Ok(());
         }
         let paths = storage::load_launchpad()?;
-        let rect = self.launchpad_rect();
+        let (rect, content) = self.launchpad_rect();
         let dpi = self.monitor.dpi;
-        let layout = LaunchpadLayout::new(rect.width, rect.height, dpi, &paths, "", 0);
+        let layout = LaunchpadLayout::new(rect.width, rect.height, content, dpi, &paths, "", 0);
         let window = LaunchpadWindow::create(rect)?;
         self.launchpad = Some(Launchpad {
             window,
             rect,
+            content,
             dpi,
             paths,
             query: String::new(),
@@ -105,6 +121,7 @@ impl Bars {
             wheel: 0,
             hover: None,
             pressed: false,
+            swallow_press: false,
         });
         if let Err(error) = self.draw_launchpad() {
             self.close_launchpad();
@@ -124,15 +141,18 @@ impl Bars {
     }
 
     pub(super) fn resize_launchpad(&mut self) -> Result<()> {
-        let rect = self.launchpad_rect();
+        let (rect, content) = self.launchpad_rect();
         let Some(pad) = &mut self.launchpad else {
             return Ok(());
         };
-        if (pad.rect, pad.dpi) == (rect, self.monitor.dpi) {
+        if (pad.rect, pad.content, pad.dpi) == (rect, content, self.monitor.dpi) {
             return Ok(());
         }
-        pad.window.place(rect)?;
+        if pad.rect != rect {
+            pad.window.place(rect)?;
+        }
         pad.rect = rect;
+        pad.content = content;
         pad.dpi = self.monitor.dpi;
         pad.layout_page(pad.layout.page);
         self.draw_launchpad()
@@ -177,7 +197,7 @@ impl Bars {
         let dock_client = |x: i32, y: i32| (pad.rect.x + x - dock.x, pad.rect.y + y - dock.y);
         let next_page = match input {
             LaunchpadEvent::Press => {
-                pad.pressed = true;
+                pad.pressed = !std::mem::take(&mut pad.swallow_press);
                 return Ok(());
             }
             LaunchpadEvent::Move { x, y, .. } if self.dock_press.is_some() => {
@@ -189,7 +209,10 @@ impl Bars {
                 let (x, y) = dock_client(x, y);
                 return self.release_dock(x, y);
             }
-            LaunchpadEvent::Click(..) if !std::mem::take(&mut pad.pressed) => return Ok(()),
+            LaunchpadEvent::Click(..) if !std::mem::take(&mut pad.pressed) => {
+                pad.swallow_press = false;
+                return Ok(());
+            }
             LaunchpadEvent::Close | LaunchpadEvent::Key(LaunchpadKey::Escape) => {
                 self.close_launchpad();
                 return Ok(());
@@ -213,16 +236,7 @@ impl Bars {
                 let LaunchpadHit::Item(index) = pad.layout.hit(x, y) else {
                     return Ok(());
                 };
-                if !confirm_remove(owner, &pad.paths[index]) {
-                    return Ok(());
-                }
-                let mut next = pad.paths.clone();
-                next.remove(index);
-                if let Err(error) = pad.save(next) {
-                    platform::report_error(Some(owner), &error);
-                    return Ok(());
-                }
-                page
+                return self.launchpad_menu(index);
             }
             LaunchpadEvent::DropFiles(files) => {
                 return self.import_files(owner, DockDrop::Launchpad, files);
@@ -291,6 +305,79 @@ impl Bars {
             Err(error) => platform::report_error(Some(pad.window.0), &error),
         }
         Ok(())
+    }
+
+    /// DeskIsle's own menu for a tile, opening below it the way the Dock's menus open
+    /// above their icons.
+    fn launchpad_menu(&mut self, index: usize) -> Result<()> {
+        let Some(pad) = &self.launchpad else {
+            return Ok(());
+        };
+        let Some(tile) = pad.layout.tiles.iter().find(|tile| tile.index == index) else {
+            return Ok(());
+        };
+        let scale = pad.dpi as f32 / 96.;
+        let anchor = Anchor {
+            x: pad.rect.x + ((tile.icon.left + tile.icon.right) / 2. * scale).round() as i32,
+            y: pad.rect.y + (tile.label.bottom * scale).round() as i32,
+            up: false,
+        };
+        let path = pad.paths[index].clone();
+        let choice = self.popup(menu::launchpad_menu(&path), anchor, None)?;
+        let Some(pad) = &mut self.launchpad else {
+            return Ok(());
+        };
+        let owner = pad.window.0;
+        let Some(command) = choice else {
+            // A press on the launchpad deactivated the menu; its release is not a click
+            // on the background.
+            if primary_button_down()
+                && let Ok(point) = platform::cursor()
+                && pad.contains_screen_point(point.x, point.y)
+            {
+                pad.swallow_press = true;
+            }
+            return Ok(());
+        };
+        // Starting something hands the screen to it, as a click on the tile does.
+        let close = match &command {
+            Command::NewInstance(path) => shell::execute(owner, path).map(|()| true),
+            Command::RunAsAdmin(path) => shell::run_as_admin(owner, path),
+            Command::Reveal(path) => shell::reveal(owner, path).map(|()| true),
+            Command::Properties(path) => shell::properties(owner, path).map(|()| false),
+            Command::LaunchpadRemove(path) => return self.remove_launchpad_entry(path),
+            _ => return self.run_command(command).map(drop),
+        };
+        match close {
+            Ok(true) => self.close_launchpad(),
+            Ok(false) => {}
+            Err(error) => platform::report_error(Some(owner), &error),
+        }
+        Ok(())
+    }
+
+    /// Takes `path` out of the launchpad. The file itself stays where it is.
+    pub(super) fn remove_launchpad_entry(&mut self, path: &Path) -> Result<()> {
+        let Some(pad) = &mut self.launchpad else {
+            let mut entries = storage::load_launchpad()?;
+            let before = entries.len();
+            entries.retain(|entry| entry != path);
+            if entries.len() != before {
+                storage::save_launchpad(&entries)?;
+            }
+            return Ok(());
+        };
+        let mut next = pad.paths.clone();
+        next.retain(|entry| entry != path);
+        if next.len() == pad.paths.len() {
+            return Ok(());
+        }
+        if let Err(error) = pad.save(next) {
+            platform::report_error(Some(pad.window.0), &error);
+            return Ok(());
+        }
+        pad.layout_page(pad.layout.page);
+        self.draw_launchpad()
     }
 }
 

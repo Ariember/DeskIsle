@@ -16,7 +16,10 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
-use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::Shell::{
+    IShellLinkW, SEE_MASK_FLAG_NO_UI, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ShellExecuteW, ShellLink,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, HSTRING, Interface, Owned, PCWSTR, PWSTR, Result, w};
 
@@ -453,6 +456,34 @@ fn execute_with_parameters(
 pub fn reveal(owner: HWND, path: &Path) -> Result<()> {
     let parameters = HSTRING::from(format!("/select,\"{}\"", path.display()));
     execute_with_parameters(owner, &HSTRING::from("explorer.exe"), Some(&parameters))
+}
+
+/// Starts `path` elevated. Returns `false` when the user declined the UAC prompt.
+pub fn run_as_admin(owner: HWND, path: &Path) -> Result<bool> {
+    match invoke_verb(owner, path, w!("runas"), Default::default()) {
+        Err(error) if error.code() == ERROR_CANCELLED.to_hresult() => Ok(false),
+        result => result.map(|()| true),
+    }
+}
+
+/// Shows the Shell's property sheet for `path`. A shortcut's sheet changes its icon.
+pub fn properties(owner: HWND, path: &Path) -> Result<()> {
+    invoke_verb(owner, path, w!("properties"), SEE_MASK_INVOKEIDLIST)
+}
+
+fn invoke_verb(owner: HWND, path: &Path, verb: PCWSTR, mask: u32) -> Result<()> {
+    let file = HSTRING::from(path.as_os_str());
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        // DeskIsle reports failures itself, in its own words.
+        fMask: mask | SEE_MASK_FLAG_NO_UI,
+        hwnd: owner,
+        lpVerb: verb,
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
 }
 
 /// Asks each window of `app_id` to close, as the title bar's close button would; the

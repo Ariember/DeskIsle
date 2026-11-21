@@ -61,6 +61,8 @@ pub enum Symbol {
     Store,
     Restart,
     Lock,
+    /// Running with administrator rights, as the Windows UAC shield.
+    Shield,
     SignOut,
     Calendar,
     Bell,
@@ -495,6 +497,27 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
             );
             s.line(&[(12., 14.5), (12., 17.)]);
         }
+        Symbol::Shield => {
+            s.push(
+                (12., 2.75),
+                vec![
+                    Step::Line((19.5, 5.5)),
+                    Step::Line((19.5, 11.)),
+                    Step::Quad {
+                        control: (19.5, 18.),
+                        to: (12., 21.25),
+                    },
+                    Step::Quad {
+                        control: (4.5, 18.),
+                        to: (4.5, 11.),
+                    },
+                    Step::Line((4.5, 5.5)),
+                ],
+                true,
+                Stroke,
+            );
+            s.line(&[(8.75, 12.), (11.1, 14.35), (15.5, 9.75)]);
+        }
         Symbol::SignOut => {
             s.polyline(
                 &[(10., 3.5), (4.5, 3.5), (4.5, 20.5), (10., 20.5)],
@@ -863,6 +886,7 @@ mod tests {
         Symbol::Store,
         Symbol::Restart,
         Symbol::Lock,
+        Symbol::Shield,
         Symbol::SignOut,
         Symbol::Calendar,
         Symbol::Bell,
