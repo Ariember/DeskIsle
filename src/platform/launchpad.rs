@@ -53,11 +53,12 @@ pub enum LaunchpadEvent {
     Scroll(i16),
     Key(LaunchpadKey),
     Text(char),
+    FileHover(bool),
     DropFiles(Vec<PathBuf>),
     Close,
 }
 
-pub struct LaunchpadWindow(pub HWND);
+pub struct LaunchpadWindow(pub HWND, Option<drop_files::Registration>);
 
 impl LaunchpadWindow {
     pub fn contains_screen_point(&self, x: i32, y: i32) -> bool {
@@ -67,7 +68,7 @@ impl LaunchpadWindow {
     pub fn create(r: Rect) -> Result<Self> {
         // A regular Alt+Tab window lets the user switch back to Explorer for a file.
         // DirectComposition supplies the entire translucent client area.
-        unsafe {
+        let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_APPWINDOW | WS_EX_ACCEPTFILES | WS_EX_NOREDIRECTIONBITMAP,
                 CLASS,
@@ -82,8 +83,10 @@ impl LaunchpadWindow {
                 Some(GetModuleHandleW(None)?.into()),
                 None,
             )
-            .map(Self)
-        }
+        }?;
+        let mut window = Self(hwnd, None);
+        window.1 = Some(drop_files::Target::Launchpad.register(hwnd)?);
+        Ok(window)
     }
 
     pub fn show(&self) {
@@ -137,6 +140,7 @@ fn input_char(unit: u16) -> Option<char> {
 
 impl Drop for LaunchpadWindow {
     fn drop(&mut self) {
+        self.1.take();
         let _ = unsafe { DestroyWindow(self.0) };
         EVENTS.with_borrow_mut(|events| events.retain(|e| !matches!(e, Event::Launchpad(_))));
         HIGH_SURROGATE.set(None);

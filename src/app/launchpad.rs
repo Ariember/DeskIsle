@@ -26,6 +26,7 @@ pub(super) struct Launchpad {
     layout: LaunchpadLayout,
     wheel: i32,
     hover: Option<usize>,
+    file_hover: bool,
     pressed: bool,
     /// The click that dismissed a tile's menu, which must not also close the launchpad.
     swallow_press: bool,
@@ -79,6 +80,10 @@ impl Bars {
             } else {
                 storage::save_launchpad(&entries)?;
             }
+            if let Some(renderer) = &self.renderer {
+                // The entry is already saved even if the confirmation cannot animate.
+                let _ = renderer.confirm_launchpad_drop();
+            }
         }
         Ok(())
     }
@@ -120,6 +125,7 @@ impl Bars {
             layout,
             wheel: 0,
             hover: None,
+            file_hover: false,
             pressed: false,
             swallow_press: false,
         });
@@ -159,11 +165,13 @@ impl Bars {
     }
 
     pub(super) fn paint_launchpad(&mut self) -> Result<()> {
+        let dropping = self.dropping_on_launchpad();
         if let (Some(pad), Some(renderer)) = (&self.launchpad, self.renderer.as_mut()) {
             renderer.draw_launchpad(pad.window.0, &pad.layout, &pad.paths, &pad.query)?;
             if pad.hover.is_some() {
                 renderer.hover_launchpad(&pad.layout, pad.hover)?;
             }
+            renderer.deepen_launchpad(dropping)?;
         }
         Ok(())
     }
@@ -173,6 +181,10 @@ impl Bars {
             Err(error) if is_device_lost(&error) => self.rebuild_renderer(),
             result => result,
         }
+    }
+
+    pub(super) fn launchpad_file_hover(&self) -> bool {
+        self.launchpad.as_ref().is_some_and(|pad| pad.file_hover)
     }
 
     pub(super) fn launchpad_event(&mut self, input: LaunchpadEvent) -> Result<()> {
@@ -239,7 +251,17 @@ impl Bars {
                 return self.launchpad_menu(index);
             }
             LaunchpadEvent::DropFiles(files) => {
+                if std::mem::take(&mut pad.file_hover) {
+                    self.draw()?;
+                }
                 return self.import_files(owner, DockDrop::Launchpad, files);
+            }
+            LaunchpadEvent::FileHover(hover) => {
+                if pad.file_hover != hover {
+                    pad.file_hover = hover;
+                    return self.draw();
+                }
+                return Ok(());
             }
             LaunchpadEvent::Text(ch) => {
                 pad.query.push(ch);

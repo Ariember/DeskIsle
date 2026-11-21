@@ -66,11 +66,12 @@ impl Drop for Desktop {
     }
 }
 
-pub struct Bar(pub HWND);
+pub struct Bar(pub HWND, Option<drop_files::Registration>);
 
 impl Drop for Bar {
     fn drop(&mut self) {
         // Both bars are created, used and destroyed on the same UI thread.
+        self.1.take();
         let _ = unsafe { DestroyWindow(self.0) };
     }
 }
@@ -136,10 +137,11 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
                 Some(instance),
                 None,
             )
-            .map(Bar)
+            .map(|hwnd| Bar(hwnd, None))
         };
         let top = create(w!("DeskIsle Status"))?;
-        let bottom = create(w!("DeskIsle Dock"))?;
+        let mut bottom = create(w!("DeskIsle Dock"))?;
+        bottom.1 = Some(drop_files::Target::Dock.register(bottom.0)?);
         DragAcceptFiles(bottom.0, true);
         Ok((top, bottom))
     }
@@ -394,6 +396,7 @@ pub enum Event {
     Move(HWND, i32, i32),
     Leave(HWND),
     CancelPress(HWND),
+    DockFileHover(Option<(i32, i32)>),
     /// Shell files and the actual drop point in client pixels.
     DropFiles(HWND, i32, i32, Vec<PathBuf>),
     Click(HWND, i32, i32),

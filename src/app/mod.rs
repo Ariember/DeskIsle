@@ -22,7 +22,7 @@ use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
 use crate::ui::layout::{
-    DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
+    DockDrop, DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
 };
 use crate::ui::system::SystemStatus;
 use monitor::MetricsWorker;
@@ -66,6 +66,7 @@ struct Bars {
     hidden: BTreeSet<String>,
     hover: Option<DockHit>,
     dock_press: Option<drag::DockPress>,
+    dock_file_target: Option<DockDrop>,
     preview: Option<PreviewWindow>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
@@ -187,6 +188,7 @@ pub(crate) fn run() -> Result<()> {
         hidden,
         hover: None,
         dock_press: None,
+        dock_file_target: None,
         preview: None,
         top_hover: None,
         wheel: 0,
@@ -268,8 +270,14 @@ pub(crate) fn run() -> Result<()> {
                 bars.move_dock_pointer(x, y)?;
             }
             Event::CancelPress(hwnd) if hwnd == bars.bottom.0 => bars.cancel_dock_press()?,
+            Event::DockFileHover(point) if !bars.fullscreen => {
+                let target = point.and_then(|(x, y)| bars.file_target(x, y));
+                bars.set_dock_file_target(target)?;
+            }
             Event::DropFiles(hwnd, x, y, files) if hwnd == bars.bottom.0 && !bars.fullscreen => {
-                if let Some(target) = bars.layout.drop_target(x, y, None) {
+                let target = bars.file_target(x, y);
+                bars.set_dock_file_target(None)?;
+                if let Some(target) = target {
                     bars.import_files(hwnd, target, files)?;
                 }
             }
@@ -375,6 +383,7 @@ impl Bars {
         self.position()?;
         if fullscreen {
             self.cancel_dock_press()?;
+            self.set_dock_file_target(None)?;
             self.tray.cancel_click();
             self.set_hover(None)?;
             self.set_top_hover(None)?;
@@ -737,9 +746,14 @@ impl Bars {
             self.top_hover,
             &self.indicators,
         )?;
-        let icons = self
-            .layout
-            .slots
+        let insertion = match self.dock_file_target {
+            Some(DockDrop::Insert(at)) => Some(self.layout.insertion_preview(at)),
+            _ => None,
+        };
+        let (slots, scale) = insertion
+            .as_ref()
+            .map_or((&self.layout.slots, 1.), |(slots, scale)| (slots, *scale));
+        let icons = slots
             .iter()
             .map(|slot| {
                 let (path, label, running, active) = match slot.target {
@@ -767,20 +781,25 @@ impl Bars {
                 }
             })
             .collect::<Vec<_>>();
-        let hover = self
-            .layout
-            .slots
+        let hover = slots
             .iter()
             .position(|slot| Some(slot.target) == dock_hover);
-        let deep = self
-            .layout
-            .slots
+        let deep = slots
             .iter()
             .position(|slot| slot.target == DockHit::Launchpad)
             .filter(|_| dropping);
         let bottom = self.layout.bottom;
         let lift = self.settings.hover_scale();
-        renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, deep, lift)?;
+        renderer.draw_dock(
+            bottom.width,
+            bottom.height,
+            dpi,
+            &icons,
+            hover,
+            deep,
+            lift,
+            scale,
+        )?;
         renderer.deepen_launchpad(dropping)
     }
 }

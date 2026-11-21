@@ -614,6 +614,25 @@ impl Renderer {
         }
     }
 
+    /// A short bounce after the launchpad has saved a new entry, also visible when
+    /// its window is closed. The vertical offset is independent of the hover scale.
+    pub fn confirm_launchpad_drop(&self) -> Result<()> {
+        let Some(icon) = self.icons.iter().find(|icon| icon.path.is_none()) else {
+            return Ok(());
+        };
+        let top = (icon.center.1 - icon.size / 2) as f32;
+        let curve = keyframes(
+            &self.device,
+            [(0., 0.), (0.07, 0.07), (0.18, -0.14), (0.32, 0.)]
+                .into_iter()
+                .map(|(time, offset)| (time, top + offset * icon.size as f32)),
+        )?;
+        unsafe {
+            icon.visual.SetOffsetY(&curve)?;
+            self.device.Commit()
+        }
+    }
+
     /// `hover` lifts the icon under the pointer. `deep` is the launchpad's slot while an
     /// app is held over it, which lifts a little further and darkens. While the Dock keeps
     /// its size, icons whose slot changed slide over, so a drag pushes its neighbors aside.
@@ -627,6 +646,7 @@ impl Renderer {
         hover: Option<usize>,
         deep: Option<usize>,
         lift: f32,
+        resting_scale: f32,
     ) -> Result<()> {
         let size = (width, height, dpi);
         let layout_changed = self.icons.len() != items.len()
@@ -679,13 +699,14 @@ impl Renderer {
         for (index, (layer, item)) in self.icons.iter_mut().zip(items).enumerate() {
             changed |= layer.place_dot(&self.device, self.palette, item, height, dpi)?;
             let deepened = deep == Some(index);
-            let goal = if deepened {
-                lift.max(1.) * DROP_LIFT
-            } else if hover == Some(index) {
-                lift
-            } else {
-                1.
-            };
+            let goal = resting_scale
+                * if deepened {
+                    lift.max(1.) * DROP_LIFT
+                } else if hover == Some(index) {
+                    lift
+                } else {
+                    1.
+                };
             if let Some(curve) = layer.lift.retarget(&self.device, goal, DURATION)? {
                 unsafe {
                     layer.scale.SetScaleX(&curve)?;

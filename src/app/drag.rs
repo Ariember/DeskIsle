@@ -40,6 +40,25 @@ fn accessible_files(files: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
 }
 
 impl Bars {
+    /// Use the visible gap for both hovering and release. New pins go before running
+    /// apps even if the pointer is farther along the Dock.
+    pub(super) fn file_target(&self, x: i32, y: i32) -> Option<DockDrop> {
+        self.layout
+            .file_drop_target(x, y, self.dock_file_target, self.pins.len())
+    }
+
+    pub(super) fn set_dock_file_target(&mut self, target: Option<DockDrop>) -> Result<()> {
+        if self.dock_file_target != target {
+            self.dock_file_target = target;
+            if target.is_some() {
+                self.hover = None;
+                self.preview = None;
+            }
+            self.draw()?;
+        }
+        Ok(())
+    }
+
     fn apply_drop_pins(&mut self, pins: Vec<PinnedApp>) -> Result<()> {
         match self.save_pins(pins) {
             Ok(true) => self.refresh()?,
@@ -126,6 +145,9 @@ impl Bars {
     }
 
     pub(super) fn move_dock_pointer(&mut self, x: i32, y: i32) -> Result<()> {
+        if self.dock_file_target.is_some() {
+            return Ok(());
+        }
         let Some(press) = self.dock_press.as_mut() else {
             return self.set_hover(self.layout.hit(x, y));
         };
@@ -146,13 +168,19 @@ impl Bars {
 
     /// Whether the app being dragged would go into the launchpad if released now.
     pub(super) fn dropping_on_launchpad(&self) -> bool {
-        self.dock_press
-            .as_ref()
-            .is_some_and(|press| press.target == Some(DockDrop::Launchpad))
+        self.launchpad_file_hover()
+            || self.dock_file_target == Some(DockDrop::Launchpad)
+            || self
+                .dock_press
+                .as_ref()
+                .is_some_and(|press| press.target == Some(DockDrop::Launchpad))
     }
 
     /// Preview the order without changing the window groups used for hit testing.
     pub(super) fn dock_preview(&self) -> (Option<Vec<usize>>, Option<DockHit>) {
+        if self.dock_file_target.is_some() {
+            return (None, None);
+        }
         let Some(press) = &self.dock_press else {
             return (None, self.hover);
         };

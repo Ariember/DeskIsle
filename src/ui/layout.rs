@@ -121,28 +121,108 @@ impl Layout {
             .map(|s| s.target)
     }
 
+    fn insertion_gap(&self, at: usize) -> usize {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot.target, DockHit::App(index) if index >= at))
+            .unwrap_or(self.slots.len())
+    }
+
+    /// Divide the current row into equal slots, including one for the incoming app.
+    /// Keeping the HWND in place also keeps OLE's drag-enter/leave boundaries stable.
+    fn insertion_rect(&self, position: usize) -> Rect {
+        let first = self.slots[0].rect;
+        let count = self.slots.len() as i64;
+        let width = count * i64::from(first.width);
+        let edge = |i: usize| first.x + (i as i64 * width / (count + 1)) as i32;
+        let x = edge(position);
+        Rect {
+            x,
+            width: edge(position + 1) - x,
+            ..first
+        }
+    }
+
+    fn insertion_slots(&self, gap: usize) -> impl Iterator<Item = DockSlot> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(move |(i, slot)| DockSlot {
+                rect: self.insertion_rect(i + usize::from(i >= gap)),
+                target: slot.target,
+            })
+    }
+
+    /// Visible icon positions and their resting scale while an external app is inserted.
+    pub fn insertion_preview(&self, at: usize) -> (Vec<DockSlot>, f32) {
+        let slots = self.insertion_slots(self.insertion_gap(at)).collect();
+        let pitch = self.insertion_rect(0).width;
+        // Leave some space between icons even in a short Dock with large icons.
+        let size = (pitch - pitch / 10).clamp(1, self.icon);
+        (slots, size as f32 / self.icon as f32)
+    }
+
+    /// Hit the incoming file's visible gap and limit insertion to the pinned apps.
+    pub fn file_drop_target(
+        &self,
+        x: i32,
+        y: i32,
+        current: Option<DockDrop>,
+        pins: usize,
+    ) -> Option<DockDrop> {
+        if !(0..self.bottom.width).contains(&x) || !(0..self.bottom.height).contains(&y) {
+            return None;
+        }
+        let target = if let Some(DockDrop::Insert(at)) = current {
+            let gap = self.insertion_gap(at);
+            let space = self.insertion_rect(gap);
+            if (space.x..space.x + space.width).contains(&x) {
+                DockDrop::Insert(at)
+            } else {
+                Self::drop_among(self.insertion_slots(gap), x, y, None)
+            }
+        } else {
+            Self::drop_among(self.slots.iter().copied(), x, y, None)
+        };
+        Some(match target {
+            DockDrop::Insert(at) => DockDrop::Insert(at.min(pins)),
+            DockDrop::Launchpad => DockDrop::Launchpad,
+        })
+    }
+
     /// `source` is the current group index of an app being moved within the Dock.
     pub fn drop_target(&self, x: i32, y: i32, source: Option<usize>) -> Option<DockDrop> {
         if !(0..self.bottom.width).contains(&x) || !(0..self.bottom.height).contains(&y) {
             return None;
         }
-        match (self.hit(x, y), source) {
-            (Some(DockHit::Launchpad), _) => return Some(DockDrop::Launchpad),
-            (Some(DockHit::App(index)), Some(from)) => {
-                return Some(DockDrop::Insert(index + usize::from(from < index)));
-            }
-            _ => {}
-        }
+        Some(Self::drop_among(self.slots.iter().copied(), x, y, source))
+    }
+
+    fn drop_among(
+        slots: impl Iterator<Item = DockSlot>,
+        x: i32,
+        y: i32,
+        source: Option<usize>,
+    ) -> DockDrop {
         let mut boundary = 0;
-        for slot in &self.slots {
+        for slot in slots {
+            if slot.rect.contains(x, y) {
+                match (slot.target, source) {
+                    (DockHit::Launchpad, _) => return DockDrop::Launchpad,
+                    (DockHit::App(index), Some(from)) => {
+                        return DockDrop::Insert(index + usize::from(from < index));
+                    }
+                    _ => {}
+                }
+            }
             if let DockHit::App(index) = slot.target {
                 if x < slot.rect.x + slot.rect.width / 2 {
-                    return Some(DockDrop::Insert(index));
+                    return DockDrop::Insert(index);
                 }
                 boundary = index + 1;
             }
         }
-        Some(DockDrop::Insert(boundary))
+        DockDrop::Insert(boundary)
     }
 }
 
@@ -454,6 +534,84 @@ mod tests {
             empty.drop_target(empty.bottom.width - 1, 0, None),
             Some(DockDrop::Insert(0))
         );
+    }
+
+    #[test]
+    fn incoming_app_opens_a_visible_gap_at_the_pinned_boundary() {
+        for (width, apps, first, at) in [(800, 0, 0, 0), (800, 2, 0, 1), (340, 16, 5, 3)] {
+            let work = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 600,
+            };
+            let layout = Layout::new(work, 144, apps, first, DockStyle { icon: 56, gap: 8 });
+            let (slots, scale) = layout.insertion_preview(at);
+            let icon = layout.icon as f32 * scale;
+            let mut left = layout.slots[0].rect.x;
+            let mut right = layout.bottom.width - left;
+            for (slot, original) in slots.iter().zip(&layout.slots) {
+                assert_eq!(slot.target, original.target);
+                assert!(icon <= slot.rect.width as f32);
+                if matches!(slot.target, DockHit::App(i) if i >= at) {
+                    assert!(
+                        slot.rect.x + slot.rect.width / 2
+                            > original.rect.x + original.rect.width / 2
+                    );
+                    right = right.min(slot.rect.x);
+                } else {
+                    assert!(
+                        slot.rect.x + slot.rect.width / 2
+                            < original.rect.x + original.rect.width / 2
+                    );
+                    left = slot.rect.x + slot.rect.width;
+                }
+            }
+            assert!((right - left) as f32 >= icon);
+            assert_eq!(
+                layout.file_drop_target(
+                    (left + right) / 2,
+                    layout.bottom.height / 2,
+                    Some(DockDrop::Insert(at)),
+                    at,
+                ),
+                Some(DockDrop::Insert(at))
+            );
+        }
+    }
+
+    #[test]
+    fn stationary_drop_pointer_keeps_its_target_when_icons_make_room() {
+        for (width, apps, first) in [(60, 2, 1), (800, 0, 0), (800, 3, 0), (340, 16, 5)] {
+            let work = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 600,
+            };
+            for dpi in [96, 144] {
+                let layout = Layout::new(work, dpi, apps, first, DockStyle::default());
+                for pins in [0, apps / 2, apps] {
+                    for previous in
+                        std::iter::once(None).chain((0..=pins).map(|at| Some(DockDrop::Insert(at))))
+                    {
+                        for y in [0, layout.bottom.height / 2] {
+                            for x in 0..layout.bottom.width {
+                                let next = layout.file_drop_target(x, y, previous, pins);
+                                if let Some(DockDrop::Insert(at)) = next {
+                                    assert!(at <= pins);
+                                }
+                                assert_eq!(
+                                    layout.file_drop_target(x, y, next, pins),
+                                    next,
+                                    "pointer at {x},{y}, prior gap {previous:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

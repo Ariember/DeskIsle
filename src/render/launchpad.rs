@@ -26,7 +26,7 @@ use super::{Bar, DURATION, Renderer, Tween};
 use crate::ui::{icon::Symbol, launchpad::LaunchpadLayout, panel::Area};
 
 const WHITE: (u8, u8, u8) = (255, 255, 255);
-/// How far the launchpad darkens while an app from the Dock is held over it.
+/// How far the launchpad darkens while an app is held over it.
 const DEEPEN: f32 = 0.26;
 
 pub(super) struct LaunchpadView {
@@ -135,7 +135,20 @@ impl Renderer {
                     c.fill(0., 0., w, h, 0., (0, 0, 0), DEEPEN)?;
                     // A soft frame around the part above the Dock, where the app lands.
                     c.stroke(9., 9., w - 9., bottom - 9., 18., WHITE, 0.12)?;
-                    c.stroke(10., 10., w - 10., bottom - 10., 17., WHITE, 0.34)
+                    c.stroke(10., 10., w - 10., bottom - 10., 17., WHITE, 0.34)?;
+                    // Replace the search field with the drop action for the duration
+                    // of the drag. Both fade together on this cached surface.
+                    let hint = layout.search;
+                    c.fill(
+                        hint.left,
+                        hint.top,
+                        hint.right,
+                        hint.bottom,
+                        7.,
+                        (45, 63, 84),
+                        1.,
+                    )?;
+                    centered(c, &self.write, "松开以添加到启动台", hint, 13., true, 1.)
                 },
             )?;
             unsafe { view.veil.SetContent(&veil)? };
