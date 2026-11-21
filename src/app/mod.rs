@@ -1,5 +1,6 @@
 mod about;
 mod commands;
+mod drag;
 mod launchpad;
 mod menus;
 mod monitor;
@@ -61,6 +62,7 @@ struct Bars {
     /// Keys of tray icons the user moved into the overflow menu.
     hidden: BTreeSet<String>,
     hover: Option<DockHit>,
+    dock_press: Option<drag::DockPress>,
     preview: Option<PreviewWindow>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
@@ -95,7 +97,7 @@ fn status_height(dpi: u32) -> i32 {
 }
 
 fn load_pins() -> Result<Vec<PinnedApp>> {
-    match storage::load_pins() {
+    match storage::load_pins(shell::pin_from_path) {
         Ok(Some(pins)) => Ok(pins),
         Ok(None) => shell::default_pins(),
         Err(error) => {
@@ -180,6 +182,7 @@ pub(crate) fn run() -> Result<()> {
         shown: Vec::new(),
         hidden,
         hover: None,
+        dock_press: None,
         preview: None,
         top_hover: None,
         wheel: 0,
@@ -234,6 +237,7 @@ pub(crate) fn run() -> Result<()> {
                 }
                 bars.position()?;
                 if fullscreen {
+                    bars.cancel_dock_press()?;
                     bars.tray.cancel_click();
                     bars.set_hover(None)?;
                     bars.set_top_hover(None)?;
@@ -264,13 +268,19 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Move(hwnd, x, y) if hwnd == bars.bottom.0 => {
                 platform::track_leave(hwnd)?;
-                bars.set_hover(bars.layout.hit(x, y))?;
+                bars.move_dock_pointer(x, y)?;
+            }
+            Event::CancelPress(hwnd) if hwnd == bars.bottom.0 => bars.cancel_dock_press()?,
+            Event::DropFiles(hwnd, x, y, files) if hwnd == bars.bottom.0 && !bars.fullscreen => {
+                if let Some(target) = bars.layout.drop_target(x, y, None) {
+                    bars.import_files(hwnd, target, files)?;
+                }
             }
             Event::Move(hwnd, x, y) if hwnd == bars.top.0 => {
                 platform::track_leave(hwnd)?;
                 bars.set_top_hover(Some(bars.status.hit(x, y)))?;
             }
-            Event::Leave(hwnd) if hwnd == bars.bottom.0 => bars.set_hover(None)?,
+            Event::Leave(hwnd) if hwnd == bars.bottom.0 => bars.leave_dock()?,
             Event::Leave(hwnd) if hwnd == bars.top.0 => bars.set_top_hover(None)?,
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
                 bars.scroll_status(delta, x, y)?;
@@ -293,8 +303,12 @@ pub(crate) fn run() -> Result<()> {
                 double,
             } => {
                 bars.swallow_click = false;
+                bars.cancel_dock_press()?;
                 if owner == bars.bottom.0 {
                     bars.set_hover(None)?;
+                    if !right && !bars.fullscreen {
+                        bars.press_dock(x, y);
+                    }
                 }
                 if owner == bars.top.0
                     && let StatusHit::Tray(slot) = bars.status.hit(x, y)
@@ -321,15 +335,7 @@ pub(crate) fn run() -> Result<()> {
                     return Ok(());
                 }
             }
-            Event::Click(owner, x, y) if owner == bars.bottom.0 => match bars.layout.hit(x, y) {
-                Some(DockHit::Launchpad) => {
-                    if let Err(error) = bars.open_launchpad() {
-                        platform::report_error(Some(owner), &error);
-                    }
-                }
-                Some(DockHit::App(index)) => bars.select(index)?,
-                None => {}
-            },
+            Event::Click(owner, x, y) if owner == bars.bottom.0 => bars.release_dock(x, y)?,
             Event::RightClick(owner, x, y) if bars.context_menu(owner, x, y)? => return Ok(()),
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
             Event::Launchpad(input) => bars.launchpad_event(input)?,
@@ -412,6 +418,10 @@ impl Bars {
         let moved = layout.bottom != self.layout.bottom;
         self.layout = layout;
         if moved {
+            // A press started against the previous client origin.
+            if self.dock_press.take().is_some() {
+                self.bottom.release();
+            }
             self.bottom.position(self.layout.bottom, !self.fullscreen)?;
         }
         if self.hover.is_some() {
@@ -645,6 +655,7 @@ impl Bars {
     }
 
     fn draw_frame(&mut self) -> Result<()> {
+        let (preview_order, dock_hover) = self.dock_preview();
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
         renderer.check_device()?;
         let dpi = self.monitor.dpi;
@@ -704,6 +715,7 @@ impl Bars {
                 let (path, label, running, active) = match slot.target {
                     DockHit::Launchpad => (None, "启动台", false, false),
                     DockHit::App(index) => {
+                        let index = preview_order.as_ref().map_or(index, |order| order[index]);
                         let app = &self.apps[index];
                         (
                             Some(app.icon_path.as_path()),
@@ -729,7 +741,7 @@ impl Bars {
             .layout
             .slots
             .iter()
-            .position(|slot| Some(slot.target) == self.hover);
+            .position(|slot| Some(slot.target) == dock_hover);
         let bottom = self.layout.bottom;
         let lift = self.settings.hover_scale();
         renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, lift)

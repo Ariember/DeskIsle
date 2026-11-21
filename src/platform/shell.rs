@@ -7,19 +7,61 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, Error, HSTRING, Owned, PCWSTR, PWSTR, Result, w};
+use windows::core::{BOOL, Error, HSTRING, Interface, Owned, PCWSTR, PWSTR, Result, w};
 
 use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
 
 pub const WINDOWS_CHANGED: u32 = WM_APP + 1;
+
+/// A simple program shortcut shares its executable's running windows. Keep launching
+/// the shortcut itself so the Shell applies its working directory and other options.
+pub fn pin_from_path(path: PathBuf) -> PinnedApp {
+    let mut pin = pinned(path);
+    if pin
+        .launch
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+        && let Some(exe) = shortcut_program(&pin.launch)
+    {
+        pin.app_id = path_id(&exe);
+    }
+    pin
+}
+
+fn shortcut_program(path: &Path) -> Option<PathBuf> {
+    // Read the saved target without invoking Resolve, which can search or prompt.
+    // Virtual, unreadable and parameterized links remain independently launchable.
+    let link: IShellLinkW =
+        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let file: IPersistFile = link.cast().ok()?;
+    let mut text = vec![0u16; 32_768];
+    unsafe {
+        file.Load(&HSTRING::from(path), STGM_READ).ok()?;
+        link.GetArguments(&mut text).ok()?;
+        if text[0] != 0 {
+            return None;
+        }
+        link.GetPath(&mut text, std::ptr::null_mut(), 0).ok()?;
+    }
+    let len = text.iter().position(|&unit| unit == 0)?;
+    let path = PathBuf::from(OsString::from_wide(&text[..len]));
+    (path.is_absolute()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe")))
+    .then_some(path)
+}
 
 /// The name an executable gives itself in its version resource: the product name, else
 /// the file description. `None` when it has neither or the file cannot be read.
@@ -371,8 +413,8 @@ fn check_restricted_windows(path: &Path, windows: &[WindowInfo]) -> Result<()> {
     }
 }
 
-pub fn launch(owner: HWND, path: &Path, windows: &[WindowInfo]) -> Result<()> {
-    check_restricted_windows(path, windows)?;
+pub fn launch(owner: HWND, path: &Path, app_id: &str, windows: &[WindowInfo]) -> Result<()> {
+    check_restricted_windows(Path::new(app_id), windows)?;
     execute(owner, path)
 }
 
@@ -479,6 +521,34 @@ fn activate_window(hwnd: HWND) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_shortcut_groups_with_executable_and_keeps_launch_settings() -> Result<()> {
+        use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
+
+        unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
+        let exe = std::env::current_exe().unwrap();
+        let link_path =
+            std::env::temp_dir().join(format!("deskisle-pin-{}.lnk", std::process::id()));
+        let (plain, with_args) = unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(&HSTRING::from(exe.as_path()))?;
+            let file: IPersistFile = link.cast()?;
+            let name = HSTRING::from(link_path.as_path());
+            file.Save(&name, true)?;
+            let plain = pin_from_path(link_path.clone());
+            link.SetArguments(w!("--profile other"))?;
+            file.Save(&name, true)?;
+            (plain, pin_from_path(link_path.clone()))
+        };
+        unsafe { RoUninitialize() };
+        std::fs::remove_file(&link_path).unwrap();
+        assert_eq!(plain.app_id, path_id(&exe));
+        assert_eq!(plain.launch, link_path);
+        assert_eq!(plain.icon_path, link_path);
+        assert_eq!(with_args.app_id, path_id(&link_path));
+        Ok(())
+    }
 
     #[test]
     fn unresolved_window_blocks_only_a_possible_duplicate_launch() {

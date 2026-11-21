@@ -1,6 +1,7 @@
 pub mod about;
 pub mod audio;
 pub mod display;
+mod drop_files;
 pub mod launchpad;
 pub mod machine;
 pub mod media;
@@ -18,6 +19,7 @@ use crate::geometry::Rect;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem::size_of;
+use std::path::PathBuf;
 use windows::Win32::{
     Foundation::*,
     Graphics::{
@@ -39,7 +41,7 @@ use windows::Win32::{
         Input::KeyboardAndMouse::*,
         Shell::{
             ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, ABN_FULLSCREENAPP,
-            ABN_POSCHANGED, APPBARDATA, SHAppBarMessage,
+            ABN_POSCHANGED, APPBARDATA, DragAcceptFiles, HDROP, SHAppBarMessage,
         },
         WindowsAndMessaging::*,
     },
@@ -136,7 +138,10 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
             )
             .map(Bar)
         };
-        Ok((create(w!("DeskIsle Status"))?, create(w!("DeskIsle Dock"))?))
+        let top = create(w!("DeskIsle Status"))?;
+        let bottom = create(w!("DeskIsle Dock"))?;
+        DragAcceptFiles(bottom.0, true);
+        Ok((top, bottom))
     }
 }
 
@@ -177,6 +182,7 @@ pub fn monitor() -> Result<Monitor> {
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
 const TRAY_NOTICE_TIMER: usize = 2;
+const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
 pub fn time_tray_notice(hwnd: HWND) {
@@ -294,6 +300,19 @@ impl Drop for AppBar {
 }
 
 impl Bar {
+    pub fn capture(&self) {
+        unsafe { SetCapture(self.0) };
+    }
+
+    pub fn release(&self) {
+        // Cancellation can arrive after a different window took capture.
+        if unsafe { GetCapture() } == self.0 {
+            RELEASING_BAR.set(true);
+            let _ = unsafe { ReleaseCapture() };
+            RELEASING_BAR.set(false);
+        }
+    }
+
     pub fn position(&self, r: Rect, visible: bool) -> Result<()> {
         let show = if visible {
             SWP_SHOWWINDOW
@@ -311,6 +330,19 @@ impl Bar {
                 SWP_NOACTIVATE | show,
             )
         }
+    }
+}
+
+pub fn drag_threshold(dpi: u32) -> (i32, i32) {
+    unsafe {
+        (
+            GetSystemMetricsForDpi(SM_CXDRAG, dpi)
+                .saturating_abs()
+                .max(1),
+            GetSystemMetricsForDpi(SM_CYDRAG, dpi)
+                .saturating_abs()
+                .max(1),
+        )
     }
 }
 
@@ -361,6 +393,9 @@ pub enum Event {
     MetricsUpdate,
     Move(HWND, i32, i32),
     Leave(HWND),
+    CancelPress(HWND),
+    /// Shell files and the actual drop point in client pixels.
+    DropFiles(HWND, i32, i32, Vec<PathBuf>),
     Click(HWND, i32, i32),
     RightClick(HWND, i32, i32),
     /// The middle button was released over a bar, in its client pixels.
@@ -454,6 +489,9 @@ impl Event {
 }
 
 thread_local! {
+    /// ReleaseCapture synchronously sends WM_CAPTURECHANGED. The application
+    /// already finished that press and may start a new one before reading events.
+    static RELEASING_BAR: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     /// The settings panel's caption height and the left and right edges of its close
@@ -487,7 +525,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Event::TrayNoticeExpired
         }
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
-        WM_MOUSEMOVE => Event::Move(hwnd, x, y),
+        WM_MOUSEMOVE => {
+            // A non-activating bar may miss a release outside its visible area.
+            if wp.0 & MK_LBUTTON == 0 && unsafe { GetCapture() } == hwnd {
+                queue(hwnd, Event::CancelPress(hwnd));
+            }
+            Event::Move(hwnd, x, y)
+        }
+        WM_CAPTURECHANGED if !RELEASING_BAR.get() => Event::CancelPress(hwnd),
+        WM_CANCELMODE => {
+            queue(hwnd, Event::CancelPress(hwnd));
+            // Default processing releases this window's capture.
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        WM_DROPFILES => {
+            let (point, paths) = drop_files::read(HDROP(wp.0 as _));
+            let Some(point) = point else {
+                return LRESULT(0);
+            };
+            Event::DropFiles(hwnd, point.x, point.y, paths)
+        }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave(hwnd),
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => Event::Press {
             owner: hwnd,
@@ -521,6 +578,7 @@ fn queue(hwnd: HWND, event: Event) {
             || matches!(
                 event,
                 Event::Click(..)
+                    | Event::DropFiles(..)
                     | Event::SystemUpdate
                     | Event::RightClick(..)
                     | Event::MiddleClick(..)

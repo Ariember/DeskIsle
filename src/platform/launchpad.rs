@@ -1,17 +1,15 @@
-use super::{EVENTS, Event, queue, track_leave};
+use super::{EVENTS, Event, MK_LBUTTON, drop_files, queue, track_leave};
 use crate::geometry::Rect;
 use std::cell::Cell;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use windows::Win32::{
-    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::ValidateRect,
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::WM_MOUSELEAVE,
         Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN},
-        Shell::{DragFinish, DragQueryFileW, HDROP},
+        Shell::HDROP,
         WindowsAndMessaging::*,
     },
 };
@@ -44,8 +42,9 @@ pub enum LaunchpadKey {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum LaunchpadEvent {
-    Move(i32, i32),
+    Move { x: i32, y: i32, left_down: bool },
     Leave,
+    Press,
     Click(i32, i32),
     Context(i32, i32),
     Scroll(i16),
@@ -58,6 +57,10 @@ pub enum LaunchpadEvent {
 pub struct LaunchpadWindow(pub HWND);
 
 impl LaunchpadWindow {
+    pub fn contains_screen_point(&self, x: i32, y: i32) -> bool {
+        unsafe { WindowFromPoint(POINT { x, y }) == self.0 }
+    }
+
     pub fn create(r: Rect) -> Result<Self> {
         // A regular Alt+Tab window lets the user switch back to Explorer for a file.
         // DirectComposition supplies the entire translucent client area.
@@ -144,26 +147,6 @@ impl Drop for LaunchpadWindow {
     }
 }
 
-fn dropped_paths(drop: HDROP) -> Vec<PathBuf> {
-    // WM_DROPFILES transfers this handle to the receiving window. Copy the paths
-    // before freeing it so no Shell-owned pointer leaves the window procedure.
-    unsafe {
-        let count = DragQueryFileW(drop, u32::MAX, None);
-        let mut paths = Vec::new();
-        for index in 0..count {
-            let length = DragQueryFileW(drop, index, None);
-            let mut buffer = vec![0; length as usize + 1];
-            if length > 0 && DragQueryFileW(drop, index, Some(&mut buffer)) == length {
-                paths.push(PathBuf::from(OsString::from_wide(
-                    &buffer[..length as usize],
-                )));
-            }
-        }
-        DragFinish(drop);
-        paths
-    }
-}
-
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
     let event = match msg {
@@ -173,9 +156,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_MOUSEMOVE => {
             let _ = track_leave(hwnd);
-            LaunchpadEvent::Move(x, y)
+            LaunchpadEvent::Move {
+                x,
+                y,
+                left_down: wp.0 & MK_LBUTTON != 0,
+            }
         }
         WM_MOUSELEAVE => LaunchpadEvent::Leave,
+        WM_LBUTTONDOWN => {
+            queue(hwnd, Event::Launchpad(LaunchpadEvent::Press));
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
         WM_LBUTTONUP => LaunchpadEvent::Click(x, y),
         WM_RBUTTONUP => LaunchpadEvent::Context(x, y),
         WM_MOUSEWHEEL => LaunchpadEvent::Scroll((wp.0 >> 16) as i16),
@@ -195,7 +186,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             HIGH_SURROGATE.set(None);
             return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
         }
-        WM_DROPFILES => LaunchpadEvent::DropFiles(dropped_paths(HDROP(wp.0 as _))),
+        WM_DROPFILES => {
+            let (_, paths) = drop_files::read(HDROP(wp.0 as _));
+            LaunchpadEvent::DropFiles(paths)
+        }
         WM_DPICHANGED => {
             // The app recomputes this window's bounds along with the primary bars.
             queue(hwnd, Event::Display);
@@ -211,33 +205,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::create_bars;
     use windows::Win32::{
-        Foundation::HGLOBAL,
+        Foundation::{HGLOBAL, POINT},
         System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream},
         UI::Shell::DROPFILES,
     };
 
-    #[test]
-    fn window_receives_a_unicode_multi_file_drop() -> Result<()> {
-        let paths = [r"C:\我的应用\编辑器.lnk", r"D:\Apps\Tool 🔧.exe"];
+    fn send_drop(hwnd: HWND, point: POINT, paths: &[&str]) -> Result<()> {
         unsafe {
-            let instance = GetModuleHandleW(None)?.into();
-            register_class(instance, LoadCursorW(None, IDC_ARROW)?)?;
-            let window = LaunchpadWindow::create(Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
-            })?;
-            assert_ne!(
-                GetWindowLongW(window.0, GWL_EXSTYLE) as u32 & WS_EX_ACCEPTFILES.0,
-                0
-            );
-
             // A Shell drop contains this header followed by a double-NUL terminated
             // list of paths. Hand the backing HGLOBAL to the window just as Shell does.
             let header = DROPFILES {
                 pFiles: size_of::<DROPFILES>() as u32,
+                pt: point,
                 fWide: true.into(),
                 ..Default::default()
             };
@@ -263,20 +244,42 @@ mod tests {
                 .ok()?;
             let handle = GetHGlobalFromStream(&stream)?;
             drop(stream);
-            SendMessageW(
-                window.0,
-                WM_DROPFILES,
-                Some(WPARAM(handle.0 as usize)),
-                None,
-            );
-            let received = EVENTS.with_borrow_mut(|events| {
-                events.drain(..).find_map(|event| match event {
-                    Event::Launchpad(LaunchpadEvent::DropFiles(paths)) => Some(paths),
-                    _ => None,
-                })
-            });
-            assert_eq!(received, Some(paths.map(PathBuf::from).to_vec()));
+            SendMessageW(hwnd, WM_DROPFILES, Some(WPARAM(handle.0 as usize)), None);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn launchpad_and_dock_receive_unicode_multi_file_drops() -> Result<()> {
+        let paths = [r"C:\我的应用\编辑器.lnk", r"D:\Apps\Tool 🔧.exe"];
+        let point = POINT { x: 67, y: 19 };
+        let (top, dock) = create_bars()?;
+        let pad = LaunchpadWindow::create(Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        })?;
+        let accepts =
+            |hwnd| unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_ACCEPTFILES.0 != 0 };
+        assert!(!accepts(top.0));
+        assert!(accepts(dock.0));
+        assert!(accepts(pad.0));
+        send_drop(pad.0, point, &paths)?;
+        send_drop(dock.0, point, &paths)?;
+        let paths = paths.map(PathBuf::from).to_vec();
+        EVENTS.with_borrow_mut(|events| {
+            let mut drops = events.drain(..).filter(|event| {
+                matches!(
+                    event,
+                    Event::DropFiles(..) | Event::Launchpad(LaunchpadEvent::DropFiles(_))
+                )
+            });
+            assert!(
+                drops.next() == Some(Event::Launchpad(LaunchpadEvent::DropFiles(paths.clone())))
+            );
+            assert!(drops.next() == Some(Event::DropFiles(dock.0, point.x, point.y, paths)));
+        });
         Ok(())
     }
 }

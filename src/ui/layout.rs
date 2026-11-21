@@ -14,6 +14,13 @@ pub enum DockHit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockDrop {
+    Launchpad,
+    /// Insert at this boundary in the full list of apps, including scrolled-out apps.
+    Insert(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DockSlot {
     pub target: DockHit,
     /// Client pixels relative to the bottom bar.
@@ -112,6 +119,30 @@ impl Layout {
             .iter()
             .find(|s| s.rect.contains(x, y))
             .map(|s| s.target)
+    }
+
+    /// `source` is the current group index of an app being moved within the Dock.
+    pub fn drop_target(&self, x: i32, y: i32, source: Option<usize>) -> Option<DockDrop> {
+        if !(0..self.bottom.width).contains(&x) || !(0..self.bottom.height).contains(&y) {
+            return None;
+        }
+        match (self.hit(x, y), source) {
+            (Some(DockHit::Launchpad), _) => return Some(DockDrop::Launchpad),
+            (Some(DockHit::App(index)), Some(from)) => {
+                return Some(DockDrop::Insert(index + usize::from(from < index)));
+            }
+            _ => {}
+        }
+        let mut boundary = 0;
+        for slot in &self.slots {
+            if let DockHit::App(index) = slot.target {
+                if x < slot.rect.x + slot.rect.width / 2 {
+                    return Some(DockDrop::Insert(index));
+                }
+                boundary = index + 1;
+            }
+        }
+        Some(DockDrop::Insert(boundary))
     }
 }
 
@@ -377,6 +408,52 @@ mod tests {
             let slot = layout.slots[0].rect;
             assert_eq!(layout.hit(slot.x, slot.y), Some(target));
         }
+    }
+
+    #[test]
+    fn drops_distinguish_launchpad_insertion_and_both_reorder_directions() {
+        let work = Rect {
+            x: -800,
+            y: 20,
+            width: 340,
+            height: 600,
+        };
+        for dpi in [96, 144] {
+            let layout = Layout::new(work, dpi, 16, 5, DockStyle::default());
+            let launcher = layout.slots[0].rect;
+            let app = layout.slots[1].rect;
+            let center = app.x + app.width / 2;
+            assert_eq!(
+                layout.drop_target(launcher.x, launcher.y, None),
+                Some(DockDrop::Launchpad)
+            );
+            assert_eq!(
+                layout.drop_target(center - 1, app.y, None),
+                Some(DockDrop::Insert(5))
+            );
+            assert_eq!(
+                layout.drop_target(center, app.y, None),
+                Some(DockDrop::Insert(6))
+            );
+            assert_eq!(
+                layout.drop_target(center, app.y, Some(4)),
+                Some(DockDrop::Insert(6))
+            );
+            assert_eq!(
+                layout.drop_target(center, app.y, Some(6)),
+                Some(DockDrop::Insert(5))
+            );
+            assert_eq!(
+                layout.drop_target(layout.bottom.width, app.y, Some(4)),
+                None
+            );
+            assert_eq!(layout.drop_target(center, -1, Some(6)), None);
+        }
+        let empty = Layout::new(work, 96, 0, 0, DockStyle::default());
+        assert_eq!(
+            empty.drop_target(empty.bottom.width - 1, 0, None),
+            Some(DockDrop::Insert(0))
+        );
     }
 
     #[test]

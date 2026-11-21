@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, HRESULT, Result};
 
-use crate::dock::{PinnedApp, pinned};
+use crate::dock::PinnedApp;
 use crate::settings::Settings;
 
 const PINS_FILE: &str = "pins.txt";
@@ -34,17 +34,20 @@ fn read_launchpad(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn save_launchpad(entries: &[PathBuf]) -> Result<()> {
-    write_launchpad(&settings_path(LAUNCHPAD_FILE)?, entries)
+    write_paths(
+        &settings_path(LAUNCHPAD_FILE)?,
+        entries.iter().map(PathBuf::as_path),
+    )
 }
 
-fn write_launchpad(path: &Path, entries: &[PathBuf]) -> Result<()> {
+fn write_paths<'a>(path: &Path, entries: impl IntoIterator<Item = &'a Path>) -> Result<()> {
     let dir = path
         .parent()
-        .expect("the launchpad file is in the settings directory");
+        .expect("the list file is in the settings directory");
     std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
     let mut text = String::new();
     for entry in entries {
-        text.push_str(entry.to_str().expect("launchpad paths are valid Unicode"));
+        text.push_str(&entry.to_string_lossy());
         text.push('\n');
     }
     // DeskIsle has a single writer per session. Replace the list only after the full
@@ -58,17 +61,22 @@ fn write_launchpad(path: &Path, entries: &[PathBuf]) -> Result<()> {
 }
 
 /// The pinned applications the user saved, or `None` before the first change.
-pub fn load_pins() -> Result<Option<Vec<PinnedApp>>> {
-    Ok(read_setting(PINS_FILE)?
-        .map(|lines| lines.into_iter().map(|line| pinned(line.into())).collect()))
+pub fn load_pins(make_pin: impl Fn(PathBuf) -> PinnedApp) -> Result<Option<Vec<PinnedApp>>> {
+    Ok(read_setting(PINS_FILE)?.map(|lines| {
+        let mut known = BTreeSet::new();
+        lines
+            .into_iter()
+            .map(|line| make_pin(line.into()))
+            .filter(|pin| known.insert(pin.app_id.clone()))
+            .collect()
+    }))
 }
 
 pub fn save_pins(pins: &[PinnedApp]) -> Result<()> {
-    let lines = pins
-        .iter()
-        .map(|pin| pin.launch.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    write_setting(PINS_FILE, lines.iter().map(String::as_str))
+    write_paths(
+        &settings_path(PINS_FILE)?,
+        pins.iter().map(|pin| pin.launch.as_path()),
+    )
 }
 
 const HIDDEN_FILE: &str = "tray-hidden.txt";
@@ -176,9 +184,9 @@ mod tests {
             PathBuf::from(r"C:\Apps\Edit.EXE"),
         ];
         assert!(read_launchpad(&file).unwrap().is_empty());
-        write_launchpad(&file, &entries).unwrap();
+        write_paths(&file, entries.iter().map(PathBuf::as_path)).unwrap();
         assert_eq!(read_launchpad(&file).unwrap(), entries);
-        write_launchpad(&file, &[]).unwrap();
+        write_paths(&file, []).unwrap();
         assert!(read_launchpad(&file).unwrap().is_empty());
         assert!(!dir.join(PINS_FILE).exists());
         std::fs::remove_file(file).unwrap();

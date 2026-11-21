@@ -9,8 +9,8 @@ use crate::platform::{self, shell};
 use crate::render::is_device_lost;
 use crate::storage;
 use crate::ui::launchpad::{LaunchpadHit, LaunchpadLayout};
-use windows::Win32::Foundation::E_INVALIDARG;
-use windows::core::{Error, Result};
+use crate::ui::layout::DockDrop;
+use windows::core::Result;
 
 pub(super) struct Launchpad {
     window: LaunchpadWindow,
@@ -21,9 +21,14 @@ pub(super) struct Launchpad {
     layout: LaunchpadLayout,
     wheel: i32,
     hover: Option<usize>,
+    pressed: bool,
 }
 
 impl Launchpad {
+    pub(super) fn contains_screen_point(&self, x: i32, y: i32) -> bool {
+        self.rect.contains(x, y) && self.window.contains_screen_point(x, y)
+    }
+
     fn layout_page(&mut self, page: usize) {
         self.layout = LaunchpadLayout::new(
             self.rect.width,
@@ -41,46 +46,35 @@ impl Launchpad {
         self.paths = paths;
         Ok(())
     }
-
-    fn add_files(&mut self, files: Vec<PathBuf>) -> Result<bool> {
-        let (paths, rejected) = dropped_entries(&self.paths, files);
-        let added = paths.len() != self.paths.len();
-        if added {
-            self.save(paths)?;
-            self.query.clear();
-            self.layout_page(usize::MAX);
-        }
-        if rejected > 0 {
-            platform::report_error(
-                Some(self.window.0),
-                &Error::new(
-                    E_INVALIDARG,
-                    format!(
-                        "有 {rejected} 个项目无法添加。请拖入可访问的 .lnk、.exe 或 .url 文件。"
-                    ),
-                ),
-            );
-        }
-        Ok(added)
-    }
 }
 
 /// Keep the original dropped paths, including shortcut arguments stored by the Shell.
-fn dropped_entries(existing: &[PathBuf], dropped: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
-    let mut next = existing.to_vec();
-    let mut known: BTreeSet<_> = existing.iter().map(|p| path_id(p)).collect();
-    let mut rejected = 0;
-    for path in dropped {
-        if !crate::launchpad::supported(&path) || !path.is_file() {
-            rejected += 1;
-        } else if known.insert(path_id(&path)) {
-            next.push(path);
-        }
-    }
-    (next, rejected)
+fn append_entries(entries: &mut Vec<PathBuf>, dropped: Vec<PathBuf>) -> bool {
+    let before = entries.len();
+    let mut known: BTreeSet<_> = entries.iter().map(|p| path_id(p)).collect();
+    entries.extend(dropped.into_iter().filter(|p| known.insert(path_id(p))));
+    entries.len() != before
 }
 
 impl Bars {
+    pub(super) fn add_launchpad_files(&mut self, files: Vec<PathBuf>) -> Result<()> {
+        let mut entries = match &self.launchpad {
+            Some(pad) => pad.paths.clone(),
+            None => storage::load_launchpad()?,
+        };
+        if append_entries(&mut entries, files) {
+            if let Some(pad) = &mut self.launchpad {
+                pad.save(entries)?;
+                pad.query.clear();
+                pad.layout_page(usize::MAX);
+                self.draw_launchpad()?;
+            } else {
+                storage::save_launchpad(&entries)?;
+            }
+        }
+        Ok(())
+    }
+
     fn launchpad_rect(&self) -> Rect {
         let work = self.monitor.work;
         let top = work.y.max(self.top_rect.y + self.top_rect.height);
@@ -110,6 +104,7 @@ impl Bars {
             layout,
             wheel: 0,
             hover: None,
+            pressed: false,
         });
         if let Err(error) = self.draw_launchpad() {
             self.close_launchpad();
@@ -161,12 +156,40 @@ impl Bars {
     }
 
     pub(super) fn launchpad_event(&mut self, input: LaunchpadEvent) -> Result<()> {
+        // A non-activating Dock may receive capture only within its own window.
+        // A new press here or a move after release ends any stale Dock gesture.
+        if matches!(
+            input,
+            LaunchpadEvent::Press
+                | LaunchpadEvent::Move {
+                    left_down: false,
+                    ..
+                }
+        ) {
+            self.cancel_dock_press()?;
+        }
         let Some(pad) = &mut self.launchpad else {
             return Ok(());
         };
         let owner = pad.window.0;
         let page = pad.layout.page;
+        let dock = self.layout.bottom;
+        let dock_client = |x: i32, y: i32| (pad.rect.x + x - dock.x, pad.rect.y + y - dock.y);
         let next_page = match input {
+            LaunchpadEvent::Press => {
+                pad.pressed = true;
+                return Ok(());
+            }
+            LaunchpadEvent::Move { x, y, .. } if self.dock_press.is_some() => {
+                let (x, y) = dock_client(x, y);
+                return self.move_dock_pointer(x, y);
+            }
+            LaunchpadEvent::Click(x, y) if self.dock_press.is_some() => {
+                pad.pressed = false;
+                let (x, y) = dock_client(x, y);
+                return self.release_dock(x, y);
+            }
+            LaunchpadEvent::Click(..) if !std::mem::take(&mut pad.pressed) => return Ok(()),
             LaunchpadEvent::Close | LaunchpadEvent::Key(LaunchpadKey::Escape) => {
                 self.close_launchpad();
                 return Ok(());
@@ -202,12 +225,7 @@ impl Bars {
                 page
             }
             LaunchpadEvent::DropFiles(files) => {
-                match pad.add_files(files) {
-                    Ok(true) => return self.draw_launchpad(),
-                    Ok(false) => {}
-                    Err(error) => platform::report_error(Some(owner), &error),
-                }
-                return Ok(());
+                return self.import_files(owner, DockDrop::Launchpad, files);
             }
             LaunchpadEvent::Text(ch) => {
                 pad.query.push(ch);
@@ -237,12 +255,15 @@ impl Bars {
                 }
                 next
             }
-            LaunchpadEvent::Move(..) | LaunchpadEvent::Leave => {
+            LaunchpadEvent::Move { .. } | LaunchpadEvent::Leave => {
                 let hover = match input {
-                    LaunchpadEvent::Move(x, y) => match pad.layout.hit(x, y) {
-                        LaunchpadHit::Item(index) => Some(index),
-                        _ => None,
-                    },
+                    LaunchpadEvent::Move { x, y, left_down } => {
+                        pad.pressed &= left_down;
+                        match pad.layout.hit(x, y) {
+                            LaunchpadHit::Item(index) => Some(index),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
                 if hover != pad.hover {
@@ -278,12 +299,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixed_drop_adds_existing_program_once_and_keeps_shortcuts_in_order() {
-        let saved = vec![PathBuf::from(r"C:\我的应用\快捷方式.lnk")];
-        let exe = std::env::current_exe().unwrap();
-        let files = vec![exe.clone(), PathBuf::from("relative.url"), exe.clone()];
-        let (entries, rejected) = dropped_entries(&saved, files);
-        assert_eq!(entries, [saved[0].clone(), exe]);
-        assert_eq!(rejected, 1);
+    fn repeated_import_preserves_original_shortcuts_and_order() {
+        let saved = PathBuf::from(r"C:\我的应用\快捷方式.lnk");
+        let exe = PathBuf::from(r"C:\Apps\Editor.exe");
+        let mut entries = vec![saved.clone()];
+        let files = vec![exe.clone(), saved.clone(), exe.clone()];
+        assert!(append_entries(&mut entries, files.clone()));
+        assert!(!append_entries(&mut entries, files));
+        assert_eq!(entries, [saved, exe]);
     }
 }

@@ -26,12 +26,14 @@ impl Bars {
             Command::NewInstance(path) => shell::execute(owner, &path),
             Command::Reveal(path) => shell::reveal(owner, &path),
             Command::Pin(path) => {
-                dock::pin(&mut self.pins, &path);
-                storage::save_pins(&self.pins)
+                let mut pins = self.pins.clone();
+                dock::pin(&mut pins, &path);
+                self.save_pins(pins).map(drop)
             }
             Command::Unpin(id) => {
-                self.pins.retain(|pin| pin.app_id != id);
-                storage::save_pins(&self.pins)
+                let mut pins = self.pins.clone();
+                pins.retain(|pin| pin.app_id != id);
+                self.save_pins(pins).map(drop)
             }
             Command::CloseWindow(id, window) => shell::close_windows(&id, &[window]),
             Command::CloseAllWindows(id, windows) => shell::close_windows(&id, &windows),
@@ -119,7 +121,7 @@ impl Bars {
         match app.action() {
             Action::Launch(path) => {
                 if !was_running {
-                    shell::launch(self.bottom.0, path, &snapshot)?;
+                    shell::launch(self.bottom.0, path, id, &snapshot)?;
                 }
             }
             Action::Activate(window) => {
@@ -137,5 +139,14 @@ impl Bars {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn save_pins(&mut self, pins: Vec<dock::PinnedApp>) -> Result<bool> {
+        if pins == self.pins {
+            return Ok(false);
+        }
+        storage::save_pins(&pins)?;
+        self.pins = pins;
+        Ok(true)
     }
 }
