@@ -118,6 +118,7 @@ impl Bars {
                 index,
                 label: &icon.name,
                 status: &icon.label,
+                can_interact: icon.can_interact(),
                 kept: !self.hidden.contains(&icon.key),
             })
             .collect::<Vec<_>>();
@@ -387,8 +388,10 @@ impl Bars {
                         chosen = hit
                             .focus()
                             .and_then(|focus| {
-                                menu.context_command(focus.index())
-                                    .or_else(|| menu.focused_command(focus))
+                                menu.context_command(focus.index()).or_else(|| {
+                                    menu.focused_command(focus)
+                                        .filter(|cmd| !matches!(cmd, Command::TrayToggle(_)))
+                                })
                             })
                             .cloned();
                         if self.overflow_open
@@ -439,6 +442,7 @@ impl Bars {
                     MenuKey::Dismiss => break None,
                     _ => {}
                 },
+                Event::TrayNoticeExpired => self.clear_tray_notice()?,
                 Event::MetricsUpdate => {
                     if let Err(error) = self.draw_metrics() {
                         failure = Some(error);

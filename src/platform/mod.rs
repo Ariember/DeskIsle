@@ -171,6 +171,13 @@ pub fn monitor() -> Result<Monitor> {
 
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
+const TRAY_NOTICE_TIMER: usize = 2;
+
+/// Reset the one-shot status hint whenever another delivery fails.
+pub fn time_tray_notice(hwnd: HWND) {
+    // A clock tick also clears the notice if Windows cannot allocate a timer.
+    let _ = unsafe { SetTimer(Some(hwnd), TRAY_NOTICE_TIMER, 5000, None) };
+}
 
 /// Wakes the UI thread. The worker holds the window's lifetime lock through this call.
 pub fn notify_metrics(hwnd: HWND) -> Result<()> {
@@ -345,6 +352,7 @@ pub enum Event {
     Refresh,
     Display,
     Clock,
+    TrayNoticeExpired,
     MetricsUpdate,
     Move(HWND, i32, i32),
     Leave,
@@ -468,6 +476,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),
         APPBAR_CHANGED => return LRESULT(0),
+        WM_TIMER if wp.0 == TRAY_NOTICE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), TRAY_NOTICE_TIMER) };
+            Event::TrayNoticeExpired
+        }
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => Event::Move(hwnd, x, y),
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave,

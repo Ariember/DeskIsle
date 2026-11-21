@@ -62,6 +62,7 @@ struct Bars {
     /// Wheel movement over the sound icon not yet turned into a volume step.
     wheel: i32,
     time: String,
+    tray_notice: Option<String>,
     /// A left press on a bar dismissed the open menu; its release must not click.
     swallow_click: bool,
     settings: Settings,
@@ -176,6 +177,7 @@ pub(crate) fn run() -> Result<()> {
         top_hover: None,
         wheel: 0,
         time,
+        tray_notice: None,
         swallow_click: false,
         settings,
         system: system::status(Default::default()),
@@ -232,13 +234,14 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
-                if bars.time != time {
+                if bars.tray_notice.take().is_some() || bars.time != time {
                     bars.time = time;
                     bars.draw()?;
                 }
                 // Network changes have no notification here; the minute tick catches them.
                 bars.refresh_system()?;
             }
+            Event::TrayNoticeExpired => bars.clear_tray_notice()?,
             Event::Audio => bars.refresh_audio()?,
             Event::MetricsUpdate => match bars.draw_metrics() {
                 Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
@@ -497,10 +500,25 @@ impl Bars {
                 self.draw()
             }
             Err(error) => {
-                platform::report_error(Some(self.top.0), &error);
-                Ok(())
+                let name = &self.tray.icons()[index].name;
+                self.tray_notice = Some(
+                    if error.code() == windows::Win32::Foundation::E_ACCESSDENIED {
+                        format!("权限受限，请从系统托盘操作“{name}”")
+                    } else {
+                        format!("托盘点击投递失败（{}） · {name}", error.code())
+                    },
+                );
+                platform::time_tray_notice(self.top.0);
+                self.draw()
             }
         }
+    }
+
+    fn clear_tray_notice(&mut self) -> Result<()> {
+        if self.tray_notice.take().is_some() {
+            self.draw()?;
+        }
+        Ok(())
     }
 
     fn tray_toggle(&mut self, index: usize) -> Result<()> {
@@ -587,6 +605,16 @@ impl Bars {
                 }
             })
             .collect::<Vec<_>>();
+        let title = self.tray_notice.as_deref().unwrap_or_else(|| {
+            if let Some(StatusHit::Tray(slot)) = self.top_hover
+                && let Some(&index) = self.shown.get(slot)
+                && !icons[index].can_interact()
+            {
+                "仅显示，请从系统托盘操作"
+            } else {
+                active
+            }
+        });
         let marks = self
             .status
             .system
@@ -596,7 +624,7 @@ impl Bars {
         renderer.draw_top(
             &self.status,
             dpi,
-            active,
+            title,
             &self.time,
             &tray,
             &marks,

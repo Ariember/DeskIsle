@@ -140,6 +140,11 @@ pub struct TrayIcon {
 }
 
 impl TrayIcon {
+    /// Only the live registration supplies the owner's input message.
+    pub fn can_interact(&self) -> bool {
+        self.owner != 0 && self.callback != 0
+    }
+
     pub fn needs_attention(&self) -> bool {
         self.attention.unread
     }
@@ -181,6 +186,15 @@ impl TrayIcon {
 
     fn matches(&self, n: &Notify) -> bool {
         self.identifies(n.owner, n.id, (n.flags & NIF_GUID != 0).then_some(n.guid))
+    }
+
+    fn changes_click_target(&self, n: &Notify) -> bool {
+        match n.message {
+            NIM_ADD | NIM_DELETE => true,
+            NIM_MODIFY => n.flags & NIF_MESSAGE != 0 && self.callback != n.callback,
+            NIM_SETVERSION => self.version != n.version,
+            _ => false,
+        }
     }
 
     fn identifies(&self, owner: isize, id: u32, guid: Option<GUID>) -> bool {
@@ -365,7 +379,7 @@ impl TrayHost {
         self.icons
             .iter()
             .enumerate()
-            .filter(|(_, icon)| icon.visible() && icon.callback != 0)
+            .filter(|(_, icon)| icon.visible() && icon.can_interact())
             .filter_map(|(index, icon)| {
                 let pid = shell::window_process(HWND(icon.owner as _));
                 if pid == 0 || pid == desktop_pid || window_pid.is_some_and(|target| target != pid)
@@ -399,6 +413,14 @@ impl TrayHost {
 
     fn apply(&mut self, n: Notify) -> bool {
         let found = self.icons.iter().position(|icon| icon.matches(&n));
+        if let Some(icon) = found.map(|i| &self.icons[i])
+            && self
+                .last_press
+                .is_some_and(|(id, _)| id == icon.registration)
+            && icon.changes_click_target(&n)
+        {
+            self.cancel_click();
+        }
         match (n.message, found) {
             (NIM_DELETE, Some(i)) => {
                 self.icons.remove(i);
@@ -424,7 +446,9 @@ impl TrayHost {
                 }
                 let was_unread = icon.needs_attention();
                 if n.flags & NIF_MESSAGE != 0 {
+                    let interactive = icon.can_interact();
                     icon.callback = n.callback;
+                    changed |= interactive != icon.can_interact();
                 }
                 if n.balloon {
                     icon.attention.notify(n.received);
@@ -524,11 +548,13 @@ impl TrayHost {
         let icon = &self.icons[index];
         // A popup keeps its rows stable until it closes. Do not send its gesture to
         // a registration which the owner has already withdrawn or replaced meanwhile.
-        if COMMANDS.with_borrow(|pending| {
-            pending
-                .iter()
-                .any(|n| matches!(n.message, NIM_DELETE | NIM_ADD) && icon.matches(n))
-        }) {
+        if !icon.can_interact()
+            || COMMANDS.with_borrow(|pending| {
+                pending
+                    .iter()
+                    .any(|n| icon.matches(n) && icon.changes_click_target(n))
+            })
+        {
             self.cancel_click();
             return Ok(false);
         }
@@ -550,18 +576,12 @@ impl TrayHost {
             TrayInput::KeySelect | TrayInput::ContextMenu => self.last_press = None,
             _ => {}
         }
-        if icon.callback == 0 {
-            self.last_press = None;
-            return Err(Error::new(
-                E_FAIL,
-                format!("托盘图标“{}”未注册点击回调", icon.name),
-            ));
-        }
         let owner = HWND(icon.owner as _);
         let pid = shell::window_process(owner);
         if pid == 0 {
             // The open menu may still hold indices into this snapshot. Its queued Tray
             // event will prune the dead owner once those indices are no longer in use.
+            self.cancel_click();
             queue(self.hwnd, Event::Tray);
             return Ok(false);
         }
@@ -582,13 +602,7 @@ impl TrayHost {
                     queue(self.hwnd, Event::Tray);
                     return Ok(false);
                 }
-                return Err(Error::new(
-                    error.code(),
-                    format!(
-                        "无法把点击发送给托盘图标“{}”，该应用可能以管理员权限运行：{error}",
-                        icon.name
-                    ),
-                ));
+                return Err(error);
             }
         }
         Ok(matches!(
@@ -931,10 +945,8 @@ mod tests {
             ..update()
         });
         assert_eq!(tray.icons.len(), 2);
-        assert!(
-            tray.click(1, TrayInput::KeySelect, POINT::default())
-                .is_err()
-        );
+        assert!(!tray.icons[1].can_interact());
+        assert!(!tray.click(1, TrayInput::KeySelect, POINT::default())?);
         tray.apply(Notify {
             guid,
             flags: NIF_GUID | NIF_MESSAGE,
@@ -944,6 +956,7 @@ mod tests {
         });
         assert_eq!(tray.icons.len(), 2);
         let restored = &tray.icons[1];
+        assert!(restored.can_interact());
         assert_eq!(
             (restored.owner, restored.id, restored.callback),
             (owner.0 as isize, 3, WM_APP + 3)
@@ -1047,6 +1060,27 @@ mod tests {
         };
         let up = TrayInput::Release { right: false };
         let point = usize::from(anchor.x as u16) | (usize::from(anchor.y as u16) << 16);
+        // Revoking input while the button is held takes effect even while an
+        // overflow row is waiting for release before applying queued updates.
+        host.click(0, down, anchor)?;
+        assert_eq!(receive(), [(WM_LBUTTONDOWN, point)]);
+        let callback_update = |callback| Notify {
+            message: NIM_MODIFY,
+            callback,
+            ..registration()
+        };
+        COMMANDS.with_borrow_mut(|pending| pending.push(callback_update(0)));
+        assert!(!host.click(0, up, anchor)?);
+        assert!(host.update(false));
+        assert!(!host.icons[0].can_interact());
+        for input in [down, up, TrayInput::KeySelect, TrayInput::ContextMenu] {
+            assert!(!host.click(0, input, anchor)?);
+        }
+        assert!(host.icons[0].needs_attention());
+        assert!(host.apply(callback_update(CALLBACK)));
+        assert!(!host.click(0, up, anchor)?);
+        assert!(receive().is_empty());
+        // A fresh gesture is delivered after the application registers again.
         host.click(0, down, anchor)?;
         assert_eq!(receive(), [(WM_LBUTTONDOWN, point)]);
         assert!(host.click(0, up, anchor)?);

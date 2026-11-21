@@ -1022,6 +1022,7 @@ pub struct TrayEntry<'a> {
     /// Its tooltip, shown beside the name when it says something else, such as Clash
     /// clients reporting the current speed.
     pub status: &'a str,
+    pub can_interact: bool,
     /// The user keeps it on the status bar; it still overflows when there is no room.
     pub kept: bool,
 }
@@ -1092,11 +1093,19 @@ pub fn tray_menu(
                 index: icon.index,
                 on: icon.kept,
             },
-            Some(Command::TrayActivate(icon.index)),
+            icon.can_interact
+                .then_some(Command::TrayActivate(icon.index)),
         );
         item.icon_command = Some(Command::TrayToggle(icon.index));
-        item.context = Some(Command::TrayMenu(icon.index));
+        item.context = icon.can_interact.then_some(Command::TrayMenu(icon.index));
         item.detail = tray_status(icon.label, icon.status);
+        if !icon.can_interact {
+            if item.detail.is_empty() {
+                item.detail = "仅显示".into();
+            } else {
+                item.detail.insert_str(0, "仅显示 · ");
+            }
+        }
     }
     if pages > 1 {
         let previous = menu.item(
@@ -1249,20 +1258,25 @@ mod tests {
                 index: 0,
                 label: "a",
                 status: "a",
+                can_interact: false,
                 kept: true,
             },
             TrayEntry {
                 index: 3,
                 label: "Sparkle",
                 status: "\u{2191} 943 B/s\n\u{2193} 0 B/s",
+                can_interact: true,
                 kept: false,
             },
         ];
         let menu = tray_menu(&icons, &mut 0, None, 720, 96);
         // One row per icon, whether or not it is on the bar, with no checkmarks.
+        assert_eq!(commands(&menu), [Command::TrayActivate(3)]);
+        assert_eq!(menu.context_command(0), None);
+        assert_eq!(menu.step(None, true), Some(Focus::Part(0, 0)));
         assert_eq!(
-            commands(&menu),
-            [Command::TrayActivate(0), Command::TrayActivate(3)]
+            menu.step(Some(Focus::Part(0, 0)), true),
+            Some(Focus::Part(1, 0))
         );
         assert_eq!(menu.part_command(0, 0), Some(&Command::TrayToggle(0)));
         assert_eq!(menu.context_command(1), Some(&Command::TrayMenu(3)));
@@ -1277,7 +1291,10 @@ mod tests {
             .collect();
         assert_eq!(
             details,
-            [("a", ""), ("Sparkle", "\u{2191} 943 B/s \u{2193} 0 B/s")]
+            [
+                ("a", "仅显示"),
+                ("Sparkle", "\u{2191} 943 B/s \u{2193} 0 B/s")
+            ]
         );
         assert!(matches!(
             menu.entries[..],
@@ -1304,6 +1321,7 @@ mod tests {
                 index: 2 * n + 1,
                 label: "Tray app",
                 status: "",
+                can_interact: true,
                 kept: false,
             })
             .collect();
@@ -1361,6 +1379,7 @@ mod tests {
             index,
             label: "App",
             status: "",
+            can_interact: true,
             kept: true,
         });
         let mut page = 2;
@@ -1389,6 +1408,7 @@ mod tests {
             index: 2,
             label: "a",
             status: "",
+            can_interact: true,
             kept: true,
         }];
         for dpi in [96, 120, 144, 192] {
