@@ -4,8 +4,9 @@
 
 use crate::geometry::Rect;
 use crate::settings::{
-    self, Adjust, Control, Key, MonitorKey, SCHEMA, SECTIONS, Section, Settings,
+    self, Adjust, Control, DOCK_DISPLAY_MODES, Key, MonitorKey, SCHEMA, SECTIONS, Section, Settings,
 };
+use crate::visibility::DockDisplayMode;
 
 pub const WIDTH: f32 = 720.;
 pub const HEIGHT: f32 = 560.;
@@ -40,6 +41,7 @@ const SLIDER_CARD: f32 = 86.;
 const SLIDER_PAD: f32 = 7.;
 const SEGMENT: f32 = 56.;
 const CONTROL_HEIGHT: f32 = 28.;
+const MODE_ROW_HEIGHT: f32 = 24.;
 const RESET_WIDTH: f32 = 112.;
 /// Content moved per wheel notch, in DIPs.
 const SCROLL_STEP: f32 = 48.;
@@ -79,11 +81,17 @@ pub enum Action {
     /// Restores the defaults of every setting on the current page.
     Reset,
     DisplaySettings,
+    OpenModes,
+    DismissModes,
     Change(Key, Adjust),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Part {
+    Dropdown {
+        area: Area,
+        selected: usize,
+    },
     Switch {
         area: Area,
         on: bool,
@@ -146,6 +154,8 @@ pub struct PanelState {
     pub hover: Option<Action>,
     /// The value shown while dragging, committed by the coordinator on release.
     pub slider_preview: Option<(Key, i32)>,
+    /// Keyboard highlight while the Dock mode selector is open.
+    pub mode_highlight: Option<usize>,
 }
 
 impl PanelState {
@@ -169,13 +179,30 @@ impl PanelState {
 
     /// Handles a key. Focus and scroll change here; the returned action is for the caller.
     pub fn key(&mut self, nav: Nav, layout: &PanelLayout) -> Option<Action> {
-        let count = layout.rows.len() + usize::from(layout.display_settings.is_some());
-        let focused = self.focus.filter(|&i| i < count);
         let page = |offset: usize| Action::Page((self.page + offset) % SECTIONS.len());
         match nav {
+            Nav::NextPage => return Some(page(1)),
+            Nav::PreviousPage => return Some(page(SECTIONS.len() - 1)),
+            _ => {}
+        }
+        if let Some(current) = self.mode_highlight {
+            self.hover = None;
+            let last = DOCK_DISPLAY_MODES.len() - 1;
+            self.mode_highlight = Some(match nav {
+                Nav::Next | Nav::Increase => (current + 1).min(last),
+                Nav::Previous | Nav::Decrease => current.saturating_sub(1),
+                Nav::Activate => {
+                    return Some(Action::Change(Key::DockDisplayMode, Adjust::Pick(current)));
+                }
+                Nav::Close => return Some(Action::DismissModes),
+                _ => return None,
+            });
+            return None;
+        }
+        let count = layout.rows.len() + usize::from(layout.display_settings.is_some());
+        let focused = self.focus.filter(|&i| i < count);
+        match nav {
             Nav::Close => Some(Action::Close),
-            Nav::NextPage => Some(page(1)),
-            Nav::PreviousPage => Some(page(SECTIONS.len() - 1)),
             Nav::Next | Nav::Previous if count > 0 => {
                 let next = match (focused, nav == Nav::Next) {
                     (None, true) => 0,
@@ -199,6 +226,9 @@ impl PanelState {
                 let Some(row) = layout.rows.get(focused?) else {
                     return (nav == Nav::Activate).then_some(Action::DisplaySettings);
                 };
+                if matches!(row.part, Part::Dropdown { .. }) && nav == Nav::Activate {
+                    return Some(Action::OpenModes);
+                }
                 let adjust = match nav {
                     Nav::Decrease => Adjust::Step(-1),
                     Nav::Increase => Adjust::Step(1),
@@ -245,6 +275,30 @@ pub struct PanelLayout {
     pub scroll_thumb: Option<Area>,
     pub focus: Option<usize>,
     pub hover: Option<Action>,
+    pub modes: Option<ModeList>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModeList {
+    pub area: Area,
+    pub selected: usize,
+    pub highlight: usize,
+}
+
+impl ModeList {
+    pub fn rows(&self) -> impl Iterator<Item = (Area, &'static str)> {
+        DOCK_DISPLAY_MODES.iter().enumerate().map(|(index, mode)| {
+            let top = self.area.top + MODE_ROW_HEIGHT * index as f32;
+            (
+                Area {
+                    top,
+                    bottom: top + MODE_ROW_HEIGHT,
+                    ..self.area
+                },
+                mode.label,
+            )
+        })
+    }
 }
 
 impl PanelLayout {
@@ -335,7 +389,7 @@ impl PanelLayout {
             group.top -= state.scroll;
             group.bottom -= state.scroll;
         }
-        let rows = rows
+        let rows: Vec<Row> = rows
             .into_iter()
             .map(|(spec, detail, mut card)| {
                 card.top -= state.scroll;
@@ -347,13 +401,42 @@ impl PanelLayout {
                 Row {
                     key: spec.key,
                     label: spec.label,
-                    help: spec.help,
+                    help: if spec.key == Key::DockDisplayMode {
+                        match settings.dock_display_mode() {
+                            DockDisplayMode::Default => spec.help,
+                            DockDisplayMode::Overlay => "允许其他窗口遮挡 Dock",
+                            DockDisplayMode::AutoHide => "移开收起，移到底边唤出",
+                            DockDisplayMode::SmartHide => "与前台窗口重叠时收起",
+                            DockDisplayMode::Always => "切换应用后保持置顶",
+                            DockDisplayMode::Hotkey => "Ctrl+Alt+D 显示或隐藏 Dock",
+                            DockDisplayMode::AlwaysIncludingFullscreen => "全屏时也保持置顶",
+                            DockDisplayMode::Desktop => "仅在桌面处于前台时显示",
+                        }
+                    } else {
+                        spec.help
+                    },
                     card,
                     part: part(spec, value, card),
                     detail: detail.map(|s| detail_control(s, settings.get(s.key), card)),
                 }
             })
             .collect();
+        let modes = state.mode_highlight.and_then(|highlight| {
+            let (button, selected) = rows.iter().find_map(|row| match row.part {
+                Part::Dropdown { area, selected } => Some((area, selected)),
+                _ => None,
+            })?;
+            let list_height = MODE_ROW_HEIGHT * DOCK_DISPLAY_MODES.len() as f32;
+            // Align the selected entry with the button and keep every row clickable,
+            // including on the shortest panel. The title remains draggable.
+            let top = (button.middle() - MODE_ROW_HEIGHT * (selected as f32 + 0.5))
+                .clamp(CAPTION + 2., height - list_height - 2.);
+            Some(ModeList {
+                area: Area::new(button.left, top, button.right, top + list_height),
+                selected,
+                highlight,
+            })
+        });
         let reset_top = height - FOOTER + (FOOTER - CONTROL_HEIGHT) / 2.;
         Self {
             scale,
@@ -385,6 +468,7 @@ impl PanelLayout {
             scroll_thumb,
             focus: state.focus,
             hover: state.hover,
+            modes,
         }
     }
 
@@ -459,6 +543,16 @@ impl PanelLayout {
     /// `x` and `y` are client pixels of the panel window.
     pub fn hit(&self, x: i32, y: i32) -> Option<Action> {
         let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
+        if let Some(modes) = &self.modes {
+            return Some(
+                modes
+                    .rows()
+                    .position(|(a, _)| a.contains(x, y))
+                    .map_or(Action::DismissModes, |i| {
+                        Action::Change(Key::DockDisplayMode, Adjust::Pick(i))
+                    }),
+            );
+        }
         if self.close.contains(x, y) {
             return Some(Action::Close);
         }
@@ -495,6 +589,7 @@ impl PanelLayout {
             }
         }
         let adjust = match &row.part {
+            Part::Dropdown { area, .. } => return area.contains(x, y).then_some(Action::OpenModes),
             // In composite cards the space around the style buttons is neutral.
             Part::Switch { area, .. }
                 if row.detail.is_some() && !area.contains(x, y) && y >= row.card.middle() =>
@@ -610,6 +705,10 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
             value,
             unit,
         },
+        Control::Choice(_) if spec.key == Key::DockDisplayMode => Part::Dropdown {
+            area: Area::new(right - 166., top, right, bottom),
+            selected: value as usize,
+        },
         Control::Choice(choices) => {
             let (left, top, segment, bottom) = if stacked_choice(spec.key) {
                 let left = card.left + CONTROL_INSET;
@@ -663,7 +762,7 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
 /// Where the row's label and help text go: from the card's left edge to its control.
 pub fn text_area(row: &Row) -> Area {
     let control_left = match &row.part {
-        Part::Switch { area, .. } => area.left,
+        Part::Switch { area, .. } | Part::Dropdown { area, .. } => area.left,
         Part::Slider { .. } => row.card.right - 78.,
         Part::Segments { .. } if stacked_choice(row.key) => row.card.right,
         Part::Segments { options, .. } => options.first().map_or(row.card.right, |o| o.0.left),
@@ -739,6 +838,11 @@ mod tests {
                     let row = &layout.rows[index];
                     let change = |adjust| Some(Action::Change(row.key, adjust));
                     match &row.part {
+                        Part::Dropdown { area, .. } => {
+                            let (x, y) = center(*area, s);
+                            assert_eq!(layout.hit(x, y), Some(Action::OpenModes));
+                            assert_eq!(state.key(Nav::Activate, &layout), Some(Action::OpenModes));
+                        }
                         Part::Switch { area, .. } => {
                             let (x, y) = center(*area, s);
                             assert_eq!(layout.hit(x, y), change(Adjust::Toggle));
@@ -773,6 +877,41 @@ mod tests {
                 // The window corner and the caption do nothing.
                 assert_eq!(layout.hit(1, 1), None);
             }
+        }
+    }
+
+    #[test]
+    fn dock_mode_list_fits_short_panels_and_commits_only_on_selection() {
+        let mut settings = Settings::default();
+        let mut state = dock_page();
+        let work = Rect {
+            width: 1200,
+            ..work(520)
+        };
+        for selected in 0..DOCK_DISPLAY_MODES.len() {
+            settings.adjust(Key::DockDisplayMode, Adjust::Pick(selected));
+            state.mode_highlight = Some(selected);
+            let layout = PanelLayout::new(&mut state, &settings, 192, work);
+            let modes = layout.modes.as_ref().unwrap();
+            assert_eq!(modes.selected, selected);
+            assert!(modes.area.top >= CAPTION && modes.area.bottom <= layout.height);
+            for (index, (area, _)) in modes.rows().enumerate() {
+                let (x, y) = center(area, layout.scale);
+                assert_eq!(
+                    layout.hit(x, y),
+                    Some(Action::Change(Key::DockDisplayMode, Adjust::Pick(index)))
+                );
+            }
+            assert_eq!(layout.hit(1, 1), Some(Action::DismissModes));
+            assert_eq!(state.key(Nav::Previous, &layout), None);
+            assert_eq!(
+                state.key(Nav::Activate, &layout),
+                Some(Action::Change(
+                    Key::DockDisplayMode,
+                    Adjust::Pick(selected.saturating_sub(1))
+                ))
+            );
+            assert_eq!(state.key(Nav::Close, &layout), Some(Action::DismissModes));
         }
     }
 

@@ -25,9 +25,10 @@ use windows::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{
-            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_EXTENDED_FRAME_BOUNDS,
+            DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+            DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -70,13 +71,15 @@ impl Drop for Desktop {
 pub struct Bar(pub HWND, Option<drop_files::Registration>);
 
 /// The registering UI thread owns the window and drops this binding before destroying it.
-pub struct TaskbarShortcut {
+pub struct Shortcut {
     hwnd: HWND,
     id: i32,
 }
 
-impl TaskbarShortcut {
-    pub fn register(hwnd: HWND, choice: i32) -> Result<Option<Self>> {
+const DOCK_SHORTCUT_ID: i32 = 3;
+
+impl Shortcut {
+    pub fn taskbar(hwnd: HWND, choice: i32) -> Result<Option<Self>> {
         let (modifiers, key, label) = match choice {
             0 => return Ok(None),
             1 => (MOD_CONTROL | MOD_ALT, VK_T, "Ctrl+Alt+T"),
@@ -84,18 +87,34 @@ impl TaskbarShortcut {
             _ => return Err(Error::new(E_INVALIDARG, "未知的任务栏快捷键")),
         };
         // A distinct ID per preset lets the old registration survive a conflict.
-        unsafe { RegisterHotKey(Some(hwnd), choice, modifiers | MOD_NOREPEAT, key.0 as u32) }
-            .map_err(|error| {
-                Error::new(
-                    error.code(),
-                    format!("无法注册任务栏快捷键 {label}：{error}"),
-                )
-            })?;
-        Ok(Some(Self { hwnd, id: choice }))
+        Self::register(hwnd, choice, modifiers, key, label).map(Some)
+    }
+
+    pub fn dock(hwnd: HWND) -> Result<Self> {
+        Self::register(
+            hwnd,
+            DOCK_SHORTCUT_ID,
+            MOD_CONTROL | MOD_ALT,
+            VK_D,
+            "Ctrl+Alt+D",
+        )
+    }
+
+    fn register(
+        hwnd: HWND,
+        id: i32,
+        modifiers: HOT_KEY_MODIFIERS,
+        key: VIRTUAL_KEY,
+        label: &str,
+    ) -> Result<Self> {
+        unsafe { RegisterHotKey(Some(hwnd), id, modifiers | MOD_NOREPEAT, key.0 as u32) }.map_err(
+            |error| Error::new(error.code(), format!("无法注册快捷键 {label}：{error}")),
+        )?;
+        Ok(Self { hwnd, id })
     }
 }
 
-impl Drop for TaskbarShortcut {
+impl Drop for Shortcut {
     fn drop(&mut self) {
         let _ = unsafe { UnregisterHotKey(Some(self.hwnd), self.id) };
     }
@@ -393,22 +412,48 @@ impl Bar {
     }
 
     pub fn position(&self, r: Rect, visible: bool) -> Result<()> {
+        self.position_layer(r, visible, true)
+    }
+
+    pub fn position_layer(&self, r: Rect, visible: bool, topmost: bool) -> Result<()> {
         let show = if visible {
             SWP_SHOWWINDOW
         } else {
             SWP_HIDEWINDOW
         };
-        unsafe {
+        let place = |after, order| unsafe {
             SetWindowPos(
                 self.0,
-                Some(HWND_TOPMOST),
+                after,
                 r.x,
                 r.y,
                 r.width,
                 r.height,
-                SWP_NOACTIVATE | show,
+                SWP_NOACTIVATE | order | show,
             )
+        };
+        if topmost {
+            return place(Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0));
         }
+        let is_topmost = |hwnd| {
+            WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32)
+                .contains(WS_EX_TOPMOST)
+        };
+        if !is_topmost(self.0) {
+            return place(None, SWP_NOZORDER);
+        }
+        // Inserting after an ordinary foreground window demotes the Dock while
+        // keeping it above Explorer's desktop. The borrowed HWND can disappear
+        // or change bands between the query and SetWindowPos.
+        let front = foreground();
+        if !front.is_invalid() && !is_desktop(front) && !is_topmost(front) {
+            match place(Some(front), SET_WINDOW_POS_FLAGS(0)) {
+                Ok(()) if !is_topmost(self.0) => return Ok(()),
+                Err(error) if unsafe { IsWindow(Some(front)) }.as_bool() => return Err(error),
+                _ => {}
+            }
+        }
+        place(Some(HWND_NOTOPMOST), SET_WINDOW_POS_FLAGS(0))
     }
 
     /// Arms a one-shot dwell timer on the Dock window.
@@ -484,6 +529,7 @@ pub enum Event {
     InputLanguage,
     DockReveal,
     TaskbarShortcut(i32),
+    DockShortcut,
     MetricsUpdate,
     Move(HWND, i32, i32),
     Leave(HWND),
@@ -609,6 +655,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_CLOSE => Event::Quit,
         WM_HOTKEY if matches!(wp.0, 1 | 2) => Event::TaskbarShortcut(wp.0 as i32),
+        WM_HOTKEY if wp.0 == DOCK_SHORTCUT_ID as usize => Event::DockShortcut,
         shell::WINDOWS_CHANGED => Event::Refresh,
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => Event::Display,
@@ -1138,6 +1185,57 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 /// The window that currently has the foreground, to tell when another one takes it.
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+pub fn foreground_is_desktop() -> bool {
+    is_desktop(foreground())
+}
+
+fn is_desktop(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let shell = unsafe { GetShellWindow() };
+    if hwnd == shell || hwnd == unsafe { GetDesktopWindow() } {
+        return true;
+    }
+    // Explorer can host the desktop view in a WorkerW instead of Progman.
+    let mut class = [0u16; 32];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    class[..len].iter().copied().eq("WorkerW".encode_utf16())
+        && !shell.is_invalid()
+        && shell::window_process(hwnd) == shell::window_process(shell)
+}
+
+fn window_overlaps(hwnd: HWND, dock: Rect) -> bool {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool()
+            || IsIconic(hwnd).as_bool()
+            || WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32)
+                .contains(WS_EX_TOOLWINDOW)
+            || is_desktop(hwnd)
+        {
+            return false;
+        }
+        // GetWindowRect includes invisible resize borders. Prefer the frame that
+        // the compositor actually draws, including for partially overlapping windows.
+        let mut frame = RECT::default();
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut frame).cast(),
+            size_of::<RECT>() as u32,
+        )
+        .is_err()
+            && GetWindowRect(hwnd, &mut frame).is_err()
+        {
+            return false;
+        }
+        frame.left < dock.x + dock.width
+            && frame.right > dock.x
+            && frame.top < dock.y + dock.height
+            && frame.bottom > dock.y
+    }
 }
 
 pub fn maximized_on_primary(hwnd: HWND) -> bool {

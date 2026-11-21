@@ -8,6 +8,7 @@ use crate::settings::{Adjust, Key, SCHEMA, SECTIONS, Settings, Store, Theme, Top
 use crate::storage;
 use crate::ui::layout::DockStyle;
 use crate::ui::panel::{Action, Nav, PanelLayout, PanelState, panel_dpi};
+use crate::visibility::DockDisplayMode;
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::core::{Error, Result};
 
@@ -269,6 +270,7 @@ impl Bars {
             }
             Event::PanelCancel => {
                 panel.state.slider_preview = None;
+                panel.state.mode_highlight = None;
                 panel.pressed = None;
                 None
             }
@@ -281,6 +283,12 @@ impl Bars {
                     }
                 } else {
                     panel.state.hover = panel.layout.hit(x, y);
+                    if panel.state.mode_highlight.is_some()
+                        && let Some(Action::Change(Key::DockDisplayMode, Adjust::Pick(i))) =
+                            panel.state.hover
+                    {
+                        panel.state.mode_highlight = Some(i);
+                    }
                 }
                 None
             }
@@ -306,6 +314,13 @@ impl Bars {
             Event::PanelScroll(_) | Event::PanelKey(_) if panel.state.slider_preview.is_some() => {
                 None
             }
+            Event::PanelScroll(delta) if panel.state.mode_highlight.is_some() => {
+                if delta != 0 {
+                    let direction = if delta > 0 { Nav::Previous } else { Nav::Next };
+                    panel.state.key(direction, &panel.layout);
+                }
+                None
+            }
             Event::PanelScroll(delta) => {
                 panel.state.scroll_by(delta, &panel.layout);
                 None
@@ -313,6 +328,7 @@ impl Bars {
             Event::PanelKey(key) => nav(key).and_then(|nav| panel.state.key(nav, &panel.layout)),
             Event::PanelDpi => {
                 panel.state.slider_preview = None;
+                panel.state.mode_highlight = None;
                 panel.pressed = None;
                 panel.window.release();
                 None
@@ -320,7 +336,21 @@ impl Bars {
             Event::PanelClose => Some(Action::Close),
             _ => None,
         };
+        if action.is_some() && panel.state.mode_highlight.take().is_some() {
+            panel.window.release();
+            panel.state.hover = None;
+        }
         match action {
+            Some(Action::OpenModes) => {
+                panel.state.focus = panel
+                    .layout
+                    .rows
+                    .iter()
+                    .position(|row| row.key == Key::DockDisplayMode);
+                panel.state.mode_highlight = Some(self.settings.get(Key::DockDisplayMode) as usize);
+                panel.window.capture();
+            }
+            Some(Action::DismissModes) => {}
             Some(Action::Close) => {
                 self.close_settings();
                 return Ok(());
@@ -369,7 +399,7 @@ impl Bars {
         let changed: Vec<_> = self.settings.changed(&previous).collect();
         let (mut relayout, mut redisplay, mut save, mut retheme) = (false, false, false, false);
         let mut monitor_changed = false;
-        let mut immersion_changed = false;
+        let mut dock_visibility_changed = false;
         let mut backdrop_changed = false;
         let mut top_height_changed = false;
         let mut status_changed = false;
@@ -435,8 +465,20 @@ impl Bars {
                 }
                 // The next hover animates to the new scale.
                 Key::HoverZoom => Ok(()),
-                Key::DockImmersive | Key::DockRevealDelay => {
-                    immersion_changed = true;
+                Key::DockDisplayMode => {
+                    let binding = if self.settings.dock_display_mode() == DockDisplayMode::Hotkey {
+                        platform::Shortcut::dock(self.top.0).map(Some)
+                    } else {
+                        Ok(None)
+                    };
+                    binding.map(|binding| {
+                        self.dock_shortcut = binding;
+                        self.dock_hotkey_shown = false;
+                        dock_visibility_changed = true;
+                    })
+                }
+                Key::DockRevealDelay => {
+                    dock_visibility_changed = true;
                     Ok(())
                 }
                 Key::HideTaskbar => {
@@ -449,7 +491,7 @@ impl Bars {
                 }
                 Key::Autostart => startup::set(enabled),
                 Key::TaskbarShortcut => {
-                    platform::TaskbarShortcut::register(self.top.0, self.settings.get(spec.key))
+                    platform::Shortcut::taskbar(self.top.0, self.settings.get(spec.key))
                         .map(|registered| self.taskbar_shortcut = registered)
                 }
                 Key::Clock(_) | Key::RecentFiles => Ok(()),
@@ -480,8 +522,12 @@ impl Bars {
         {
             self.refresh_about_appearance()?;
         }
-        if immersion_changed {
-            self.sync_dock_immersion()?;
+        if dock_visibility_changed {
+            self.sync_dock_visibility(true)?;
+            if matches!(self.dock_exposure, super::DockExposure::Waiting(_)) {
+                self.hide_idle_dock()?;
+                self.hover_dock_edge(false)?;
+            }
         }
         if window_style_changed {
             self.refresh_top_window(true);

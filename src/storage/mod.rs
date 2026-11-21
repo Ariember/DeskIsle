@@ -4,7 +4,7 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, HRESULT, Result};
 
 use crate::dock::PinnedApp;
-use crate::settings::Settings;
+use crate::settings::{Key, Settings, spec};
 
 const PINS_FILE: &str = "pins.txt";
 
@@ -109,21 +109,39 @@ const SETTINGS_FILE: &str = "settings.ini";
 /// `id = value`; `#` starts a comment. Invalid lines keep their defaults and are
 /// returned as messages for the caller to show.
 pub fn load_settings() -> Result<Option<(Settings, Vec<String>)>> {
-    let Some(lines) = read_setting(SETTINGS_FILE)? else {
-        return Ok(None);
-    };
+    Ok(read_setting(SETTINGS_FILE)?.map(|lines| parse_settings(&lines)))
+}
+
+fn parse_settings(lines: &[String]) -> (Settings, Vec<String>) {
     let mut settings = Settings::default();
     let mut problems = Vec::new();
+    let mut legacy_immersive = None;
+    let mut has_display_mode = false;
+    let mode_id = spec(Key::DockDisplayMode).id;
     for line in lines.iter().filter(|line| !line.starts_with('#')) {
         let result = match line.split_once('=') {
-            Some((id, value)) => settings.set_text(id.trim(), value.trim()),
+            Some((id, value)) if id.trim() == "dock.immersive" => {
+                legacy_immersive = Some(value.trim());
+                continue;
+            }
+            Some((id, value)) => {
+                has_display_mode |= id.trim() == mode_id;
+                settings.set_text(id.trim(), value.trim())
+            }
             None => Err(format!("无法识别的设置行“{line}”，已忽略")),
         };
         if let Err(problem) = result {
             problems.push(problem);
         }
     }
-    Ok(Some((settings, problems)))
+    if !has_display_mode && let Some(value) = legacy_immersive {
+        match value {
+            "true" => settings.set_text(mode_id, "auto_hide").expect("valid mode"),
+            "false" => {}
+            _ => problems.push(format!("dock.immersive 的值“{value}”无效，已使用默认值")),
+        }
+    }
+    (settings, problems)
 }
 
 pub fn save_settings(settings: &Settings) -> Result<()> {
@@ -184,6 +202,34 @@ fn write_setting<'a>(name: &str, lines: impl IntoIterator<Item = &'a str>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_immersive_setting_yields_to_explicit_display_mode() {
+        use crate::visibility::DockDisplayMode::*;
+        for (lines, expected) in [
+            (vec![], Default),
+            (vec!["dock.immersive=false"], Default),
+            (vec!["dock.immersive=true"], AutoHide),
+            (
+                vec!["dock.immersive=true", "dock.display_mode=desktop"],
+                Desktop,
+            ),
+            (
+                vec!["dock.display_mode=desktop", "dock.immersive=true"],
+                Desktop,
+            ),
+        ] {
+            let (settings, problems) =
+                parse_settings(&lines.into_iter().map(String::from).collect::<Vec<_>>());
+            assert!(problems.is_empty());
+            assert_eq!(settings.dock_display_mode(), expected);
+            assert!(
+                settings
+                    .file_entries()
+                    .all(|(id, _)| id != "dock.immersive")
+            );
+        }
+    }
 
     #[test]
     fn independent_launchpad_round_trips_shortcuts_and_an_empty_list() {

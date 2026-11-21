@@ -13,6 +13,7 @@ mod settings;
 mod storage;
 mod system;
 mod ui;
+mod visibility;
 
 fn main() -> std::process::ExitCode {
     match app::run() {

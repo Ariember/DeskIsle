@@ -27,6 +27,7 @@ use crate::ui::layout::{
     DockDrop, DockHit, DockStyle, Layout, StatusHit, StatusLayout, SystemItem,
 };
 use crate::ui::system::SystemStatus;
+use crate::visibility::{DockDisplayMode, DockPolicy};
 use immersion::DockExposure;
 use monitor::MetricsWorker;
 use windows::Win32::Foundation::POINT;
@@ -50,7 +51,8 @@ struct Bars {
     metrics_worker: MetricsWorker,
     indicators: Vec<Indicator>,
     /// Unregister the global shortcut before destroying its owner window.
-    taskbar_shortcut: Option<platform::TaskbarShortcut>,
+    taskbar_shortcut: Option<platform::Shortcut>,
+    dock_shortcut: Option<platform::Shortcut>,
     top: Bar,
     bottom: Bar,
     pins: Vec<PinnedApp>,
@@ -65,7 +67,7 @@ struct Bars {
     /// Last acrylic request (dark or light), and whether DWM supplied the material.
     top_glass_theme: Option<bool>,
     top_glass: bool,
-    /// Both bars step aside while a full-screen application covers their monitor.
+    /// A full-screen application covers the primary monitor.
     fullscreen: bool,
     /// What the shell last reported. It also reports the desktop as a full-screen
     /// window, so the bars only step aside while an application is in front as well.
@@ -81,6 +83,8 @@ struct Bars {
     hover: Option<DockHit>,
     dock_press: Option<drag::DockPress>,
     dock_file_target: Option<DockDrop>,
+    dock_policy: DockPolicy,
+    dock_hotkey_shown: bool,
     dock_exposure: DockExposure,
     preview: Option<PreviewWindow>,
     /// The status bar target under the pointer, highlighted on the bar.
@@ -150,13 +154,23 @@ pub(crate) fn run() -> Result<()> {
         platform::report_error(None, &error);
         Vec::new()
     });
-    let taskbar_shortcut =
-        platform::TaskbarShortcut::register(top.0, settings.get(Key::TaskbarShortcut))
+    let taskbar_shortcut = platform::Shortcut::taskbar(top.0, settings.get(Key::TaskbarShortcut))
+        .unwrap_or_else(|error| {
+            platform::report_error(Some(top.0), &error);
+            settings.set(Key::TaskbarShortcut, 0);
+            None
+        });
+    let dock_shortcut = if settings.dock_display_mode() == DockDisplayMode::Hotkey {
+        platform::Shortcut::dock(top.0)
+            .map(Some)
             .unwrap_or_else(|error| {
                 platform::report_error(Some(top.0), &error);
-                settings.set(Key::TaskbarShortcut, 0);
+                settings.set(Key::DockDisplayMode, DockDisplayMode::Default as i32);
                 None
-            });
+            })
+    } else {
+        None
+    };
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
     let mut native_taskbar = NativeTaskbar::default();
@@ -198,6 +212,7 @@ pub(crate) fn run() -> Result<()> {
         metrics_worker: MetricsWorker::new(top.0)?,
         indicators: Vec::new(),
         taskbar_shortcut,
+        dock_shortcut,
         worker,
         events,
         renderer,
@@ -237,11 +252,9 @@ pub(crate) fn run() -> Result<()> {
         hover: None,
         dock_press: None,
         dock_file_target: None,
-        dock_exposure: if settings.enabled(Key::DockImmersive) {
-            DockExposure::Edge
-        } else {
-            DockExposure::Shown
-        },
+        dock_policy: DockPolicy::Hidden,
+        dock_hotkey_shown: false,
+        dock_exposure: DockExposure::Shown,
         preview: None,
         top_hover: None,
         wheel: 0,
@@ -281,9 +294,6 @@ pub(crate) fn run() -> Result<()> {
                     bars.restatus();
                 }
                 bars.refresh()?;
-                // The shell reports nothing new when focus moves between the desktop
-                // and a full-screen application, so check again on every switch.
-                bars.sync_fullscreen()?;
             }
             Event::TrayRecovery => bars.tray.retry_incomplete_icons(),
             Event::Tray if bars.tray.update(false) => {
@@ -302,7 +312,6 @@ pub(crate) fn run() -> Result<()> {
                 bars.shell_fullscreen = fullscreen;
                 // The notification can arrive before the foreground change it follows.
                 bars.refresh()?;
-                bars.sync_fullscreen()?;
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
@@ -326,6 +335,10 @@ pub(crate) fn run() -> Result<()> {
             Event::TaskbarShortcut(id) if id == bars.settings.get(Key::TaskbarShortcut) => {
                 bars.toggle_taskbar()?;
             }
+            Event::DockShortcut if bars.dock_shortcut.is_some() && !bars.fullscreen => {
+                bars.dock_hotkey_shown = !bars.dock_hotkey_shown;
+                bars.sync_dock_visibility(false)?;
+            }
             Event::DockReveal if matches!(bars.dock_exposure, DockExposure::Waiting(_)) => {
                 bars.hover_dock_edge(true)?;
             }
@@ -342,7 +355,9 @@ pub(crate) fn run() -> Result<()> {
             Event::SystemUpdate => {
                 bars.system_updated(bars.top.0)?;
             }
-            Event::Move(hwnd, x, y) if hwnd == bars.bottom.0 => {
+            Event::Move(hwnd, x, y)
+                if hwnd == bars.bottom.0 && bars.dock_policy != DockPolicy::Hidden =>
+            {
                 platform::track_leave(hwnd)?;
                 if bars.dock_exposure.collapsed() {
                     bars.hover_dock_edge(false)?;
@@ -351,7 +366,7 @@ pub(crate) fn run() -> Result<()> {
                 }
             }
             Event::CancelPress(hwnd) if hwnd == bars.bottom.0 => bars.cancel_dock_press()?,
-            Event::DockFileHover(point) if !bars.fullscreen => {
+            Event::DockFileHover(point) if bars.dock_policy != DockPolicy::Hidden => {
                 if bars.dock_exposure.collapsed() && point.is_some() {
                     bars.hover_dock_edge(false)?;
                 } else {
@@ -362,9 +377,7 @@ pub(crate) fn run() -> Result<()> {
                     }
                 }
             }
-            Event::DropFiles(hwnd, x, y, files)
-                if hwnd == bars.bottom.0 && !bars.fullscreen && !bars.dock_exposure.collapsed() =>
-            {
+            Event::DropFiles(hwnd, x, y, files) if hwnd == bars.bottom.0 && bars.dock_shown() => {
                 let target = bars.file_target(x, y);
                 bars.set_dock_file_target(None)?;
                 if let Some(target) = target {
@@ -390,7 +403,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
                 bars.scroll_status(delta, x, y)?;
             }
-            Event::Scroll(_, delta, _, _) if delta != 0 && !bars.dock_exposure.collapsed() => {
+            Event::Scroll(_, delta, _, _) if delta != 0 && bars.dock_shown() => {
                 let first = bars
                     .layout
                     .first
@@ -399,9 +412,7 @@ pub(crate) fn run() -> Result<()> {
                     bars.draw()?;
                 }
             }
-            Event::MiddleClick(owner, x, y)
-                if owner != bars.bottom.0 || !bars.dock_exposure.collapsed() =>
-            {
+            Event::MiddleClick(owner, x, y) if owner != bars.bottom.0 || bars.dock_shown() => {
                 bars.middle_click(owner, x, y)?
             }
             Event::Press {
@@ -426,7 +437,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.cancel_dock_press()?;
                 if owner == bars.bottom.0 {
                     bars.set_hover(None)?;
-                    if !right && !bars.fullscreen && !bars.dock_exposure.collapsed() {
+                    if !right && bars.dock_shown() {
                         bars.press_dock(x, y);
                     }
                 }
@@ -472,9 +483,11 @@ pub(crate) fn run() -> Result<()> {
                     return Ok(());
                 }
             }
-            Event::Click(owner, x, y) if owner == bars.bottom.0 => bars.release_dock(x, y)?,
+            Event::Click(owner, x, y) if owner == bars.bottom.0 && bars.dock_shown() => {
+                bars.release_dock(x, y)?
+            }
             Event::RightClick(owner, x, y)
-                if (owner != bars.bottom.0 || !bars.dock_exposure.collapsed())
+                if (owner != bars.bottom.0 || bars.dock_shown())
                     && bars.context_menu(owner, x, y)? =>
             {
                 return Ok(());
@@ -546,27 +559,21 @@ impl Bars {
                 .is_some_and(|id| platform::window_covers_monitor(id, self.monitor.bounds))
     }
 
-    /// Hides both bars while the shell reports a full-screen window and that window is
-    /// an application, and shows them again otherwise.
-    fn sync_fullscreen(&mut self) -> Result<()> {
+    /// The shell does not repeat its full-screen notification on every foreground
+    /// switch, so check the current application as well as the last notification.
+    fn sync_visibility(&mut self, foreground_changed: bool, layout_changed: bool) -> Result<()> {
         let fullscreen = self.shell_fullscreen && self.fullscreen_app();
-        if fullscreen == self.fullscreen {
-            return Ok(());
+        if fullscreen == self.fullscreen && !layout_changed {
+            let raise = foreground_changed && self.settings.dock_display_mode().reassert_topmost();
+            return self.sync_dock_visibility(raise);
         }
         self.fullscreen = fullscreen;
         self.sync_sampling();
         self.publish_tray_rects();
-        if !fullscreen {
-            self.draw()?;
-        }
         self.position()?;
         if fullscreen {
             self.cancel_tray_drag();
-            self.cancel_dock_press()?;
-            self.hide_idle_dock()?;
-            self.set_dock_file_target(None)?;
             self.tray.cancel_click();
-            self.set_hover(None)?;
             self.set_top_hover(None)?;
         }
         Ok(())
@@ -580,14 +587,14 @@ impl Bars {
         Ok(())
     }
 
-    fn position(&self) -> Result<()> {
+    fn position(&mut self) -> Result<()> {
         self.tray.position(
             self.settings
                 .enabled(Key::HideTaskbar)
                 .then_some(self.top_rect),
         )?;
         self.top.position(self.top_rect, !self.fullscreen)?;
-        self.position_dock()
+        self.sync_dock_visibility(true)
     }
 
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
@@ -616,7 +623,7 @@ impl Bars {
         if !self.relayout(self.layout.first)? {
             self.update_preview();
         }
-        self.position()?;
+        self.sync_visibility(false, true)?;
         self.time = platform::clock(self.top.0)?;
         // Windows announces a change of its app mode as a setting change.
         self.update_theme_from_desktop()?;
@@ -637,7 +644,7 @@ impl Bars {
             return Ok(false);
         }
         let moved = layout.bottom != self.layout.bottom
-            || (self.settings.enabled(Key::DockImmersive)
+            || (self.dock_policy == DockPolicy::EdgeReveal
                 && layout.immersive_window(true) != self.layout.immersive_window(true));
         self.layout = layout;
         if moved {
@@ -645,7 +652,7 @@ impl Bars {
             if self.dock_press.take().is_some() {
                 self.bottom.release();
             }
-            self.position_dock()?;
+            self.sync_dock_visibility(true)?;
         }
         if self.hover.is_some() {
             self.hover = platform::cursor().ok().and_then(|point| {
@@ -796,6 +803,7 @@ impl Bars {
 
     fn refresh(&mut self) -> Result<()> {
         let (apps, foreground) = applications(&self.pins)?;
+        let foreground_changed = self.foreground != foreground;
         self.foreground = foreground;
         if self.apps != apps {
             let sources_changed = if let Some(DockHit::App(i)) = self.hover {
@@ -817,11 +825,12 @@ impl Bars {
             }
         }
         self.refresh_top_window(false);
+        self.sync_visibility(foreground_changed, false)?;
         self.draw()
     }
 
     fn set_hover(&mut self, hit: Option<DockHit>) -> Result<()> {
-        let hit = hit.filter(|_| !self.fullscreen);
+        let hit = hit.filter(|_| self.dock_shown());
         if self.hover != hit {
             self.hover = hit;
             self.update_preview();

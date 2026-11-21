@@ -3,6 +3,7 @@
 //! adding a [`Key`] variant and its row, then reacting to the change in the app layer.
 
 use crate::metrics::{Metric, Sources, Style};
+use crate::visibility::DockDisplayMode;
 
 /// Identifies one setting. Callers read values through the typed accessors on
 /// [`Settings`]; the panel and the settings file go through [`SCHEMA`].
@@ -22,7 +23,7 @@ pub enum Key {
     BoldFont,
     SmoothText,
     IconSpacing,
-    DockImmersive,
+    DockDisplayMode,
     DockRevealDelay,
     IconSize,
     DockGap,
@@ -151,6 +152,41 @@ pub const HOVER_ZOOM: &[Choice] = &[
     Choice {
         id: "standard",
         label: "标准",
+    },
+];
+
+pub const DOCK_DISPLAY_MODES: &[Choice] = &[
+    Choice {
+        id: "default",
+        label: "默认显示模式",
+    },
+    Choice {
+        id: "overlay",
+        label: "叠层显示模式",
+    },
+    Choice {
+        id: "auto_hide",
+        label: "自动隐藏模式",
+    },
+    Choice {
+        id: "smart_hide",
+        label: "智能隐藏模式",
+    },
+    Choice {
+        id: "always",
+        label: "始终显示模式",
+    },
+    Choice {
+        id: "hotkey",
+        label: "热键显示模式",
+    },
+    Choice {
+        id: "always_including_fullscreen",
+        label: "始终显示包括全屏",
+    },
+    Choice {
+        id: "desktop",
+        label: "桌面显示模式",
     },
 ];
 
@@ -585,12 +621,12 @@ pub const SCHEMA: &[Spec] = &[
         store: Store::File,
     },
     Spec {
-        key: Key::DockImmersive,
-        id: "dock.immersive",
+        key: Key::DockDisplayMode,
+        id: "dock.display_mode",
         section: Section::Dock,
-        label: "Dock 空闲时使用沉浸模式",
-        help: "移开指针后收起，移到工作区底边唤出",
-        control: Control::Toggle,
+        label: "Dock 显示隐藏模式",
+        help: "全屏应用在前台时隐藏",
+        control: Control::Choice(DOCK_DISPLAY_MODES),
         default: 0,
         store: Store::File,
     },
@@ -598,7 +634,7 @@ pub const SCHEMA: &[Spec] = &[
         key: Key::DockRevealDelay,
         id: "dock.reveal_delay",
         section: Section::Dock,
-        label: "沉浸模式延迟显示时间",
+        label: "底边唤出延迟",
         help: "指针停留在底部唤出区域后的等待时间",
         control: Control::Slider {
             min: 0,
@@ -995,6 +1031,20 @@ impl Settings {
         self.get(Key::DockGap)
     }
 
+    pub fn dock_display_mode(&self) -> DockDisplayMode {
+        use DockDisplayMode::*;
+        [
+            Default,
+            Overlay,
+            AutoHide,
+            SmartHide,
+            Always,
+            Hotkey,
+            AlwaysIncludingFullscreen,
+            Desktop,
+        ][self.get(Key::DockDisplayMode) as usize]
+    }
+
     pub fn theme(&self) -> Theme {
         [Theme::System, Theme::Light, Theme::Dark, Theme::Automatic][self.get(Key::Theme) as usize]
     }
@@ -1093,7 +1143,7 @@ mod tests {
         assert_eq!(settings.ui_dpi(144), 180);
         assert!(settings.adjust(Key::DockRevealDelay, Adjust::Set(300)));
         assert!(settings.adjust(Key::IconSpacing, Adjust::Set(6)));
-        assert!(settings.adjust(Key::DockImmersive, Adjust::Toggle));
+        assert!(settings.adjust(Key::DockDisplayMode, Adjust::Pick(2)));
         let mut restored = Settings::default();
         for (key, value) in settings.file_entries() {
             restored.set_text(key, &value).unwrap();
@@ -1101,6 +1151,7 @@ mod tests {
         assert_eq!(restored, settings);
         assert_eq!(restored.theme(), Theme::Dark);
         assert_eq!(restored.dock_gap(), 14);
+        assert_eq!(restored.dock_display_mode(), DockDisplayMode::AutoHide);
     }
 
     #[test]

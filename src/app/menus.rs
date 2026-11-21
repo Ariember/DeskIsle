@@ -494,6 +494,10 @@ impl Bars {
                         && (flyout == updated || flyout == Some(SystemItem::Control));
                 }
                 Event::MenuDismiss => break None,
+                Event::DockShortcut if self.dock_shortcut.is_some() => {
+                    held.push(Event::DockShortcut);
+                    break None;
+                }
                 press @ Event::Press { right, .. } => {
                     // Deliver the press as well as the release to the next tray target.
                     if right {

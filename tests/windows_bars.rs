@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetCursorPos,
     SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP, WM_CANCELMODE,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP, WindowFromPoint,
 };
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
@@ -445,19 +445,20 @@ fn hovering_the_probe_shows_its_preview(pid: u32, dock: HWND, probe: HWND) {
     });
 }
 
+fn open_launchpad(pid: u32, dock: HWND) -> HWND {
+    let dpi = unsafe { GetDpiForWindow(dock) } as i32;
+    let center = (32 * dpi + 48) / 96;
+    let point = LPARAM(((center << 16) | center) as isize);
+    send_to_child(pid, dock, WM_LBUTTONDOWN, WPARAM(1), point);
+    send_to_child(pid, dock, WM_LBUTTONUP, WPARAM(0), point);
+    wait_until("first Dock icon did not open the launchpad", || {
+        Bars::visible_for(pid).launchpad.is_some()
+    });
+    Bars::visible_for(pid).launchpad.unwrap()
+}
+
 fn launchpad_reopens_saved_shortcut(pid: u32, dock: HWND, profile: &Path) {
-    let open = || {
-        let dpi = unsafe { GetDpiForWindow(dock) } as i32;
-        let center = (32 * dpi + 48) / 96;
-        let point = LPARAM(((center << 16) | center) as isize);
-        send_to_child(pid, dock, WM_LBUTTONDOWN, WPARAM(1), point);
-        send_to_child(pid, dock, WM_LBUTTONUP, WPARAM(0), point);
-        wait_until("first Dock icon did not open the launchpad", || {
-            Bars::visible_for(pid).launchpad.is_some()
-        });
-        Bars::visible_for(pid).launchpad.unwrap()
-    };
-    let first = open();
+    let first = open_launchpad(pid, dock);
     let rect = window_rect(first);
     assert!(rect.bottom > rect.top && rect.right > rect.left);
     assert!(
@@ -501,7 +502,7 @@ fn launchpad_reopens_saved_shortcut(pid: u32, dock: HWND, profile: &Path) {
         format!("{}\n", shortcut.display()),
     )
     .unwrap();
-    let reopened = open();
+    let reopened = open_launchpad(pid, dock);
     send_to_child(
         pid,
         reopened,
@@ -514,6 +515,49 @@ fn launchpad_reopens_saved_shortcut(pid: u32, dock: HWND, profile: &Path) {
     });
     wait_until("launchpad stayed open after launching the shortcut", || {
         Bars::visible_for(pid).launchpad.is_none()
+    });
+}
+
+fn notify_fullscreen(pid: u32, status: HWND, open: bool) {
+    send_to_child(
+        pid,
+        status,
+        WM_APP + 2,
+        WPARAM(ABN_FULLSCREENAPP as usize),
+        LPARAM(isize::from(open)),
+    );
+}
+
+fn fullscreen_dock_stays_clickable(pid: u32, status: HWND, dock: HWND) {
+    let cover = TestWindow::cover();
+    wait_until("full-screen window did not reach the foreground", || {
+        (unsafe { GetForegroundWindow() }) == cover.0
+    });
+    notify_fullscreen(pid, status, true);
+    wait_until(
+        "full-screen Dock is not reachable with the status bar hidden",
+        || {
+            let rect = window_rect(dock);
+            let center = POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            };
+            !unsafe { IsWindowVisible(status) }.as_bool()
+                && unsafe { WindowFromPoint(center) } == dock
+        },
+    );
+    let launchpad = open_launchpad(pid, dock);
+    send_to_child(
+        pid,
+        launchpad,
+        WM_KEYDOWN,
+        WPARAM(VK_ESCAPE.0.into()),
+        LPARAM(0),
+    );
+    drop(cover);
+    notify_fullscreen(pid, status, false);
+    wait_until("leaving full screen did not restore the status bar", || {
+        unsafe { IsWindowVisible(status) }.as_bool() && Bars::visible_for(pid).launchpad.is_none()
     });
 }
 
@@ -552,11 +596,9 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     let initial = window_rect(probe.0);
 
     let profile = TestProfile::new();
-    fs::write(
-        profile.0.join("DeskIsle/settings.ini"),
-        "topbar.height = 42\ntopbar.close_maximized = true\n",
-    )
-    .unwrap();
+    let settings_file = profile.0.join("DeskIsle/settings.ini");
+    let settings = "topbar.height = 42\ntopbar.close_maximized = true\n";
+    fs::write(&settings_file, settings).unwrap();
     // Pin the probe using the same Win32 image path that the Dock sees on enumeration.
     let mut executable = vec![0; 32768];
     let mut len = executable.len() as u32;
@@ -655,23 +697,13 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     corner_closes_only_the_maximized_probe(pid, status);
     hovering_the_probe_shows_its_preview(pid, dock, probe.0);
     launchpad_reopens_saved_shortcut(pid, dock, &profile.0);
-    // Send Explorer's AppBar notification to the window that registered for it.
-    let fullscreen = |open| {
-        send_to_child(
-            pid,
-            status,
-            WM_APP + 2,
-            WPARAM(ABN_FULLSCREENAPP as usize),
-            LPARAM(isize::from(open)),
-        );
-    };
     // The shell reports the desktop as full screen too, so the bars only step aside
     // while an application covering the monitor is in front.
     let cover = TestWindow::cover();
     wait_until("full-screen window did not reach the foreground", || {
         (unsafe { GetForegroundWindow() }) == cover.0
     });
-    fullscreen(true);
+    notify_fullscreen(pid, status, true);
     wait_until("full-screen notification did not hide both bars", || {
         !unsafe { IsWindowVisible(status) }.as_bool() && !unsafe { IsWindowVisible(dock) }.as_bool()
     });
@@ -696,7 +728,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     });
     assert!(!unsafe { IsWindowVisible(status) }.as_bool());
     assert!(!unsafe { IsWindowVisible(dock) }.as_bool());
-    fullscreen(false);
+    notify_fullscreen(pid, status, false);
     wait_until("leaving full screen did not restore both bars", || {
         unsafe { IsWindowVisible(status) }.as_bool() && unsafe { IsWindowVisible(dock) }.as_bool()
     });
@@ -747,12 +779,19 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         "work area and maximized window not restored after exit",
         restored,
     );
-    // A second launch must leave the active owner's windows and taskbar intact.
+    // Reuse the isolated profile and the same desktop test for the fullscreen mode.
+    fs::write(
+        &settings_file,
+        format!("{settings}dock.display_mode = always_including_fullscreen\n"),
+    )
+    .unwrap();
     let mut owner = TestInstance::start(&profile.0);
     let (status, dock) = owner.wait_for_bars();
     wait_until("restarted Dock did not hide the native taskbar", || {
         !unsafe { IsWindowVisible(taskbar.hwnd) }.as_bool()
     });
+    fullscreen_dock_stays_clickable(owner.0.id(), status, dock);
+    // A second launch must leave the active owner's windows and taskbar intact.
     let mut duplicate = TestInstance::start(&profile.0);
     wait_until("second launch did not exit", || {
         duplicate.0.try_wait().unwrap().is_some()

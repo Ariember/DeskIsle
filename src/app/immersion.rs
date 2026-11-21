@@ -1,6 +1,7 @@
 use super::Bars;
 use crate::platform;
 use crate::settings::Key;
+use crate::visibility::{DockContext, DockDisplayMode, DockPolicy};
 use std::time::{Duration, Instant};
 use windows::core::Result;
 
@@ -27,16 +28,24 @@ impl DockExposure {
 }
 
 impl Bars {
+    pub(super) fn dock_shown(&self) -> bool {
+        self.dock_policy != DockPolicy::Hidden && !self.dock_exposure.collapsed()
+    }
+
     pub(super) fn position_dock(&self) -> Result<()> {
-        let rect = if self.settings.enabled(Key::DockImmersive) {
+        let rect = if self.dock_policy == DockPolicy::EdgeReveal {
             self.layout.immersive_window(self.dock_exposure.collapsed())
         } else {
             self.layout.bottom
         };
-        self.bottom.position(rect, !self.fullscreen)
+        self.bottom.position_layer(
+            rect,
+            self.dock_policy != DockPolicy::Hidden,
+            self.settings.dock_display_mode().topmost(),
+        )
     }
 
-    fn set_dock_exposure(&mut self, next: DockExposure) -> Result<()> {
+    fn set_dock_exposure(&mut self, next: DockExposure, reposition: bool) -> Result<()> {
         let previous = self.dock_exposure;
         if let DockExposure::Waiting(_) = previous {
             self.bottom.cancel_dock_reveal();
@@ -49,33 +58,55 @@ impl Bars {
                 .time_dock_reveal(remaining.as_millis().max(1) as u32)?;
         }
         self.dock_exposure = next;
-        if previous.collapsed() != next.collapsed() {
+        if reposition || previous.collapsed() != next.collapsed() {
             self.position_dock()?;
-            if next.collapsed() {
+            if !self.dock_shown() {
+                self.cancel_dock_press()?;
                 self.set_hover(None)?;
                 self.set_dock_file_target(None)?;
-            } else {
+            } else if self.dock_policy == DockPolicy::EdgeReveal {
                 platform::track_leave(self.bottom.0)?;
             }
         }
         Ok(())
     }
 
-    pub(super) fn sync_dock_immersion(&mut self) -> Result<()> {
-        let next = if self.settings.enabled(Key::DockImmersive) {
+    pub(super) fn sync_dock_visibility(&mut self, reposition: bool) -> Result<()> {
+        let mode = self.settings.dock_display_mode();
+        let smart = mode == DockDisplayMode::SmartHide;
+        let overlaps = self
+            .events
+            .watch_dock_overlap(smart.then_some(self.layout.bottom));
+        let policy = mode.policy(DockContext {
+            fullscreen: self.fullscreen,
+            desktop: mode == DockDisplayMode::Desktop && platform::foreground_is_desktop(),
+            overlaps,
+            hotkey_shown: self.dock_hotkey_shown,
+        });
+        if self.dock_policy == policy {
+            if reposition {
+                self.position_dock()?;
+            }
+            return Ok(());
+        }
+        // Keep an active drag or a pointer already over the Dock when a smart-hide
+        // window moves across it. Leaving the Dock then collapses it as usual.
+        let keep_open = policy == DockPolicy::EdgeReveal
+            && self.dock_shown()
+            && (self.dock_press.is_some()
+                || self.dock_file_target.is_some()
+                || platform::cursor().is_ok_and(|p| self.layout.bottom.contains(p.x, p.y)));
+        self.dock_policy = policy;
+        let exposure = if policy == DockPolicy::EdgeReveal && !keep_open {
             DockExposure::Edge
         } else {
             DockExposure::Shown
         };
-        // Toggling off also removes the transparent gap under an already revealed Dock.
-        if self.dock_exposure == DockExposure::Shown && next == DockExposure::Shown {
-            return self.position_dock();
-        }
-        self.set_dock_exposure(next)
+        self.set_dock_exposure(exposure, true)
     }
 
     pub(super) fn hover_dock_edge(&mut self, timer: bool) -> Result<()> {
-        if self.fullscreen || !self.dock_exposure.collapsed() {
+        if self.dock_policy != DockPolicy::EdgeReveal || !self.dock_exposure.collapsed() {
             return Ok(());
         }
         let point = platform::cursor()?;
@@ -84,25 +115,25 @@ impl Bars {
             .immersive_window(true)
             .contains(point.x, point.y)
         {
-            return self.set_dock_exposure(DockExposure::Edge);
+            return self.set_dock_exposure(DockExposure::Edge, false);
         }
         let delay = Duration::from_millis(self.settings.get(Key::DockRevealDelay) as u64);
         let next = self.dock_exposure.enter_edge(Instant::now(), delay);
         if next != self.dock_exposure || timer {
-            self.set_dock_exposure(next)?;
+            self.set_dock_exposure(next, false)?;
         }
         Ok(())
     }
 
     pub(super) fn hide_idle_dock(&mut self) -> Result<()> {
-        if self.settings.enabled(Key::DockImmersive) && self.dock_press.is_none() {
-            self.set_dock_exposure(DockExposure::Edge)?;
+        if self.dock_policy == DockPolicy::EdgeReveal && self.dock_press.is_none() {
+            self.set_dock_exposure(DockExposure::Edge, false)?;
         }
         Ok(())
     }
 
     pub(super) fn finish_dock_gesture(&mut self) -> Result<()> {
-        if self.settings.enabled(Key::DockImmersive) {
+        if self.dock_policy == DockPolicy::EdgeReveal {
             let point = platform::cursor()?;
             if !self
                 .layout

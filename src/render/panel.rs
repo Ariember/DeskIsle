@@ -6,7 +6,9 @@ use windows::Win32::{
 };
 use windows::core::{Error, Result, w};
 
-use crate::settings::{Adjust, Key, MonitorKey, SECTIONS, Section, TopBarBackground};
+use crate::settings::{
+    Adjust, DOCK_DISPLAY_MODES, Key, MonitorKey, SECTIONS, Section, TopBarBackground,
+};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
@@ -521,7 +523,44 @@ impl Renderer {
             c.p.ink,
             1.,
             DWRITE_TEXT_ALIGNMENT_CENTER,
-        )
+        )?;
+        if let Some(modes) = &layout.modes {
+            self.button_face(c, &t, modes.area, 6., false)?;
+            for (index, (area, label)) in modes.rows().enumerate() {
+                let active = index == modes.highlight;
+                if active {
+                    c.round(
+                        area.left + 2.,
+                        area.top + 1.,
+                        area.right - 2.,
+                        area.bottom - 1.,
+                        4.,
+                        t.accent,
+                    )?;
+                }
+                let ink = if active { WHITE } else { c.p.ink };
+                if index == modes.selected {
+                    let check = Area {
+                        right: area.left + 22.,
+                        ..area
+                    };
+                    c.symbol_in(Symbol::Check, check, 12., ink, 1.)?;
+                }
+                self.label(
+                    c,
+                    label,
+                    Area {
+                        left: area.left + 24.,
+                        ..area
+                    },
+                    12.,
+                    false,
+                    ink,
+                    1.,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn paint_row(
@@ -699,6 +738,29 @@ impl Renderer {
     ) -> Result<()> {
         let hover = |adjust: Adjust| layout.hover == Some(Action::Change(key, adjust));
         match part {
+            Part::Dropdown { area, selected } => {
+                self.button_face(c, t, *area, 6., layout.hover == Some(Action::OpenModes))?;
+                let text = Area {
+                    left: area.left + 9.,
+                    right: area.right - 21.,
+                    ..*area
+                };
+                self.label(
+                    c,
+                    DOCK_DISPLAY_MODES[*selected].label,
+                    text,
+                    12.,
+                    false,
+                    c.p.ink,
+                    1.,
+                )?;
+                let arrow = Area {
+                    left: text.right,
+                    right: area.right - 4.,
+                    ..*area
+                };
+                c.symbol_in(Symbol::ChevronDown, arrow, 11., c.p.muted, 1.)?;
+            }
             Part::Switch { area, on } => {
                 // A macOS switch: a capsule track and a white knob with a soft shadow.
                 let s = *area;
@@ -990,6 +1052,11 @@ mod render_tests {
                     }
                     state.scroll = (state.scroll + layout.view.bottom - layout.view.top)
                         .min(layout.max_scroll);
+                }
+                if section == Section::Dock {
+                    state.mode_highlight = Some(settings.get(Key::DockDisplayMode) as usize);
+                    let layout = PanelLayout::new(&mut state, &settings, 120, work);
+                    renderer.draw_panel(panel.0, &layout, 120, dark)?;
                 }
             }
         }

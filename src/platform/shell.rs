@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, HSTRING, Interface, Owned, PCWSTR, PWSTR, Result, w};
 
 use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
+use crate::geometry::Rect;
 
 mod recent;
 pub use recent::recent_documents;
@@ -128,6 +129,7 @@ thread_local! {
     static EVENT_TARGET: Cell<Option<HWND>> = const { Cell::new(None) };
     static CHANGE_POSTED: Cell<bool> = const { Cell::new(false) };
     static MAXIMIZED_FOREGROUND: Cell<Option<HWND>> = const { Cell::new(None) };
+    static DOCK_OVERLAP: Cell<Option<(Rect, bool)>> = const { Cell::new(None) };
 }
 
 pub struct WindowEvents {
@@ -139,11 +141,7 @@ impl WindowEvents {
         let mut hooks = Vec::new();
         for (first, last, flags) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0),
-            (
-                EVENT_OBJECT_LOCATIONCHANGE,
-                EVENT_OBJECT_LOCATIONCHANGE,
-                WINEVENT_SKIPOWNPROCESS,
-            ),
+            (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, 0),
             (
                 EVENT_OBJECT_DESTROY,
                 EVENT_OBJECT_HIDE,
@@ -186,12 +184,21 @@ impl WindowEvents {
     pub fn acknowledge(&self) {
         CHANGE_POSTED.set(false);
     }
+
+    /// Compare against the expanded Dock even while its window is at the reveal edge.
+    pub fn watch_dock_overlap(&self, rect: Option<Rect>) -> bool {
+        let watched =
+            rect.map(|bounds| (bounds, super::window_overlaps(super::foreground(), bounds)));
+        DOCK_OVERLAP.set(watched);
+        watched.is_some_and(|(_, overlaps)| overlaps)
+    }
 }
 
 impl Drop for WindowEvents {
     fn drop(&mut self) {
         EVENT_TARGET.set(None);
         CHANGE_POSTED.set(false);
+        DOCK_OVERLAP.set(None);
     }
 }
 
@@ -214,9 +221,14 @@ unsafe extern "system" fn window_event(
             return;
         }
         let maximized = super::maximized_on_primary(hwnd).then_some(hwnd);
-        // Movement and resizing generate many notifications. Only a transition into
-        // or out of maximization on this monitor needs a new window snapshot.
+        let overlap_changed = DOCK_OVERLAP.get().is_some_and(|(dock, previous)| {
+            let overlaps = super::window_overlaps(hwnd, dock);
+            DOCK_OVERLAP.set(Some((dock, overlaps)));
+            overlaps != previous
+        });
+        // During a move/resize the UI only needs a snapshot when a rule changes.
         if MAXIMIZED_FOREGROUND.replace(maximized) == maximized
+            && !overlap_changed
             && event == EVENT_OBJECT_LOCATIONCHANGE
         {
             return;
