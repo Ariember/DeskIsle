@@ -144,6 +144,13 @@ impl Bars {
         Ok(())
     }
 
+    /// Whether the app being dragged would go into the launchpad if released now.
+    pub(super) fn dropping_on_launchpad(&self) -> bool {
+        self.dock_press
+            .as_ref()
+            .is_some_and(|press| press.target == Some(DockDrop::Launchpad))
+    }
+
     /// Preview the order without changing the window groups used for hit testing.
     pub(super) fn dock_preview(&self) -> (Option<Vec<usize>>, Option<DockHit>) {
         let Some(press) = &self.dock_press else {

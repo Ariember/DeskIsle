@@ -22,10 +22,12 @@ use windows::Win32::{
 use windows::core::{HSTRING, Result};
 
 use super::canvas::{Canvas, Palette, Text, paint};
-use super::{Bar, Renderer};
+use super::{Bar, DURATION, Renderer, Tween};
 use crate::ui::{icon::Symbol, launchpad::LaunchpadLayout, panel::Area};
 
 const WHITE: (u8, u8, u8) = (255, 255, 255);
+/// How far the launchpad darkens while an app from the Dock is held over it.
+const DEEPEN: f32 = 0.26;
 
 pub(super) struct LaunchpadView {
     hwnd: HWND,
@@ -33,6 +35,13 @@ pub(super) struct LaunchpadView {
     highlight: IDCompositionVisual2,
     fade: IDCompositionEffectGroup,
     hovered: Option<usize>,
+    /// A darker layer with a frame around the grid, shown while an app is held over the
+    /// launchpad, above everything else in the window.
+    veil: IDCompositionVisual2,
+    veil_fade: IDCompositionEffectGroup,
+    deep: Tween,
+    /// Window size, DPI and content height the veil was painted for.
+    veil_key: Option<(i32, i32, u32, u32)>,
     icons: HashMap<PathBuf, Option<IWICBitmapSource>>,
     icon_pixels: i32,
 }
@@ -52,12 +61,22 @@ impl Renderer {
                 let fade = self.device.CreateEffectGroup()?;
                 highlight.SetEffect(&fade)?;
                 bar.root.AddVisual(&highlight, true, None)?;
+                let veil = self.device.CreateVisual()?;
+                let veil_fade = self.device.CreateEffectGroup()?;
+                veil_fade.SetOpacity2(0.)?;
+                veil.SetEffect(&veil_fade)?;
+                // In front of all siblings, the hover highlight included.
+                bar.root.AddVisual(&veil, false, None)?;
                 self.launchpad = Some(LaunchpadView {
                     hwnd,
                     bar,
                     highlight,
                     fade,
                     hovered: None,
+                    veil,
+                    veil_fade,
+                    deep: Tween::new(0.),
+                    veil_key: None,
                     icons: HashMap::new(),
                     icon_pixels: 0,
                 });
@@ -97,6 +116,31 @@ impl Renderer {
             }
         }
         let view = self.launchpad.as_mut().unwrap();
+        let key = (
+            layout.width,
+            layout.height,
+            layout.dpi,
+            layout.content.to_bits(),
+        );
+        if view.veil_key != Some(key) {
+            let (w, h) = (layout.width as f32 / scale, layout.height as f32 / scale);
+            let bottom = layout.content;
+            let veil = paint(
+                &self.device,
+                p,
+                layout.width,
+                layout.height,
+                layout.dpi,
+                |c| {
+                    c.fill(0., 0., w, h, 0., (0, 0, 0), DEEPEN)?;
+                    // A soft frame around the part above the Dock, where the app lands.
+                    c.stroke(9., 9., w - 9., bottom - 9., 18., WHITE, 0.12)?;
+                    c.stroke(10., 10., w - 10., bottom - 10., 17., WHITE, 0.34)
+                },
+            )?;
+            unsafe { view.veil.SetContent(&veil)? };
+            view.veil_key = Some(key);
+        }
         let surface = paint(
             &self.device,
             p,
@@ -247,6 +291,21 @@ impl Renderer {
             self.device.Commit()?;
         }
         view.hovered = hit.map(|tile| tile.index);
+        Ok(())
+    }
+
+    /// Darkens the launchpad while `on`, as the target for an app held over it.
+    pub fn deepen_launchpad(&mut self, on: bool) -> Result<()> {
+        let Some(view) = &mut self.launchpad else {
+            return Ok(());
+        };
+        let goal = if on { 1. } else { 0. };
+        if let Some(curve) = view.deep.retarget(&self.device, goal, DURATION)? {
+            unsafe {
+                view.veil_fade.SetOpacity(&curve)?;
+                self.device.Commit()?;
+            }
+        }
         Ok(())
     }
 

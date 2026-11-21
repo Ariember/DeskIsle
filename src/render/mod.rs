@@ -76,7 +76,6 @@ pub struct Renderer {
     imaging: IWICImagingFactory,
     icons: Vec<IconLayer>,
     bottom_size: Option<Dimensions>,
-    indicators: Vec<(i32, bool, bool)>,
     top_state: Option<TopState>,
     metric_layer: Option<metrics::MetricLayer>,
     menu: Option<MenuView>,
@@ -133,16 +132,30 @@ struct IconLayer {
     label: String,
     size: i32,
     center: (i32, i32),
+    /// Holds the icon and its running indicator, and slides between slots.
     visual: IDCompositionVisual2,
+    /// Lifts the icon, not its indicator, around the icon's lower middle.
     scale: IDCompositionScaleTransform,
-    hovered: bool,
-    /// The hovered scale the last animation used.
-    lift: f32,
-    start_time: Instant,
-    start_scale: f32,
+    lift: Tween,
+    x: Tween,
+    /// Darkens the launchpad while an app is held over it.
+    shade: Option<(IDCompositionEffectGroup, Tween)>,
+    /// The running indicator below the icon.
+    dot: Option<IDCompositionVisual2>,
+    /// Active state, slot top, bar height and DPI the indicator was placed for.
+    dot_key: Option<(bool, i32, i32, u32)>,
 }
 
 const DURATION: f32 = 0.14;
+/// How long an icon takes to slide into the slot a drag makes for it, in seconds.
+const SLIDE: f32 = 0.22;
+/// The launchpad's extra lift and darkening while an app is held over it.
+const DROP_LIFT: f32 = 1.06;
+const DROP_SHADE: f32 = 0.32;
+/// The running indicator's layer in DIPs: its size, and how far its top sits above the
+/// Dock's bottom edge.
+const DOT_BOX: (f32, f32) = (20., 8.);
+const DOT_TOP: f32 = 10.5;
 /// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
 const PILL_RADIUS: f32 = 7.;
 /// Size of the system icons on the status bar, in DIPs. The battery is drawn larger with
@@ -218,31 +231,103 @@ fn keyframes(
     }
 }
 
+/// A property the compositor eases toward `goal` with an ease-out cubic. A new goal
+/// starts from wherever the running curve has reached, so an interruption does not jump.
+struct Tween {
+    from: f32,
+    goal: f32,
+    start: Instant,
+    duration: f32,
+}
+
+impl Tween {
+    fn new(value: f32) -> Self {
+        Self {
+            from: value,
+            goal: value,
+            start: Instant::now(),
+            duration: 0.,
+        }
+    }
+
+    fn value(&self) -> f32 {
+        if self.duration <= 0. {
+            return self.goal;
+        }
+        let remaining = (1. - self.start.elapsed().as_secs_f32() / self.duration).clamp(0., 1.);
+        self.goal + (self.from - self.goal) * remaining.powi(3)
+    }
+
+    /// The curve toward `goal`, or None while that already is the goal.
+    fn retarget(
+        &mut self,
+        device: &IDCompositionDesktopDevice,
+        goal: f32,
+        duration: f32,
+    ) -> Result<Option<IDCompositionAnimation>> {
+        if (goal - self.goal).abs() < 1e-3 {
+            return Ok(None);
+        }
+        let from = self.value();
+        let curve = ease(device, from, goal, duration)?;
+        *self = Self {
+            from,
+            goal,
+            start: Instant::now(),
+            duration,
+        };
+        Ok(Some(curve))
+    }
+}
+
 impl IconLayer {
     fn matches(&self, icon: &DockIcon<'_>) -> bool {
         self.path.as_deref() == icon.path && self.label == icon.label && self.size == icon.size
     }
 
-    fn animate(
+    /// Shows the running indicator below the icon, inside the layer so it slides along.
+    /// Returns whether it changed.
+    fn place_dot(
         &mut self,
         device: &IDCompositionDesktopDevice,
-        hover: bool,
-        lift: f32,
-    ) -> Result<()> {
-        let old_goal = if self.hovered { self.lift } else { 1.0 };
-        let goal = if hover { lift } else { 1.0 };
-        let remaining = (1.0 - self.start_time.elapsed().as_secs_f32() / DURATION).clamp(0., 1.);
-        let from = old_goal + (self.start_scale - old_goal) * remaining.powi(3);
-        unsafe {
-            let curve = ease(device, from, goal, DURATION)?;
-            self.scale.SetScaleX(&curve)?;
-            self.scale.SetScaleY(&curve)?;
+        palette: Palette,
+        item: &DockIcon<'_>,
+        height: i32,
+        dpi: u32,
+    ) -> Result<bool> {
+        let top = item.center_y - item.size / 2;
+        let key = item.running.then_some((item.active, top, height, dpi));
+        if key == self.dot_key {
+            return Ok(false);
         }
-        self.start_time = Instant::now();
-        self.start_scale = from;
-        self.hovered = hover;
-        self.lift = lift;
-        Ok(())
+        unsafe {
+            if let Some(old) = self.dot.take() {
+                self.visual.RemoveVisual(&old)?;
+            }
+            if key.is_some() {
+                let s = dpi as f32 / 96.;
+                let (w, h) = DOT_BOX;
+                let width = (w * s).ceil() as i32;
+                let surface = paint(device, palette, width, (h * s).ceil() as i32, dpi, |c| {
+                    let mid = w / 2.;
+                    let half = if item.active { 5. } else { 2. };
+                    if item.active {
+                        c.fill(mid - 9., 1., mid + 9., 7., 3., c.p.accent, 0.18)?;
+                    }
+                    let ink = if item.active { c.p.accent } else { c.p.muted };
+                    c.round(mid - half, 2.5, mid + half, 5.5, 1.5, ink)
+                })?;
+                let dot = device.CreateVisual()?;
+                dot.SetContent(&surface)?;
+                dot.SetOffsetX2(((self.size - width) / 2) as f32)?;
+                dot.SetOffsetY2((height as f32 - DOT_TOP * s).round() - top as f32)?;
+                // Behind the icon, which may grow over it while lifted.
+                self.visual.AddVisual(&dot, true, None)?;
+                self.dot = Some(dot);
+            }
+        }
+        self.dot_key = key;
+        Ok(true)
     }
 }
 
@@ -280,7 +365,6 @@ impl Renderer {
                 imaging: CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?,
                 icons: Vec::new(),
                 bottom_size: None,
-                indicators: Vec::new(),
                 top_state: None,
                 metric_layer: None,
                 menu: None,
@@ -530,6 +614,10 @@ impl Renderer {
         }
     }
 
+    /// `hover` lifts the icon under the pointer. `deep` is the launchpad's slot while an
+    /// app is held over it, which lifts a little further and darkens. While the Dock keeps
+    /// its size, icons whose slot changed slide over, so a drag pushes its neighbors aside.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_dock(
         &mut self,
         width: i32,
@@ -537,6 +625,7 @@ impl Renderer {
         dpi: u32,
         items: &[DockIcon<'_>],
         hover: Option<usize>,
+        deep: Option<usize>,
         lift: f32,
     ) -> Result<()> {
         let size = (width, height, dpi);
@@ -544,67 +633,71 @@ impl Renderer {
             || self.icons.iter().zip(items).any(|(layer, icon)| {
                 !layer.matches(icon) || layer.center != (icon.center_x, icon.center_y)
             });
-        let statuses = items.iter().map(|i| (i.center_x, i.running, i.active));
-        let panel_changed =
-            self.bottom_size != Some(size) || statuses.clone().ne(self.indicators.iter().copied());
+        // A resized Dock re-centers on the screen, so the old offsets do not line up with
+        // the new slots. Icons then take their places at once.
+        let slide = self.bottom_size == Some(size);
+        let panel_changed = !slide;
         if panel_changed {
             let s = dpi as f32 / 96.;
             let w = width as f32 / s;
             let h = height as f32 / s;
             let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
                 c.bar_glass(w, h, 18.)?;
-                c.stroke(0., 0., w, h, 18., c.p.line, 0.16)?;
-                for icon in items.iter().filter(|i| i.running) {
-                    let x = icon.center_x as f32 / s;
-                    let half = if icon.active { 5. } else { 2. };
-                    if icon.active {
-                        // A soft wash behind the foreground application's icon.
-                        c.fill(x - 21., 5., x + 21., h - 4., 11., c.p.accent, 0.07)?;
-                        c.fill(x - 9., h - 9.5, x + 9., h - 3.5, 3., c.p.accent, 0.18)?;
-                    }
-                    c.round(
-                        x - half,
-                        h - 8.,
-                        x + half,
-                        h - 5.,
-                        1.5,
-                        if icon.active { c.p.accent } else { c.p.muted },
-                    )?;
-                }
-                Ok(())
+                c.stroke(0., 0., w, h, 18., c.p.line, 0.16)
             })?;
             unsafe { self.bottom.root.SetContent(&surface)? };
-            self.indicators = statuses.collect();
             self.bottom_size = Some(size);
         }
         if layout_changed {
             unsafe { self.bottom.root.RemoveAllVisuals()? };
             let mut previous = std::mem::take(&mut self.icons);
             for item in items {
-                let mut layer =
-                    if let Some(i) = previous.iter().position(|layer| layer.matches(item)) {
-                        previous.swap_remove(i)
-                    } else {
-                        self.icon(item)?
-                    };
-                layer.center = (item.center_x, item.center_y);
+                let known = previous.iter().position(|layer| layer.matches(item));
+                let mut layer = match known {
+                    Some(i) => previous.swap_remove(i),
+                    None => self.icon(item)?,
+                };
+                let x = (item.center_x - item.size / 2) as f32;
+                let y = (item.center_y - item.size / 2) as f32;
                 unsafe {
-                    layer
-                        .visual
-                        .SetOffsetX2((item.center_x - item.size / 2) as f32)?;
-                    layer
-                        .visual
-                        .SetOffsetY2((item.center_y - item.size / 2) as f32)?;
+                    if slide && known.is_some() {
+                        if let Some(curve) = layer.x.retarget(&self.device, x, SLIDE)? {
+                            layer.visual.SetOffsetX(&curve)?;
+                        }
+                    } else {
+                        layer.x = Tween::new(x);
+                        layer.visual.SetOffsetX2(x)?;
+                    }
+                    layer.visual.SetOffsetY2(y)?;
                     self.bottom.root.AddVisual(&layer.visual, true, None)?;
                 }
+                layer.center = (item.center_x, item.center_y);
                 self.icons.push(layer);
             }
         }
         let mut changed = panel_changed || layout_changed;
-        for (index, layer) in self.icons.iter_mut().enumerate() {
-            let hovered = hover == Some(index);
-            if layer.hovered != hovered {
-                layer.animate(&self.device, hovered, lift)?;
+        for (index, (layer, item)) in self.icons.iter_mut().zip(items).enumerate() {
+            changed |= layer.place_dot(&self.device, self.palette, item, height, dpi)?;
+            let deepened = deep == Some(index);
+            let goal = if deepened {
+                lift.max(1.) * DROP_LIFT
+            } else if hover == Some(index) {
+                lift
+            } else {
+                1.
+            };
+            if let Some(curve) = layer.lift.retarget(&self.device, goal, DURATION)? {
+                unsafe {
+                    layer.scale.SetScaleX(&curve)?;
+                    layer.scale.SetScaleY(&curve)?;
+                }
+                changed = true;
+            }
+            let shade = if deepened { 1. } else { 0. };
+            if let Some((fade, tween)) = &mut layer.shade
+                && let Some(curve) = tween.retarget(&self.device, shade, DURATION)?
+            {
+                unsafe { fade.SetOpacity(&curve)? };
                 changed = true;
             }
         }
@@ -654,14 +747,31 @@ impl Renderer {
             Ok(())
         })?;
         unsafe {
-            let visual = self.device.CreateVisual()?;
-            visual.SetContent(&surface)?;
+            let image = self.device.CreateVisual()?;
+            image.SetContent(&surface)?;
             let scale = self.device.CreateScaleTransform()?;
             scale.SetCenterX2(size * 0.5)?;
             scale.SetCenterY2(size * 0.75)?;
             scale.SetScaleX2(1.)?;
             scale.SetScaleY2(1.)?;
-            visual.SetTransform(&scale)?;
+            image.SetTransform(&scale)?;
+            // Of the Dock icons only the launchpad accepts a dropped app.
+            let shade = if item.path.is_none() {
+                let tint = paint(&self.device, self.palette, item.size, item.size, 96, |c| {
+                    c.fill(0., 0., size, size, size * 0.24, (0, 0, 0), DROP_SHADE)
+                })?;
+                let veil = self.device.CreateVisual()?;
+                veil.SetContent(&tint)?;
+                let fade = self.device.CreateEffectGroup()?;
+                fade.SetOpacity2(0.)?;
+                veil.SetEffect(&fade)?;
+                image.AddVisual(&veil, false, None)?;
+                Some((fade, Tween::new(0.)))
+            } else {
+                None
+            };
+            let visual = self.device.CreateVisual()?;
+            visual.AddVisual(&image, true, None)?;
             Ok(IconLayer {
                 path: item.path.map(Path::to_owned),
                 label: item.label.into(),
@@ -669,10 +779,11 @@ impl Renderer {
                 center: (0, 0),
                 visual,
                 scale,
-                hovered: false,
-                lift: 1.,
-                start_time: Instant::now(),
-                start_scale: 1.,
+                lift: Tween::new(1.),
+                x: Tween::new(0.),
+                shade,
+                dot: None,
+                dot_key: None,
             })
         }
     }

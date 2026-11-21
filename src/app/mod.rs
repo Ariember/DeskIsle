@@ -656,6 +656,7 @@ impl Bars {
 
     fn draw_frame(&mut self) -> Result<()> {
         let (preview_order, dock_hover) = self.dock_preview();
+        let dropping = self.dropping_on_launchpad();
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
         renderer.check_device()?;
         let dpi = self.monitor.dpi;
@@ -742,8 +743,15 @@ impl Bars {
             .slots
             .iter()
             .position(|slot| Some(slot.target) == dock_hover);
+        let deep = self
+            .layout
+            .slots
+            .iter()
+            .position(|slot| slot.target == DockHit::Launchpad)
+            .filter(|_| dropping);
         let bottom = self.layout.bottom;
         let lift = self.settings.hover_scale();
-        renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, lift)
+        renderer.draw_dock(bottom.width, bottom.height, dpi, &icons, hover, deep, lift)?;
+        renderer.deepen_launchpad(dropping)
     }
 }
