@@ -4,7 +4,7 @@
 use super::Bars;
 use crate::platform::{self, Event, PanelKey, PanelWindow, display, startup};
 use crate::render::is_device_lost;
-use crate::settings::{Adjust, Key, SCHEMA, SECTIONS, Settings, Store, Theme};
+use crate::settings::{Adjust, Key, SCHEMA, SECTIONS, Settings, Store, Theme, TopBarBackground};
 use crate::storage;
 use crate::ui::layout::DockStyle;
 use crate::ui::panel::{Action, Nav, PanelLayout, PanelState, panel_dpi};
@@ -104,6 +104,18 @@ impl Bars {
         dark(&self.settings)
     }
 
+    pub(super) fn sync_top_backdrop(&mut self) {
+        let theme = (self.settings.top_bar_background() == TopBarBackground::Frosted
+            && display::transparency().unwrap_or(false))
+        .then(|| self.dark());
+        if theme != self.top_glass_theme {
+            self.top_glass = self
+                .top
+                .set_top_backdrop(theme.is_some(), theme.unwrap_or(false));
+            self.top_glass_theme = theme;
+        }
+    }
+
     pub(super) fn update_theme_from_desktop(&mut self) -> Result<()> {
         if self.settings.theme() == Theme::Automatic
             && self.settings.enabled(Key::SyncSystemTheme)
@@ -122,6 +134,7 @@ impl Bars {
     /// panel's sidebar after transparency effects were switched; Windows announces both
     /// as a setting change. The bars repaint on their next draw; the panel repaints here.
     pub(super) fn apply_theme(&mut self) -> Result<()> {
+        self.sync_top_backdrop();
         let dark = self.dark();
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
@@ -358,6 +371,9 @@ impl Bars {
         let mut monitor_changed = false;
         let mut immersion_changed = false;
         let mut backdrop_changed = false;
+        let mut top_height_changed = false;
+        let mut status_changed = false;
+        let mut window_style_changed = false;
         for spec in changed {
             let enabled = self.settings.enabled(spec.key);
             let result = match spec.key {
@@ -365,6 +381,31 @@ impl Bars {
                     redisplay = true;
                     Ok(())
                 }
+                Key::TopBarHeight => {
+                    top_height_changed = true;
+                    Ok(())
+                }
+                Key::TopBarBackground | Key::ColorTrayIcons => {
+                    retheme = true;
+                    Ok(())
+                }
+                Key::TopBarImmersive | Key::TopBarCloseMaximized => {
+                    window_style_changed = true;
+                    Ok(())
+                }
+                Key::ShowInputLanguageIcon => {
+                    status_changed = true;
+                    self.sync_input_indicator()
+                }
+                Key::ShowInputMethodIcon | Key::ShowSearchIcon => {
+                    status_changed = true;
+                    Ok(())
+                }
+                Key::LockTrayIcons => {
+                    self.cancel_tray_drag();
+                    Ok(())
+                }
+                Key::ConfirmPowerActions => Ok(()),
                 Key::Theme | Key::SyncSystemTheme => {
                     retheme = true;
                     if self.settings.enabled(Key::SyncSystemTheme)
@@ -442,14 +483,20 @@ impl Bars {
         if immersion_changed {
             self.sync_dock_immersion()?;
         }
-        if redisplay {
+        if window_style_changed {
+            self.refresh_top_window(true);
+        }
+        if status_changed {
+            self.restatus();
+        }
+        if redisplay || top_height_changed {
             // Showing or hiding the taskbar changes the work area the Dock sits in.
-            self.display(false)
+            self.display(top_height_changed)
         } else if relayout {
             self.relayout(self.layout.first)?;
             self.draw()?;
             self.resize_launchpad()
-        } else if retheme {
+        } else if retheme || status_changed || window_style_changed {
             self.draw()
         } else {
             Ok(())

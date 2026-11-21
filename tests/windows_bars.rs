@@ -25,15 +25,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
-    GWL_EXSTYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetShellWindow,
-    GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN,
-    SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA, SW_HIDE, SW_MAXIMIZE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    GUITHREADINFO, GWL_EXSTYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
+    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA,
+    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetCursorPos,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP, WM_CANCELMODE,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
@@ -59,6 +59,7 @@ impl Drop for TestProfile {
         let _ = fs::remove_file(self.0.join("launched.txt"));
         let _ = fs::remove_file(self.0.join("DeskIsle/launchpad.txt"));
         let _ = fs::remove_file(self.0.join("DeskIsle/pins.txt"));
+        let _ = fs::remove_file(self.0.join("DeskIsle/settings.ini"));
         let _ = fs::remove_dir(self.0.join("DeskIsle"));
         let _ = fs::remove_dir(&self.0);
     }
@@ -195,9 +196,16 @@ impl TestWindow {
                 ..Default::default()
             };
             assert_ne!(RegisterClassW(&wc), 0);
+        }
+        Self::maximized()
+    }
+
+    fn maximized() -> Self {
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap().into();
             let hwnd = CreateWindowExW(
                 Default::default(),
-                class,
+                w!("DeskIsle.TestWindow"),
                 w!("DeskIsle maximization test"),
                 WS_OVERLAPPEDWINDOW,
                 0,
@@ -316,6 +324,52 @@ fn send_to_child(pid: u32, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
     assert_eq!(owner, pid, "target window no longer belongs to our child");
     let sent = unsafe { SendMessageTimeoutW(hwnd, msg, wp, lp, SMTO_ABORTIFHUNG, 2000, None) };
     assert_ne!(sent.0, 0, "child did not process message {msg:#x}");
+}
+
+fn corner_closes_only_the_maximized_probe(pid: u32, status: HWND) {
+    let probe = TestWindow::maximized();
+    let _ = unsafe { SetForegroundWindow(probe.0) };
+    wait_until(
+        "probe must be in the foreground",
+        || unsafe { GetForegroundWindow() } == probe.0,
+    );
+    let rect = window_rect(status);
+    let corner = LPARAM((rect.right - rect.left - 1) as isize);
+    let thread = unsafe { GetWindowThreadProcessId(status, None) };
+    let captured = || {
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetGUIThreadInfo(thread, &mut info) }.unwrap();
+        info.hwndCapture == status
+    };
+    let press = || {
+        wait_until(
+            "corner did not accept a press for the maximized probe",
+            || {
+                assert_eq!(unsafe { GetForegroundWindow() }, probe.0);
+                if captured() {
+                    return true;
+                }
+                send_to_child(pid, status, WM_LBUTTONDOWN, WPARAM(1), corner);
+                false
+            },
+        );
+    };
+    press();
+    let _ = unsafe { ShowWindow(probe.0, SW_RESTORE) };
+    send_to_child(pid, status, WM_LBUTTONUP, WPARAM(0), corner);
+    wait_until("corner did not release capture", || !captured());
+    assert!(unsafe { IsWindow(Some(probe.0)) }.as_bool());
+
+    let _ = unsafe { ShowWindow(probe.0, SW_MAXIMIZE) };
+    press();
+    assert_eq!(unsafe { GetForegroundWindow() }, probe.0);
+    send_to_child(pid, status, WM_LBUTTONUP, WPARAM(0), corner);
+    wait_until("corner did not close the probe", || {
+        !unsafe { IsWindow(Some(probe.0)) }.as_bool()
+    });
 }
 
 fn hovering_the_probe_shows_its_preview(pid: u32, dock: HWND, probe: HWND) {
@@ -498,6 +552,11 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     let initial = window_rect(probe.0);
 
     let profile = TestProfile::new();
+    fs::write(
+        profile.0.join("DeskIsle/settings.ini"),
+        "topbar.height = 42\ntopbar.close_maximized = true\n",
+    )
+    .unwrap();
     // Pin the probe using the same Win32 image path that the Dock sees on enumeration.
     let mut executable = vec![0; 32768];
     let mut len = executable.len() as u32;
@@ -562,6 +621,8 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
             // top, so it may sit above the work area measured before launch.
             let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
             assert_eq!((rect.left, rect.right), (0, width), "{rect:?}");
+            let dpi = unsafe { GetDpiForWindow(hwnd) } as i32;
+            assert_eq!(rect.bottom - rect.top, (42 * dpi + 48) / 96);
             assert!(rect.top >= 0 && rect.top <= work.top, "{rect:?}");
             let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
             assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "bar can take focus");
@@ -591,6 +652,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "bar can take focus");
     }
     let pid = app.0.id();
+    corner_closes_only_the_maximized_probe(pid, status);
     hovering_the_probe_shows_its_preview(pid, dock, probe.0);
     launchpad_reopens_saved_shortcut(pid, dock, &profile.0);
     // Send Explorer's AppBar notification to the window that registered for it.

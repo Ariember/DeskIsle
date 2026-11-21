@@ -4,6 +4,7 @@ use super::Bars;
 use crate::dock::{self, Action, group_apps};
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, power, shell};
+use crate::settings::Key;
 use crate::storage;
 use crate::ui::layout::{DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{self, Command};
@@ -45,8 +46,7 @@ impl Bars {
             Command::TaskManager => shell::execute(owner, "taskmgr.exe"),
             Command::ShowDesktop => self.tray.toggle_desktop(),
             Command::Sleep => power::sleep(owner),
-            Command::Restart => power::restart(),
-            Command::ShutDown => power::shut_down(),
+            Command::Restart | Command::ShutDown => self.power_action(command == Command::Restart),
             Command::SignOut => power::sign_out(),
             Command::Lock => power::lock(),
             Command::Settings => self.open_settings(),
@@ -84,6 +84,19 @@ impl Bars {
         }
         self.refresh()?;
         Ok(false)
+    }
+
+    fn power_action(&self, restart: bool) -> Result<()> {
+        if self.settings.enabled(Key::ConfirmPowerActions)
+            && !platform::confirm_power(self.top.0, restart)?
+        {
+            return Ok(());
+        }
+        if restart {
+            power::restart()
+        } else {
+            power::shut_down()
+        }
     }
 
     /// A middle click mutes or unmutes over the sound icon and starts another instance

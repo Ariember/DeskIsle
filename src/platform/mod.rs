@@ -2,6 +2,7 @@ pub mod about;
 pub mod audio;
 pub mod display;
 mod drop_files;
+pub mod input;
 pub mod launchpad;
 pub mod machine;
 pub mod media;
@@ -24,9 +25,9 @@ use windows::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{
-            DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
-            DwmSetWindowAttribute,
+            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -335,6 +336,49 @@ impl Drop for AppBar {
 }
 
 impl Bar {
+    /// Windows 11 22H2 and newer can provide desktop acrylic beneath the top surface.
+    /// On other builds the renderer paints the frosted style with an opaque fallback.
+    pub fn set_top_backdrop(&self, requested: bool, dark: bool) -> bool {
+        let material = if requested {
+            DWMSBT_TRANSIENTWINDOW
+        } else {
+            DWMSBT_NONE
+        };
+        let set_material = |material: windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE| unsafe {
+            DwmSetWindowAttribute(
+                self.0,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                (&raw const material).cast(),
+                size_of_val(&material) as u32,
+            )
+        };
+        if set_material(material).is_err() {
+            return false;
+        }
+        let margins = MARGINS {
+            cxLeftWidth: if requested { -1 } else { 0 },
+            ..Default::default()
+        };
+        if unsafe { DwmExtendFrameIntoClientArea(self.0, &margins) }.is_err() {
+            if requested {
+                let _ = set_material(DWMSBT_NONE);
+            }
+            return false;
+        }
+        if requested {
+            let dark = BOOL::from(dark);
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    self.0,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    (&raw const dark).cast(),
+                    size_of_val(&dark) as u32,
+                )
+            };
+        }
+        requested
+    }
+
     pub fn capture(&self) {
         unsafe { SetCapture(self.0) };
     }
@@ -437,6 +481,7 @@ pub enum Event {
     Display,
     Clock,
     TrayNoticeExpired,
+    InputLanguage,
     DockReveal,
     TaskbarShortcut(i32),
     MetricsUpdate,
@@ -583,6 +628,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let _ = unsafe { KillTimer(Some(hwnd), DOCK_REVEAL_TIMER) };
             Event::DockReveal
         }
+        WM_TIMER if wp.0 == input::TIMER => Event::InputLanguage,
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => {
             // A non-activating bar may miss a release outside its visible area.
@@ -1091,6 +1137,57 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 /// The window that currently has the foreground, to tell when another one takes it.
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+pub fn maximized_on_primary(hwnd: HWND) -> bool {
+    unsafe {
+        IsZoomed(hwnd).as_bool()
+            && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)
+                == MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY)
+    }
+}
+
+/// Reads one visible pixel just inside the application's top edge. Custom title bars
+/// often paint their own color. A popup covering the sample must not supply its tint.
+pub fn top_window_color(id: isize, bar: Rect, dpi: u32) -> Option<u32> {
+    let window = HWND(id as _);
+    let point = POINT {
+        x: bar.x + bar.width / 2,
+        y: bar.y + bar.height + (3 * dpi as i32 / 96).max(1),
+    };
+    unsafe {
+        if GetAncestor(WindowFromPoint(point), GA_ROOT) != window {
+            return None;
+        }
+        let dc = GetDC(None);
+        if dc.is_invalid() {
+            return None;
+        }
+        let color = GetPixel(dc, point.x, point.y);
+        ReleaseDC(None, dc);
+        (color.0 != u32::MAX).then_some(color.0)
+    }
+}
+
+pub fn confirm_power(owner: HWND, restart: bool) -> Result<bool> {
+    let message = if restart {
+        w!("确定要重新启动计算机吗？")
+    } else {
+        w!("确定要关闭计算机吗？")
+    };
+    let answer = unsafe {
+        MessageBoxW(
+            Some(owner),
+            message,
+            w!("DeskIsle"),
+            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
+        )
+    };
+    if answer.0 == 0 {
+        Err(Error::from_thread())
+    } else {
+        Ok(answer == IDYES)
+    }
 }
 
 /// A maximized window's frame can extend outside the monitor while its client area

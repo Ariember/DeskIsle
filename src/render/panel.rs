@@ -6,7 +6,7 @@ use windows::Win32::{
 };
 use windows::core::{Error, Result, w};
 
-use crate::settings::{Adjust, Key, MonitorKey, SECTIONS, Section};
+use crate::settings::{Adjust, Key, MonitorKey, SECTIONS, Section, TopBarBackground};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
@@ -53,6 +53,7 @@ fn section_color(section: Section) -> Rgb {
     match section {
         Section::General => (87, 102, 116),
         Section::Dock => (27, 112, 178),
+        Section::TopBar => (94, 83, 166),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
     }
@@ -63,6 +64,7 @@ fn section_symbol(section: Section) -> Symbol {
     match section {
         Section::General => Symbol::Computer,
         Section::Dock => Symbol::Dock,
+        Section::TopBar => Symbol::Window,
         Section::Clock => Symbol::Clock,
         Section::Monitor => Symbol::Chip,
     }
@@ -72,6 +74,54 @@ fn section_symbol(section: Section) -> Symbol {
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
     (channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
+}
+
+/// A small desktop with a colorful wallpaper so the amount of tint is visible.
+fn top_bar_preview(c: &Canvas, a: Area, style: TopBarBackground) -> Result<()> {
+    let (l, t, r, b) = (a.left, a.top, a.right, a.bottom);
+    let w = r - l;
+    c.clipped(c.rect(l, t, r, b), || {
+        c.gradient(l, t, r, b, 0., ((106, 161, 196), 1.), ((182, 205, 216), 1.))?;
+        for (x, y, start, end) in [
+            (0.30, 6., (171, 129, 230), (72, 55, 128)),
+            (0.17, 17., (232, 152, 216), (132, 54, 134)),
+            (0.02, 28., (255, 181, 153), (197, 79, 119)),
+            (-0.18, 39., (255, 214, 144), (231, 114, 90)),
+        ] {
+            let band = |spread: f32, alpha| {
+                c.gradient(
+                    l + w * x - spread,
+                    t + y - spread,
+                    l + w * (x + 0.66) + spread,
+                    b + 34. + spread,
+                    32. + spread,
+                    (start, alpha),
+                    (end, alpha),
+                )
+            };
+            if style == TopBarBackground::Frosted {
+                // Feather the miniature's wallpaper, which is drawn inside the panel
+                // rather than behind a separate window with a real DWM backdrop.
+                for (spread, alpha) in [
+                    (6., 0.08),
+                    (4., 0.16),
+                    (2., 0.24),
+                    (0., 0.32),
+                    (-2., 0.44),
+                    (-4., 0.67),
+                    (-6., 1.),
+                ] {
+                    band(spread, alpha)?;
+                }
+            } else {
+                band(0., 1.)?;
+            }
+        }
+        c.top_background(Area::new(l, t, r, t + 15.), style, true)?;
+        c.ring(l + 9., t + 7.5, 3.2, 1.3, c.p.accent)?;
+        c.symbol(Symbol::Search, r - 23., t + 7.5, 9., c.p.ink, 1.)?;
+        c.symbol(Symbol::Controls, r - 9., t + 7.5, 10., c.p.ink, 1.)
+    })
 }
 
 /// The settings window's tones, modeled on macOS System Settings: a tinted sidebar,
@@ -717,40 +767,50 @@ impl Renderer {
                     }
                 }
             }
-            Part::Segments { options, selected } if key == Key::Theme => {
+            Part::Segments { options, selected }
+                if matches!(key, Key::Theme | Key::TopBarBackground) =>
+            {
                 for (i, (area, label)) in options.iter().enumerate() {
                     let x = (area.left + area.right) / 2.;
                     let top = area.top + 3.;
-                    let width = ((area.right - area.left) * 0.70).min(66.);
-                    let preview = Area::new(x - width / 2., top, x + width / 2., top + 34.);
-                    // System and scheduled modes show both appearances.
-                    let light = (216, 221, 228);
-                    let dark = (55, 58, 65);
-                    let base = if i == 2 { dark } else { light };
-                    c.round(preview.left, top, preview.right, preview.bottom, 5., base)?;
-                    if i == 0 || i == 3 {
-                        c.clipped(c.rect(x, top, preview.right, preview.bottom), || {
-                            c.round(preview.left, top, preview.right, preview.bottom, 5., dark)
-                        })?;
-                    }
-                    let icon = match i {
-                        0 => Symbol::Computer,
-                        1 => Symbol::Sun,
-                        2 => Symbol::Moon,
-                        _ => Symbol::Clock,
+                    let (width, height) = if key == Key::TopBarBackground {
+                        (area.right - area.left - 8., 56.)
+                    } else {
+                        (((area.right - area.left) * 0.70).min(66.), 34.)
                     };
-                    let tile =
-                        Area::new(preview.left + 3., top + 2., preview.left + 23., top + 22.);
-                    c.symbol_in(icon, tile, 13., if i == 2 { WHITE } else { dark }, 0.9)?;
-                    c.fill(
-                        x - width * 0.28,
-                        top + 24.,
-                        x + width * 0.28,
-                        top + 30.,
-                        3.,
-                        WHITE,
-                        0.65,
-                    )?;
+                    let preview = Area::new(x - width / 2., top, x + width / 2., top + height);
+                    if key == Key::TopBarBackground {
+                        top_bar_preview(c, preview, TopBarBackground::from_index(i as i32))?;
+                    } else {
+                        // System and scheduled modes show both appearances.
+                        let light = (216, 221, 228);
+                        let dark = (55, 58, 65);
+                        let base = if i == 2 { dark } else { light };
+                        c.round(preview.left, top, preview.right, preview.bottom, 5., base)?;
+                        if i == 0 || i == 3 {
+                            c.clipped(c.rect(x, top, preview.right, preview.bottom), || {
+                                c.round(preview.left, top, preview.right, preview.bottom, 5., dark)
+                            })?;
+                        }
+                        let icon = match i {
+                            0 => Symbol::Computer,
+                            1 => Symbol::Sun,
+                            2 => Symbol::Moon,
+                            _ => Symbol::Clock,
+                        };
+                        let tile =
+                            Area::new(preview.left + 3., top + 2., preview.left + 23., top + 22.);
+                        c.symbol_in(icon, tile, 13., if i == 2 { WHITE } else { dark }, 0.9)?;
+                        c.fill(
+                            x - width * 0.28,
+                            top + 24.,
+                            x + width * 0.28,
+                            top + 30.,
+                            3.,
+                            WHITE,
+                            0.65,
+                        )?;
+                    }
                     let selected = i == *selected;
                     let rim = if selected { t.accent } else { c.p.line };
                     c.stroke(
@@ -758,7 +818,7 @@ impl Renderer {
                         top - 1.,
                         preview.right + 1.,
                         preview.bottom + 1.,
-                        6.,
+                        if key == Key::TopBarBackground { 1. } else { 6. },
                         rim,
                         if selected {
                             1.
@@ -894,7 +954,7 @@ mod render_tests {
 
     #[test]
     #[ignore = "requires a Windows desktop compositor"]
-    fn general_and_dock_pages_commit_in_both_appearances() -> Result<()> {
+    fn settings_pages_commit_in_both_appearances() -> Result<()> {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
         let result = paint_pages();
         // All windows and graphics objects were owned by this test thread.
@@ -917,7 +977,7 @@ mod render_tests {
         let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
         for dark in [false, true] {
             renderer.set_appearance(dark, &settings);
-            for section in [Section::General, Section::Dock] {
+            for section in [Section::General, Section::Dock, Section::TopBar] {
                 let mut state = PanelState {
                     page: SECTIONS.iter().position(|&s| s == section).unwrap(),
                     ..Default::default()

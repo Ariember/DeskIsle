@@ -2,6 +2,7 @@
 //! current state, and the flyout each opens. The flyouts are menus whose commands
 //! change a system feature and leave the flyout open, rebuilt from fresh state.
 
+use crate::settings::{Key, Settings};
 use crate::system::{Audio, Battery, Display, Media, MediaAction, Network, PowerPlan, RadioKind};
 use crate::ui::icon::Symbol;
 use crate::ui::layout::SystemItem;
@@ -27,22 +28,40 @@ pub struct SystemStatus {
     pub audio: Option<Audio>,
     pub battery: Option<Battery>,
     pub network: Network,
+    pub input_language: Option<&'static str>,
 }
 
 /// How a system control is drawn on the status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
     /// An icon of DeskIsle's set, drawn faded when `dim`.
-    Icon { symbol: Symbol, dim: bool },
+    Icon {
+        symbol: Symbol,
+        dim: bool,
+    },
+    Text(&'static str),
     /// The battery icon followed by the charge, when the battery reports it.
-    Battery { symbol: Symbol, percent: Option<u8> },
+    Battery {
+        symbol: Symbol,
+        percent: Option<u8>,
+    },
 }
 
 impl SystemStatus {
     /// The controls to show, in display order. Battery appears only on computers that
     /// have one.
-    pub fn items(&self) -> Vec<SystemItem> {
-        let mut items = vec![SystemItem::Network, SystemItem::Display];
+    pub fn items(&self, settings: &Settings) -> Vec<SystemItem> {
+        let mut items = Vec::new();
+        if settings.enabled(Key::ShowInputMethodIcon) {
+            items.push(SystemItem::InputMethod);
+        }
+        if settings.enabled(Key::ShowInputLanguageIcon) && self.input_language.is_some() {
+            items.push(SystemItem::InputLanguage);
+        }
+        if settings.enabled(Key::ShowSearchIcon) {
+            items.push(SystemItem::Search);
+        }
+        items.extend([SystemItem::Network, SystemItem::Display]);
         if self.battery.is_some() {
             items.push(SystemItem::Battery);
         }
@@ -53,6 +72,9 @@ impl SystemStatus {
     pub fn mark(&self, item: SystemItem) -> Mark {
         let icon = |symbol| Mark::Icon { symbol, dim: false };
         match item {
+            SystemItem::InputMethod => icon(Symbol::Keyboard),
+            SystemItem::InputLanguage => Mark::Text(self.input_language.unwrap_or_default()),
+            SystemItem::Search => icon(Symbol::Search),
             SystemItem::Network if self.network.ssid.is_some() => icon(Symbol::Wifi),
             SystemItem::Network if self.network.cellular => icon(Symbol::Cellular),
             SystemItem::Network if self.network.wired => icon(Symbol::Ethernet),
@@ -90,6 +112,8 @@ impl SystemStatus {
 /// flyout a left click shows.
 pub fn settings_page(item: SystemItem) -> &'static str {
     match item {
+        SystemItem::InputMethod | SystemItem::InputLanguage => "ms-settings:typing",
+        SystemItem::Search => "ms-settings:search-permissions",
         SystemItem::Network => "ms-settings:network",
         SystemItem::Display => "ms-settings:display",
         SystemItem::Battery => "ms-settings:powersleep",
@@ -476,7 +500,25 @@ mod tests {
     #[test]
     fn status_marks_follow_the_state() {
         let mut status = SystemStatus::default();
-        assert!(!status.items().contains(&SystemItem::Battery));
+        let mut settings = Settings::default();
+        assert!(!status.items(&settings).contains(&SystemItem::Battery));
+        settings.set(Key::ShowInputMethodIcon, 0);
+        settings.set(Key::ShowSearchIcon, 1);
+        settings.set(Key::ShowInputLanguageIcon, 1);
+        let items = status.items(&settings);
+        assert!(items.contains(&SystemItem::Search));
+        assert!(!items.contains(&SystemItem::InputMethod));
+        assert!(!items.contains(&SystemItem::InputLanguage));
+        status.input_language = Some("中");
+        assert!(status.items(&settings).contains(&SystemItem::InputLanguage));
+        assert_eq!(status.mark(SystemItem::InputLanguage), Mark::Text("中"));
+        settings.set(Key::ShowInputLanguageIcon, 0);
+        settings.set(Key::ShowSearchIcon, 0);
+        settings.set(Key::ShowInputMethodIcon, 1);
+        let items = status.items(&settings);
+        assert!(items.contains(&SystemItem::InputMethod));
+        assert!(!items.contains(&SystemItem::InputLanguage));
+        assert!(!items.contains(&SystemItem::Search));
         assert_eq!(
             status.mark(SystemItem::Network),
             Mark::Icon {
@@ -498,7 +540,7 @@ mod tests {
             }
         );
         status.network.ssid = Some("home".into());
-        let items = status.items();
+        let items = status.items(&settings);
         assert_eq!(items.last(), Some(&SystemItem::Control));
         assert!(items.contains(&SystemItem::Battery));
         assert_eq!(

@@ -292,6 +292,7 @@ impl PanelLayout {
                 || matches!(
                     spec.key,
                     Key::Theme
+                        | Key::ConfirmPowerActions
                         | Key::Autostart
                         | Key::TemperatureUnit
                         | Key::FontFamily
@@ -302,6 +303,7 @@ impl PanelLayout {
             }
             let height = match spec.key {
                 Key::Theme => 122.,
+                Key::TopBarBackground => 144.,
                 key if stacked_choice(key) => SLIDER_CARD,
                 _ if matches!(spec.control, Control::Slider { .. }) => SLIDER_CARD,
                 _ if detail.is_some() => MONITOR_CARD,
@@ -523,7 +525,12 @@ pub fn slider_track(area: Area) -> (f32, f32) {
 pub fn stacked_choice(key: Key) -> bool {
     matches!(
         key,
-        Key::Theme | Key::Accent | Key::FontFamily | Key::TaskbarShortcut | Key::Language
+        Key::Theme
+            | Key::TopBarBackground
+            | Key::Accent
+            | Key::FontFamily
+            | Key::TaskbarShortcut
+            | Key::Language
     )
 }
 
@@ -606,10 +613,10 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
         Control::Choice(choices) => {
             let (left, top, segment, bottom) = if stacked_choice(spec.key) {
                 let left = card.left + CONTROL_INSET;
-                let height = if spec.key == Key::Theme {
-                    64.
-                } else {
-                    CONTROL_HEIGHT
+                let height = match spec.key {
+                    Key::Theme => 64.,
+                    Key::TopBarBackground => 86.,
+                    _ => CONTROL_HEIGHT,
                 };
                 (
                     left,

@@ -26,7 +26,12 @@ impl Renderer {
         dpi: u32,
         metrics: &[Indicator],
     ) -> Result<()> {
-        if self.update_metrics(layout, dpi, metrics)? {
+        let caption = self
+            .top_state
+            .as_ref()
+            .and_then(|state| state.immersive_color);
+        let palette = self.palette.for_top_bar(caption);
+        if self.update_metrics(layout, dpi, metrics, palette)? {
             unsafe { self.device.Commit()? };
         }
         Ok(())
@@ -37,6 +42,7 @@ impl Renderer {
         layout: &StatusLayout,
         dpi: u32,
         readings: &[Indicator],
+        palette: Palette,
     ) -> Result<bool> {
         let slots = &layout.metrics;
         let (Some(first), Some(last)) = (slots.first(), slots.last()) else {
@@ -49,7 +55,7 @@ impl Renderer {
         let readings = &readings[..slots.len()];
         let size = (last.x + last.width - first.x, layout.height, dpi);
         if let Some(layer) = &mut self.metric_layer
-            && (layer.size, layer.palette) == (size, self.palette)
+            && (layer.size, layer.palette) == (size, palette)
             && layer.readings == readings
         {
             if first.x == layer.left {
@@ -59,7 +65,7 @@ impl Renderer {
             layer.left = first.x;
             return Ok(true);
         }
-        let surface = paint(&self.device, self.palette, size.0, size.1, dpi, |c| {
+        let surface = paint(&self.device, palette, size.0, size.1, dpi, |c| {
             for (r, indicator) in slots.iter().zip(readings) {
                 let l = (r.x - first.x) as f32 / c.scale;
                 let right = (r.x + r.width - first.x) as f32 / c.scale;
@@ -81,7 +87,7 @@ impl Renderer {
                 visual,
                 size,
                 left: first.x,
-                palette: self.palette,
+                palette,
                 readings: readings.to_owned(),
             });
         }
@@ -159,7 +165,8 @@ mod tests {
             Indicator::new(Metric::GpuTemperature, Style::Value),
             Indicator::new(Metric::CpuTemperature, Style::Value),
         ];
-        let layout = |metrics: &[Indicator]| StatusLayout::new(1200, 45, 144, 0, 0, &[], metrics);
+        let layout =
+            |metrics: &[Indicator]| StatusLayout::new((1200, 45), 144, 0, 0, &[], metrics, false);
         let mut bar = layout(&indicators);
         renderer.draw_top(
             &bar,
@@ -171,6 +178,8 @@ mod tests {
             None,
             None,
             &indicators,
+            false,
+            Some(0x301040),
         )?;
         for disk in [Some(0), Some(75), None, Some(93)] {
             let sample = Sample {
@@ -217,6 +226,9 @@ mod tests {
                 }
             }
         }
+        settings.set(Key::TopBarBackground, 1);
+        renderer.set_appearance(true, &settings);
+        let frosted = top.set_top_backdrop(true, true);
         renderer.draw_top(
             &bar,
             144,
@@ -227,7 +239,12 @@ mod tests {
             None,
             None,
             &indicators,
+            frosted,
+            None,
         )?;
+        settings.set(Key::TopBarBackground, 2);
+        renderer.set_appearance(true, &settings);
+        top.set_top_backdrop(false, true);
         renderer.draw_top(
             &layout(&[]),
             144,
@@ -238,7 +255,51 @@ mod tests {
             None,
             None,
             &[],
+            false,
+            None,
         )?;
+        use crate::ui::{layout::SystemItem, system::Mark};
+        use windows::Win32::UI::WindowsAndMessaging::{IDI_INFORMATION, LoadIconW};
+        let items = [
+            SystemItem::InputMethod,
+            SystemItem::InputLanguage,
+            SystemItem::Search,
+        ];
+        let marks = [
+            Mark::Icon {
+                symbol: Symbol::Keyboard,
+                dim: false,
+            },
+            Mark::Text("中"),
+            Mark::Icon {
+                symbol: Symbol::Search,
+                dim: false,
+            },
+        ];
+        let bar = StatusLayout::new((1200, 45), 144, 1, 1, &items, &[], false);
+        let tray = [super::super::TrayImage {
+            // LoadIconW returns a shared system icon.
+            icon: Some(unsafe { LoadIconW(None, IDI_INFORMATION)? }),
+            stamp: 1,
+            needs_attention: false,
+        }];
+        for colored in [0, 1] {
+            settings.set(Key::ColorTrayIcons, colored);
+            renderer.set_appearance(true, &settings);
+            renderer.draw_top(
+                &bar,
+                144,
+                "DeskIsle",
+                "12:01",
+                &tray,
+                &marks,
+                None,
+                None,
+                &[],
+                false,
+                None,
+            )?;
+        }
         unsafe { renderer.device.WaitForCommitCompletion()? };
         renderer.check_device()
     }

@@ -29,6 +29,16 @@ pub enum Key {
     HoverZoom,
     HideTaskbar,
     Autostart,
+    TopBarBackground,
+    TopBarHeight,
+    ConfirmPowerActions,
+    TopBarImmersive,
+    TopBarCloseMaximized,
+    LockTrayIcons,
+    ColorTrayIcons,
+    ShowInputMethodIcon,
+    ShowInputLanguageIcon,
+    ShowSearchIcon,
     Clock(ClockKey),
     Monitor(MonitorKey),
 }
@@ -58,6 +68,7 @@ pub enum MonitorKey {
 pub enum Section {
     General,
     Dock,
+    TopBar,
     Clock,
     Monitor,
 }
@@ -65,6 +76,7 @@ pub enum Section {
 pub const SECTIONS: &[Section] = &[
     Section::General,
     Section::Dock,
+    Section::TopBar,
     Section::Clock,
     Section::Monitor,
 ];
@@ -74,6 +86,7 @@ impl Section {
         match self {
             Section::General => "常规",
             Section::Dock => "Dock",
+            Section::TopBar => "顶部栏",
             Section::Clock => "时间",
             Section::Monitor => "监控",
         }
@@ -149,6 +162,19 @@ pub enum Theme {
     Light,
     Dark,
     Automatic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopBarBackground {
+    Tinted,
+    Frosted,
+    Transparent,
+}
+
+impl TopBarBackground {
+    pub fn from_index(index: i32) -> Self {
+        [Self::Tinted, Self::Frosted, Self::Transparent][index as usize]
+    }
 }
 
 pub const THEMES: &[Choice] = &[
@@ -235,6 +261,25 @@ const fn monitor(
         label,
         help,
         control,
+        default,
+        store: Store::File,
+    }
+}
+
+const fn top_bar_toggle(
+    key: Key,
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+    default: i32,
+) -> Spec {
+    Spec {
+        key,
+        id,
+        section: Section::TopBar,
+        label,
+        help,
+        control: Control::Toggle,
         default,
         store: Store::File,
     }
@@ -564,6 +609,100 @@ pub const SCHEMA: &[Spec] = &[
         default: 0,
         store: Store::File,
     },
+    Spec {
+        key: Key::TopBarBackground,
+        id: "topbar.background",
+        section: Section::TopBar,
+        label: "顶部栏背景样式",
+        help: "选择顶部栏在桌面上的背景效果",
+        control: Control::Choice(&[
+            Choice {
+                id: "tinted",
+                label: "半透明",
+            },
+            Choice {
+                id: "frosted",
+                label: "毛玻璃",
+            },
+            Choice {
+                id: "transparent",
+                label: "透明",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::TopBarHeight,
+        id: "topbar.height",
+        section: Section::TopBar,
+        label: "顶部栏高度",
+        help: "调整顶部栏及其在主屏预留的空间",
+        control: Control::Slider {
+            min: 24,
+            max: 48,
+            step: 1,
+            unit: "DIP",
+        },
+        default: 30,
+        store: Store::File,
+    },
+    top_bar_toggle(
+        Key::ConfirmPowerActions,
+        "topbar.confirm_power",
+        "关机或重启前确认",
+        "从顶部栏选择关机或重启时显示确认对话框",
+        0,
+    ),
+    top_bar_toggle(
+        Key::TopBarImmersive,
+        "topbar.immersive",
+        "窗口最大化时使用沉浸模式",
+        "顶部栏背景跟随主屏前台最大化窗口",
+        1,
+    ),
+    top_bar_toggle(
+        Key::TopBarCloseMaximized,
+        "topbar.close_maximized",
+        "点击右上角关闭最大化窗口",
+        "在顶部栏右端显示当前最大化窗口的关闭按钮",
+        0,
+    ),
+    top_bar_toggle(
+        Key::LockTrayIcons,
+        "topbar.lock_icons",
+        "锁定托盘图标位置",
+        "关闭时可左右拖动顶部栏的托盘图标调整顺序",
+        0,
+    ),
+    top_bar_toggle(
+        Key::ColorTrayIcons,
+        "topbar.color_tray_icons",
+        "显示彩色托盘图标",
+        "保留应用托盘图标的原色",
+        0,
+    ),
+    top_bar_toggle(
+        Key::ShowInputMethodIcon,
+        "topbar.show_input_method",
+        "显示输入法图标",
+        "在顶部栏显示输入设置入口",
+        1,
+    ),
+    top_bar_toggle(
+        Key::ShowInputLanguageIcon,
+        "topbar.show_input_language",
+        "显示输入法中英文图标",
+        "在顶部栏显示当前输入模式",
+        0,
+    ),
+    top_bar_toggle(
+        Key::ShowSearchIcon,
+        "topbar.show_search",
+        "显示搜索图标",
+        "点击搜索图标，在启动台中查找应用",
+        1,
+    ),
     clock_preview(
         ClockKey::Format,
         "clock.format",
@@ -860,6 +999,10 @@ impl Settings {
         [Theme::System, Theme::Light, Theme::Dark, Theme::Automatic][self.get(Key::Theme) as usize]
     }
 
+    pub fn top_bar_background(&self) -> TopBarBackground {
+        TopBarBackground::from_index(self.get(Key::TopBarBackground))
+    }
+
     /// The scale of a hovered Dock icon.
     pub fn hover_scale(&self) -> f32 {
         [1.0, 1.12, 1.24][self.get(Key::HoverZoom) as usize]
@@ -958,6 +1101,30 @@ mod tests {
         assert_eq!(restored, settings);
         assert_eq!(restored.theme(), Theme::Dark);
         assert_eq!(restored.dock_gap(), 14);
+    }
+
+    #[test]
+    fn top_bar_settings_load_over_legacy_defaults_and_round_trip() {
+        let mut settings = Settings::default();
+        settings.set_text("dock.icon_size", "42").unwrap();
+        assert_eq!(settings.get(Key::TopBarHeight), 30);
+        assert!(settings.enabled(Key::TopBarImmersive));
+        assert!(settings.enabled(Key::ShowInputMethodIcon));
+        assert!(settings.enabled(Key::ShowSearchIcon));
+        for spec in SCHEMA.iter().filter(|s| s.section == Section::TopBar) {
+            let adjustment = match spec.control {
+                Control::Choice(_) => Adjust::Pick(2),
+                Control::Slider { .. } => Adjust::Set(37),
+                Control::Toggle => Adjust::Toggle,
+            };
+            assert!(settings.adjust(spec.key, adjustment));
+        }
+        let mut restored = Settings::default();
+        for (id, value) in settings.file_entries() {
+            restored.set_text(id, &value).unwrap();
+        }
+        assert_eq!(restored, settings);
+        assert_eq!(restored.icon_size(), 42);
     }
 
     #[test]

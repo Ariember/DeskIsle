@@ -33,9 +33,10 @@ use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
-use crate::settings::{Key, Settings};
+use crate::settings::{Key, Settings, TopBarBackground};
 use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{StatusHit, StatusLayout};
+use crate::ui::panel::Area;
 use crate::ui::system::Mark;
 
 use self::about::AboutView;
@@ -84,6 +85,8 @@ pub struct Renderer {
     about: Option<AboutView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
+    top_background: TopBarBackground,
+    color_tray_icons: bool,
     traditional_panel: bool,
     mark: Option<MarkLayer>,
 }
@@ -91,6 +94,10 @@ pub struct Renderer {
 #[derive(PartialEq)]
 struct TopState {
     layout: StatusLayout,
+    background: TopBarBackground,
+    frosted: bool,
+    color_tray_icons: bool,
+    immersive_color: Option<u32>,
     dpi: u32,
     title: String,
     time: String,
@@ -374,6 +381,8 @@ impl Renderer {
                 about: None,
                 launchpad: None,
                 palette: Palette::new(dark, settings),
+                top_background: settings.top_bar_background(),
+                color_tray_icons: settings.enabled(Key::ColorTrayIcons),
                 traditional_panel: settings.enabled(Key::Language),
                 mark: None,
             })
@@ -386,6 +395,8 @@ impl Renderer {
 
     /// Invalidates painted layers when their colors or text settings change.
     pub fn set_appearance(&mut self, dark: bool, settings: &Settings) -> bool {
+        self.top_background = settings.top_bar_background();
+        self.color_tray_icons = settings.enabled(Key::ColorTrayIcons);
         // Panel labels are repainted when the changed language choice is laid out.
         self.traditional_panel = settings.enabled(Key::Language);
         let palette = Palette::new(dark, settings);
@@ -426,10 +437,17 @@ impl Renderer {
         open: Option<StatusHit>,
         hover: Option<StatusHit>,
         metrics: &[Indicator],
+        frosted: bool,
+        immersive_color: Option<u32>,
     ) -> Result<()> {
-        let metrics_changed = self.update_metrics(layout, dpi, metrics)?;
+        let palette = self.palette.for_top_bar(immersive_color);
+        let metrics_changed = self.update_metrics(layout, dpi, metrics, palette)?;
         let state = TopState {
             layout: layout.clone(),
+            background: self.top_background,
+            frosted,
+            color_tray_icons: self.color_tray_icons,
+            immersive_color,
             dpi,
             title: title.into(),
             time: time.into(),
@@ -460,12 +478,16 @@ impl Renderer {
         };
         let surface = paint(
             &self.device,
-            self.palette,
+            palette,
             layout.width,
             layout.height,
             dpi,
             |c| {
-                c.bar_glass(w, h, 0.)?;
+                if immersive_color.is_some() {
+                    c.round(0., 0., w, h, 0., c.p.bar)?;
+                } else {
+                    c.top_background(Area::new(0., 0., w, h), self.top_background, frosted)?;
+                }
                 c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.12)?;
                 let t = layout.title;
                 c.text(
@@ -490,7 +512,12 @@ impl Renderer {
                         Some(bitmap) => {
                             let left = (r.x as f32 + (r.width as f32 - icon_size) / 2.).round();
                             let top = (r.y as f32 + (r.height as f32 - icon_size) / 2.).round();
-                            c.bitmap(&bitmap, c.pixels(left, top, icon_size))?;
+                            let rect = c.pixels(left, top, icon_size);
+                            if self.color_tray_icons {
+                                c.bitmap(&bitmap, rect)?;
+                            } else {
+                                c.grayscale_bitmap(&bitmap, rect)?;
+                            }
                         }
                         // An icon without a usable image keeps its slot visible and clickable.
                         None => {
@@ -519,6 +546,18 @@ impl Renderer {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));
                     let (x, y) = ((l + right) / 2., h / 2.);
                     match *mark {
+                        Mark::Text(text) => c.draw_text(
+                            &self.write,
+                            text,
+                            c.rect(l, 0., right, h),
+                            Text {
+                                size: 13.,
+                                align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                                ..Text::default()
+                            },
+                            c.p.ink,
+                            1.,
+                        )?,
                         Mark::Icon { symbol, dim } => {
                             let alpha = if dim { 0.4 } else { 1. };
                             c.symbol(symbol, x, y, BAR_ICON, c.p.ink, alpha)?;
@@ -553,6 +592,16 @@ impl Renderer {
                     }
                 }
                 let r = layout.clock;
+                if let Some(slot) = layout.close {
+                    c.symbol(
+                        Symbol::Close,
+                        dip(slot.x) + dip(slot.width) / 2.,
+                        h / 2.,
+                        BAR_ICON,
+                        c.p.ink,
+                        1.,
+                    )?;
+                }
                 c.text(
                     &self.write,
                     time,
@@ -564,7 +613,7 @@ impl Renderer {
             },
         )?;
         unsafe { self.top.root.SetContent(&surface)? };
-        self.place_mark(layout.height, dpi)?;
+        self.place_mark(layout.height, dpi, palette)?;
         unsafe { self.device.Commit()? };
         self.top_state = Some(state);
         Ok(())
@@ -572,8 +621,8 @@ impl Renderer {
 
     /// Paints the DeskIsle mark, a ring as round as the controls beside it, onto its own
     /// layer above the bar. The layer is kept while the bar's height, DPI and palette are.
-    fn place_mark(&mut self, height: i32, dpi: u32) -> Result<()> {
-        let key = (height, dpi, self.palette);
+    fn place_mark(&mut self, height: i32, dpi: u32, palette: Palette) -> Result<()> {
+        let key = (height, dpi, palette);
         if self.mark.as_ref().is_some_and(|mark| mark.key == key) {
             return Ok(());
         }
@@ -584,7 +633,7 @@ impl Renderer {
         let top = (cy - MARK_BOX / 2. * s).floor();
         let (x, y) = (cx - left, cy - top);
         let edge = (MARK_BOX * s).ceil() as i32 + 1;
-        let surface = paint(&self.device, self.palette, edge, edge, dpi, |c| {
+        let surface = paint(&self.device, palette, edge, edge, dpi, |c| {
             c.ring(x / s, y / s, MARK_RADIUS, MARK_STROKE, c.p.accent)
         })?;
         unsafe {
@@ -670,7 +719,7 @@ impl Renderer {
             let w = width as f32 / s;
             let h = height as f32 / s;
             let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-                c.bar_glass(w, h, 18.)?;
+                c.bar_glass(Area::new(0., 0., w, h), 18.)?;
                 c.stroke(0., 0., w, h, 18., c.p.line, 0.16)
             })?;
             unsafe { self.bottom.root.SetContent(&surface)? };

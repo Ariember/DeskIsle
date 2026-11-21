@@ -10,7 +10,7 @@ use windows::Win32::{
 };
 use windows::core::{Result, w};
 
-use crate::settings::{Key, Settings};
+use crate::settings::{Key, Settings, TopBarBackground};
 use crate::ui::icon::{self, Paint, Step, Symbol, Tone};
 use crate::ui::panel::Area;
 
@@ -58,6 +58,36 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// Match the foreground of an opaque window-caption color (a Win32 COLORREF).
+    pub(super) fn for_top_bar(self, caption: Option<u32>) -> Self {
+        let Some(color) = caption else { return self };
+        let [r, g, b, _] = color.to_le_bytes();
+        let linear = |v: u8| {
+            let v = f32::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+        // Choose the higher contrast of black and white, including on saturated colors.
+        let (ink, danger) = if luminance > 0.179 {
+            ((0, 0, 0), (92, 0, 7))
+        } else {
+            ((255, 255, 255), (255, 220, 213))
+        };
+        Self {
+            bar: (r, g, b),
+            ink,
+            muted: ink,
+            line: ink,
+            accent: ink,
+            danger,
+            ..self
+        }
+    }
+
     pub fn new(dark: bool, settings: &Settings) -> Self {
         let typography = Typography {
             family: settings.get(Key::FontFamily),
@@ -343,16 +373,32 @@ impl Canvas {
         Ok(())
     }
 
-    pub(super) fn bar_glass(&self, w: f32, h: f32, radius: f32) -> Result<()> {
+    pub(super) fn bar_glass(&self, a: Area, radius: f32) -> Result<()> {
         self.gradient(
-            0.,
-            0.,
-            w,
-            h,
+            a.left,
+            a.top,
+            a.right,
+            a.bottom,
             radius,
             (self.p.panel_top, 0.74),
             (self.p.bar, 0.64),
         )
+    }
+
+    /// Shared by the live top bar and the three miniatures in settings.
+    pub(super) fn top_background(
+        &self,
+        area: Area,
+        style: TopBarBackground,
+        frosted: bool,
+    ) -> Result<()> {
+        let (l, t, r, b) = (area.left, area.top, area.right, area.bottom);
+        match style {
+            TopBarBackground::Frosted if frosted => self.fill(l, t, r, b, 0., self.p.bar, 0.23),
+            TopBarBackground::Frosted => self.round(l, t, r, b, 0., self.p.bar),
+            TopBarBackground::Transparent => Ok(()),
+            TopBarBackground::Tinted => self.bar_glass(area, 0.),
+        }
     }
 
     /// Runs `draw` with output limited to `rect`.
@@ -381,6 +427,39 @@ impl Canvas {
                 None,
                 None,
             );
+        }
+        Ok(())
+    }
+
+    pub(super) fn grayscale_bitmap(
+        &self,
+        bitmap: &IWICBitmapSource,
+        rect: D2D_RECT_F,
+    ) -> Result<()> {
+        unsafe {
+            let texture = self.ctx.CreateBitmapFromWicBitmap(bitmap, None)?;
+            let effect = self.ctx.CreateEffect(&CLSID_D2D1Grayscale)?;
+            effect.SetInput(0, &texture, true);
+            let image = effect.GetOutput()?;
+            let size = texture.GetSize();
+            let mut previous = Default::default();
+            self.ctx.GetTransform(&mut previous);
+            // Canvas rectangles already include the surface's pixel origin. Fit the
+            // filtered image to the same destination used for the original bitmap.
+            let mut transform = previous;
+            transform.M11 = (rect.right - rect.left) / size.width;
+            transform.M22 = (rect.bottom - rect.top) / size.height;
+            transform.M31 = rect.left;
+            transform.M32 = rect.top;
+            self.ctx.SetTransform(&transform);
+            self.ctx.DrawImage(
+                &image,
+                None,
+                None,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+            self.ctx.SetTransform(&previous);
         }
         Ok(())
     }

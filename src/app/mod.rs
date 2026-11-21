@@ -7,6 +7,7 @@ mod menus;
 mod monitor;
 mod settings;
 mod system;
+mod tray_drag;
 
 use std::collections::BTreeSet;
 
@@ -23,7 +24,7 @@ use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
 use crate::ui::layout::{
-    DockDrop, DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
+    DockDrop, DockHit, DockStyle, Layout, StatusHit, StatusLayout, SystemItem,
 };
 use crate::ui::system::SystemStatus;
 use immersion::DockExposure;
@@ -55,8 +56,15 @@ struct Bars {
     pins: Vec<PinnedApp>,
     apps: Vec<AppGroup>,
     foreground: Option<isize>,
+    maximized_window: Option<isize>,
+    top_window_color: Option<u32>,
+    /// Only close the window whose corner button received the original press.
+    close_press: Option<(String, isize)>,
     monitor: Monitor,
     top_rect: Rect,
+    /// Last acrylic request (dark or light), and whether DWM supplied the material.
+    top_glass_theme: Option<bool>,
+    top_glass: bool,
     /// Both bars step aside while a full-screen application covers their monitor.
     fullscreen: bool,
     /// What the shell last reported. It also reports the desktop as a full-screen
@@ -68,6 +76,8 @@ struct Bars {
     shown: Vec<usize>,
     /// Keys of tray icons the user moved into the overflow menu.
     hidden: BTreeSet<String>,
+    tray_order: Vec<String>,
+    tray_press: Option<tray_drag::TrayPress>,
     hover: Option<DockHit>,
     dock_press: Option<drag::DockPress>,
     dock_file_target: Option<DockDrop>,
@@ -101,8 +111,8 @@ fn applications(pins: &[PinnedApp]) -> Result<(Vec<AppGroup>, Option<isize>)> {
     ))
 }
 
-fn status_height(dpi: u32) -> i32 {
-    (STATUS_HEIGHT * dpi as i32 + 48) / 96
+fn status_height(settings: &Settings, dpi: u32) -> i32 {
+    (settings.get(Key::TopBarHeight) * dpi as i32 + 48) / 96
 }
 
 fn load_pins() -> Result<Vec<PinnedApp>> {
@@ -136,6 +146,10 @@ pub(crate) fn run() -> Result<()> {
         BTreeSet::new()
     });
     let mut settings = settings::load();
+    let tray_order = storage::load_tray_order().unwrap_or_else(|error| {
+        platform::report_error(None, &error);
+        Vec::new()
+    });
     let taskbar_shortcut =
         platform::TaskbarShortcut::register(top.0, settings.get(Key::TaskbarShortcut))
             .unwrap_or_else(|error| {
@@ -148,7 +162,7 @@ pub(crate) fn run() -> Result<()> {
     let mut native_taskbar = NativeTaskbar::default();
     let monitor = settings::primary_monitor(&settings)?;
     let mut appbar = AppBar::new(top.0);
-    let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi))?;
+    let top_rect = appbar.place(monitor.bounds, status_height(&settings, monitor.dpi))?;
     if settings.enabled(Key::HideTaskbar) {
         native_taskbar.hide()?;
     }
@@ -197,14 +211,29 @@ pub(crate) fn run() -> Result<()> {
         pins,
         apps,
         foreground,
-        status: StatusLayout::new(top_rect.width, top_rect.height, monitor.dpi, 0, 0, &[], &[]),
+        maximized_window: None,
+        top_window_color: None,
+        close_press: None,
+        status: StatusLayout::new(
+            (top_rect.width, top_rect.height),
+            monitor.dpi,
+            0,
+            0,
+            &[],
+            &[],
+            false,
+        ),
         monitor,
         top_rect,
+        top_glass_theme: None,
+        top_glass: false,
         fullscreen,
         shell_fullscreen: fullscreen,
         layout,
         shown: Vec::new(),
         hidden,
+        tray_order,
+        tray_press: None,
         hover: None,
         dock_press: None,
         dock_file_target: None,
@@ -220,13 +249,21 @@ pub(crate) fn run() -> Result<()> {
         tray_notice: None,
         swallow_click: false,
         settings,
-        system: system::status(Default::default()),
+        system: system::status(Default::default(), None),
         media: None,
         audio_watch,
         open_flyout: None,
         overflow_open: false,
         native_taskbar,
     };
+    if bars.settings.enabled(Key::ShowInputLanguageIcon)
+        && let Err(error) = bars.sync_input_indicator()
+    {
+        platform::report_error(Some(bars.top.0), &error);
+        bars.settings.set(Key::ShowInputLanguageIcon, 0);
+    }
+    bars.sync_top_backdrop();
+    bars.refresh_top_window(true);
     bars.apply_monitor_settings()?;
     bars.position()?;
     // Applications answer at once; the loop below receives their icons.
@@ -268,10 +305,15 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
+                let old_color = bars.top_window_color;
+                bars.refresh_top_window(true);
                 if bars.settings.theme() == crate::settings::Theme::Automatic {
                     bars.update_theme_from_desktop()?;
                 }
-                if bars.tray_notice.take().is_some() || bars.time != time {
+                if bars.tray_notice.take().is_some()
+                    || bars.time != time
+                    || bars.top_window_color != old_color
+                {
                     bars.time = time;
                     bars.draw()?;
                 }
@@ -279,6 +321,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh_system()?;
             }
             Event::TrayNoticeExpired => bars.clear_tray_notice()?,
+            Event::InputLanguage => bars.refresh_input_indicator()?,
             Event::TaskbarShortcut(id) if id == bars.settings.get(Key::TaskbarShortcut) => {
                 bars.toggle_taskbar()?;
             }
@@ -329,7 +372,14 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Move(hwnd, x, y) if hwnd == bars.top.0 => {
                 platform::track_leave(hwnd)?;
+                if let Some(press) = &mut bars.tray_press {
+                    press.track(x, y);
+                }
                 bars.set_top_hover(Some(bars.status.hit(x, y)))?;
+            }
+            Event::CancelPress(hwnd) if hwnd == bars.top.0 => {
+                bars.cancel_close_press();
+                bars.cancel_tray_drag();
             }
             Event::Leave(hwnd) if hwnd == bars.bottom.0 => {
                 bars.leave_dock()?;
@@ -360,7 +410,18 @@ pub(crate) fn run() -> Result<()> {
                 right,
                 double,
             } => {
+                bars.cancel_tray_drag();
+                bars.cancel_close_press();
                 bars.swallow_click = false;
+                if owner == bars.top.0
+                    && !right
+                    && bars.status.hit(x, y) == StatusHit::CloseMaximized
+                    && let Some(id) = bars.maximized_window
+                    && let Some(app) = bars.apps.iter().find(|app| app.active)
+                {
+                    bars.top.capture();
+                    bars.close_press = Some((app.app_id.clone(), id));
+                }
                 bars.cancel_dock_press()?;
                 if owner == bars.bottom.0 {
                     bars.set_hover(None)?;
@@ -371,14 +432,31 @@ pub(crate) fn run() -> Result<()> {
                 if owner == bars.top.0
                     && let StatusHit::Tray(slot) = bars.status.hit(x, y)
                 {
-                    bars.tray_pointer(slot, TrayInput::Press { right, double }, x, y)?;
+                    if !right && !bars.settings.enabled(Key::LockTrayIcons) {
+                        bars.press_tray(slot, x, y, double);
+                    } else {
+                        bars.tray_pointer(slot, TrayInput::Press { right, double }, x, y)?;
+                    }
                 } else {
                     bars.tray.cancel_click();
                 }
             }
             Event::Click(..) if bars.swallow_click => bars.swallow_click = false,
+            Event::Click(owner, x, y) if owner == bars.top.0 && bars.tray_press.is_some() => {
+                bars.release_tray(x, y)?;
+            }
             Event::Click(owner, x, y) if owner == bars.top.0 => {
+                if let Some((app, id)) = bars.close_press.take() {
+                    bars.top.release();
+                    if bars.status.hit(x, y) == StatusHit::CloseMaximized
+                        && bars.maximized_foreground() == Some(id)
+                    {
+                        bars.run_command(crate::ui::menu::Command::CloseWindow(app, id))?;
+                    }
+                    continue;
+                }
                 let quit = match bars.status.hit(x, y) {
+                    StatusHit::CloseMaximized => false,
                     StatusHit::Tray(slot) => {
                         bars.tray_pointer(slot, TrayInput::Release { right: false }, x, y)?;
                         false
@@ -418,6 +496,46 @@ pub(crate) fn run() -> Result<()> {
 }
 
 impl Bars {
+    fn cancel_close_press(&mut self) {
+        if self.close_press.take().is_some() {
+            self.top.release();
+            self.swallow_click = true;
+        }
+    }
+
+    fn maximized_foreground(&self) -> Option<isize> {
+        let id = self.foreground?;
+        let hwnd = platform::foreground();
+        (hwnd.0 as isize == id
+            && self.apps.iter().any(|app| app.active)
+            && platform::maximized_on_primary(hwnd))
+        .then_some(id)
+    }
+
+    fn refresh_top_window(&mut self, refresh_color: bool) {
+        let immersive = self.settings.enabled(Key::TopBarImmersive);
+        let close = self.settings.enabled(Key::TopBarCloseMaximized);
+        let window = if immersive || close {
+            self.maximized_foreground()
+        } else {
+            None
+        };
+        if !close || window != self.maximized_window {
+            self.cancel_close_press();
+        }
+        if !immersive {
+            self.top_window_color = None;
+        } else if refresh_color || window != self.maximized_window {
+            self.top_window_color = window
+                .and_then(|id| platform::top_window_color(id, self.top_rect, self.monitor.dpi));
+        }
+        self.maximized_window = window;
+        if self.status.close.is_some() != (close && window.is_some()) {
+            self.top_hover = None;
+            self.restatus();
+        }
+    }
+
     /// Whether the foreground window is an application covering the bars' monitor.
     /// The desktop is not in the window snapshot, so it never qualifies.
     fn fullscreen_app(&self) -> bool {
@@ -442,6 +560,7 @@ impl Bars {
         }
         self.position()?;
         if fullscreen {
+            self.cancel_tray_drag();
             self.cancel_dock_press()?;
             self.hide_idle_dock()?;
             self.set_dock_file_target(None)?;
@@ -473,6 +592,7 @@ impl Bars {
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
     /// asks or the monitor changed, since each negotiation changes the work area again.
     fn display(&mut self, replace: bool) -> Result<()> {
+        self.cancel_tray_drag();
         self.tray.cancel_click();
         let monitor = settings::primary_monitor(&self.settings)?;
         let replace =
@@ -480,7 +600,7 @@ impl Bars {
         if replace {
             self.top_rect = self.tray.with_explorer_taskbar(|| {
                 self.appbar
-                    .place(monitor.bounds, status_height(monitor.dpi))
+                    .place(monitor.bounds, status_height(&self.settings, monitor.dpi))
             })?;
             // Only undo a bottom reservation that appeared during this negotiation.
             // A previously occupied strip can belong to another desktop utility.
@@ -490,6 +610,7 @@ impl Bars {
         }
         self.monitor = settings::primary_monitor(&self.settings)?;
         (self.apps, self.foreground) = applications(&self.pins)?;
+        self.refresh_top_window(true);
         self.restatus();
         if !self.relayout(self.layout.first)? {
             self.update_preview();
@@ -544,14 +665,22 @@ impl Bars {
         self.shown = (0..icons.len())
             .filter(|&i| icons[i].visible() && !self.hidden.contains(&icons[i].key))
             .collect();
+        if !self.tray_order.is_empty() {
+            self.shown.sort_by_cached_key(|&i| {
+                self.tray_order
+                    .iter()
+                    .position(|k| k == &icons[i].key)
+                    .unwrap_or(usize::MAX)
+            });
+        }
         self.status = StatusLayout::new(
-            self.top_rect.width,
-            self.top_rect.height,
+            (self.top_rect.width, self.top_rect.height),
             self.monitor.dpi,
             self.shown.len(),
             visible,
-            &self.system.items(),
+            &self.system.items(&self.settings),
             &self.indicators,
+            self.settings.enabled(Key::TopBarCloseMaximized) && self.maximized_window.is_some(),
         );
         self.publish_tray_rects();
         self.sync_sampling();
@@ -574,8 +703,8 @@ impl Bars {
                     return None;
                 }
                 let rect = on_bar
-                    .binary_search(&index)
-                    .ok()
+                    .iter()
+                    .position(|&shown| shown == index)
                     .map(|slot| self.status.tray[slot].rect)
                     .or(self.status.overflow)?;
                 Some((
@@ -686,6 +815,7 @@ impl Bars {
                 self.update_preview();
             }
         }
+        self.refresh_top_window(false);
         self.draw()
     }
 
@@ -808,6 +938,8 @@ impl Bars {
                 .or(self.overflow_open.then_some(StatusHit::Overflow)),
             self.top_hover,
             &self.indicators,
+            self.top_glass,
+            self.top_window_color,
         )?;
         let insertion = match self.dock_file_target {
             Some(DockDrop::Insert(at)) => Some(self.layout.insertion_preview(at)),

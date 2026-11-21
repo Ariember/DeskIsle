@@ -35,7 +35,7 @@ impl Bars {
                 },
                 // A left click on the mark opens the system menu; a right click keeps
                 // DeskIsle's own menu with Settings and Quit.
-                StatusHit::Mark | StatusHit::Bar => self.bar_menu(),
+                StatusHit::Mark | StatusHit::Bar | StatusHit::CloseMaximized => self.bar_menu(),
             };
         }
         if owner != self.bottom.0 {
@@ -146,12 +146,12 @@ impl Bars {
     /// overflow button while the icon is not on the bar.
     pub(super) fn tray_anchor(&self, index: usize) -> Result<Anchor> {
         let on_bar = &self.shown[..self.status.tray.len()];
-        match on_bar.binary_search(&index) {
-            Ok(slot) => {
+        match on_bar.iter().position(|&shown| shown == index) {
+            Some(slot) => {
                 let rect = self.status.tray[slot].rect;
                 Ok(self.top_anchor(rect.x + rect.width / 2))
             }
-            Err(_) => self.tray_overflow_anchor(),
+            None => self.tray_overflow_anchor(),
         }
     }
 
@@ -523,7 +523,8 @@ impl Bars {
                     }
                 }
                 // A dragged volume slider sends one per step; the latest state is enough.
-                event @ (Event::Audio | Event::Power) if held.contains(&event) => {}
+                event @ (Event::Audio | Event::Power | Event::InputLanguage)
+                    if held.contains(&event) => {}
                 event => held.push(event),
             }
             if let Some((index, value, done)) = slide {
@@ -611,7 +612,7 @@ impl Bars {
                 && drag.is_none()
                 && let Some(item) = flyout
             {
-                rebuilt = Some(self.flyout_menu(item));
+                rebuilt = self.flyout_menu(item);
                 refresh_flyout = false;
             }
             if let Some(mut next) = rebuilt {

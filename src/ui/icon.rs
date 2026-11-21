@@ -22,6 +22,7 @@ pub enum Symbol {
     Muted,
     /// Two switches, the control center's mark.
     Controls,
+    Keyboard,
     /// The tray overflow button while its menu is closed: more icons below.
     ChevronDown,
     /// The tray overflow button while its menu is open.
@@ -141,6 +142,15 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
     use Paint::{Fill, Stroke};
     let mut s = Sketch(Vec::new());
     match symbol {
+        Symbol::Keyboard => {
+            s.rect(1.75, 5., 22.25, 19., 2.5, Stroke);
+            for y in [9., 12.] {
+                for x in [6., 10., 14., 18.] {
+                    s.circle(x, y, 0.9, Fill);
+                }
+            }
+            s.line(&[(7.5, 15.5), (16.5, 15.5)]);
+        }
         Symbol::Search => {
             s.circle(10., 10., 6.5, Stroke);
             s.line(&[(15., 15.), (20.5, 20.5)]);
@@ -878,6 +888,7 @@ mod tests {
         Symbol::Check,
         Symbol::Apps,
         Symbol::Search,
+        Symbol::Keyboard,
         Symbol::Activity,
         Symbol::Desktop,
         Symbol::Power,

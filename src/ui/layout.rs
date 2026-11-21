@@ -251,12 +251,12 @@ impl Layout {
     }
 }
 
-/// Height of the full-width status bar in DIPs.
-pub const STATUS_HEIGHT: i32 = 30;
-
 /// A system control on the status bar, between the tray and the clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemItem {
+    InputMethod,
+    InputLanguage,
+    Search,
     Network,
     Display,
     Battery,
@@ -278,6 +278,7 @@ impl SystemItem {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusHit {
+    CloseMaximized,
     Tray(usize),
     Overflow,
     System(SystemItem),
@@ -307,6 +308,7 @@ pub struct StatusLayout {
     /// System controls in display order.
     pub system: Vec<(SystemItem, Rect)>,
     pub clock: Rect,
+    pub close: Option<Rect>,
 }
 
 impl StatusLayout {
@@ -315,25 +317,28 @@ impl StatusLayout {
     /// `system` lists the system controls to show, in display order; they always fit
     /// before tray icons do.
     pub fn new(
-        width: i32,
-        height: i32,
+        size: (i32, i32),
         dpi: u32,
         shown: usize,
         total: usize,
         system: &[SystemItem],
         metrics: &[Indicator],
+        close_maximized: bool,
     ) -> Self {
         let px = scaled(dpi);
-        let width = width.max(1);
-        let height = height.max(1);
+        let width = size.0.max(1);
+        let height = size.1.max(1);
         let cell = |x, w| Rect {
             x,
             y: 0,
             width: w,
             height,
         };
-        let clock_width = px(48).min(width);
-        let clock = cell((width - px(10) - clock_width).max(0), clock_width);
+        let close_width = px(28).min(width);
+        let close = close_maximized.then(|| cell(width - close_width, close_width));
+        let clock_end = close.map_or(width - px(10), |r| r.x).max(0);
+        let clock_width = px(48).min(clock_end);
+        let clock = cell(clock_end - clock_width, clock_width);
         let slot = px(28).max(1);
         let widths = system
             .iter()
@@ -414,11 +419,14 @@ impl StatusLayout {
             metrics: metric_slots,
             system,
             clock,
+            close,
         }
     }
 
     pub fn hit(&self, x: i32, y: i32) -> StatusHit {
-        if let Some(slot) = self.tray.iter().find(|s| s.rect.contains(x, y)) {
+        if self.close.is_some_and(|r| r.contains(x, y)) {
+            StatusHit::CloseMaximized
+        } else if let Some(slot) = self.tray.iter().find(|s| s.rect.contains(x, y)) {
             StatusHit::Tray(slot.index)
         } else if self.overflow.is_some_and(|r| r.contains(x, y)) {
             StatusHit::Overflow
@@ -438,6 +446,7 @@ impl StatusLayout {
     /// The slot a hovered or open target highlights. The title and empty space have none.
     pub fn target(&self, hit: StatusHit) -> Option<Rect> {
         match hit {
+            StatusHit::CloseMaximized => self.close,
             StatusHit::Tray(index) => self.tray.get(index).map(|slot| slot.rect),
             StatusHit::Overflow => self.overflow,
             StatusHit::System(item) => {
@@ -454,6 +463,8 @@ impl StatusLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STATUS_HEIGHT: i32 = 30;
 
     #[test]
     fn offset_monitor_keeps_dock_centered_and_hit_edges_half_open() {
@@ -701,7 +712,7 @@ mod tests {
             let px = scaled(dpi);
             let (width, height) = (px(1920), px(STATUS_HEIGHT));
             let system = [SystemItem::Network, SystemItem::Sound, SystemItem::Control];
-            let layout = StatusLayout::new(width, height, dpi, 3, 5, &system, &[]);
+            let layout = StatusLayout::new((width, height), dpi, 3, 5, &system, &[], false);
             assert_eq!(layout.tray.len(), 3);
             let overflow = layout.overflow.unwrap();
             let last = layout.tray[2].rect;
@@ -735,12 +746,16 @@ mod tests {
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
             // A narrow bar moves icons into the overflow list but keeps the title area.
-            let narrow = StatusLayout::new(px(520), height, dpi, 40, 40, &system, &[]);
+            let close = StatusLayout::new((width, height), dpi, 3, 5, &system, &[], true);
+            assert_eq!(close.hit(width - 1, 0), StatusHit::CloseMaximized);
+            assert_eq!(close.hit(close.close.unwrap().x - 1, 0), StatusHit::Clock);
+            assert_eq!(layout.hit(width - 1, 0), StatusHit::Bar);
+            let narrow = StatusLayout::new((px(520), height), dpi, 40, 40, &system, &[], false);
             assert!(narrow.tray.len() < 40);
             assert!(narrow.tray[0].rect.x >= px(220));
             assert!(narrow.overflow.is_some());
         }
-        let empty = StatusLayout::new(800, 30, 96, 0, 0, &[], &[]);
+        let empty = StatusLayout::new((800, 30), 96, 0, 0, &[], &[], false);
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
         assert_eq!(empty.hit(700, 10), StatusHit::Title);
         assert_eq!(empty.hit(735, 10), StatusHit::Bar);
@@ -749,7 +764,7 @@ mod tests {
     #[test]
     fn battery_slot_has_room_for_its_charge_and_targets_highlight_slots() {
         let system = [SystemItem::Battery, SystemItem::Control];
-        let layout = StatusLayout::new(1920, 30, 96, 0, 0, &system, &[]);
+        let layout = StatusLayout::new((1920, 30), 96, 0, 0, &system, &[], false);
         let (battery, control) = (layout.system[0].1, layout.system[1].1);
         assert_eq!(battery.width, 60);
         assert_eq!(battery.x + battery.width, control.x);
@@ -772,13 +787,13 @@ mod tests {
             let px = scaled(dpi);
             let layout = |width, count| {
                 StatusLayout::new(
-                    px(width),
-                    px(STATUS_HEIGHT),
+                    (px(width), px(STATUS_HEIGHT)),
                     dpi,
                     count,
                     count,
                     &[SystemItem::Network, SystemItem::Sound],
                     &metrics,
+                    false,
                 )
             };
             let full = layout(1000, 5);

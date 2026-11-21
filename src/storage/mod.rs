@@ -93,6 +93,16 @@ pub fn save_hidden(hidden: &BTreeSet<String>) -> Result<()> {
     write_setting(HIDDEN_FILE, hidden.iter().map(String::as_str))
 }
 
+const TRAY_ORDER_FILE: &str = "tray-order.txt";
+
+pub fn load_tray_order() -> Result<Vec<String>> {
+    Ok(read_setting(TRAY_ORDER_FILE)?.unwrap_or_default())
+}
+
+pub fn save_tray_order(keys: &[String]) -> Result<()> {
+    write_setting(TRAY_ORDER_FILE, keys.iter().map(String::as_str))
+}
+
 const SETTINGS_FILE: &str = "settings.ini";
 
 /// Settings the user saved, or `None` before the first change. Lines read

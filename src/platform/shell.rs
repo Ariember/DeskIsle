@@ -127,6 +127,7 @@ thread_local! {
     // OUTOFCONTEXT callbacks run on the subscribing message-loop thread.
     static EVENT_TARGET: Cell<Option<HWND>> = const { Cell::new(None) };
     static CHANGE_POSTED: Cell<bool> = const { Cell::new(false) };
+    static MAXIMIZED_FOREGROUND: Cell<Option<HWND>> = const { Cell::new(None) };
 }
 
 pub struct WindowEvents {
@@ -138,6 +139,11 @@ impl WindowEvents {
         let mut hooks = Vec::new();
         for (first, last, flags) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0),
+            (
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                WINEVENT_SKIPOWNPROCESS,
+            ),
             (
                 EVENT_OBJECT_DESTROY,
                 EVENT_OBJECT_HIDE,
@@ -172,6 +178,8 @@ impl WindowEvents {
             hooks.push(unsafe { Owned::new(hook) });
         }
         EVENT_TARGET.set(Some(hwnd));
+        let foreground = super::foreground();
+        MAXIMIZED_FOREGROUND.set(super::maximized_on_primary(foreground).then_some(foreground));
         Ok(Self { _hooks: hooks })
     }
 
@@ -200,6 +208,19 @@ unsafe extern "system" fn window_event(
         && (hwnd.is_invalid() || object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32)
     {
         return;
+    }
+    if matches!(event, EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_FOREGROUND) {
+        if event == EVENT_OBJECT_LOCATIONCHANGE && hwnd != super::foreground() {
+            return;
+        }
+        let maximized = super::maximized_on_primary(hwnd).then_some(hwnd);
+        // Movement and resizing generate many notifications. Only a transition into
+        // or out of maximization on this monitor needs a new window snapshot.
+        if MAXIMIZED_FOREGROUND.replace(maximized) == maximized
+            && event == EVENT_OBJECT_LOCATIONCHANGE
+        {
+            return;
+        }
     }
     if matches!(
         event,

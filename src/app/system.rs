@@ -2,7 +2,8 @@
 //! flyouts and carrying out the changes chosen there.
 
 use super::Bars;
-use crate::platform::{audio, display, power, system_worker::Snapshot};
+use crate::platform::{audio, display, input, power, system_worker::Snapshot};
+use crate::settings::Key;
 use crate::system::{Display, Network};
 use crate::ui::layout::{StatusHit, SystemItem};
 use crate::ui::menu::{Command, Menu};
@@ -15,11 +16,12 @@ const NOTCH: i32 = 120;
 
 /// Queries what the status bar icons show. A feature whose query fails shows as
 /// unavailable until the next update rather than stopping DeskIsle.
-pub(super) fn status(network: Network) -> SystemStatus {
+pub(super) fn status(network: Network, input_language: Option<&'static str>) -> SystemStatus {
     SystemStatus {
         audio: audio::state().ok(),
         battery: power::battery().ok().flatten(),
         network,
+        input_language,
     }
 }
 
@@ -29,7 +31,7 @@ impl Bars {
         if self.system == status {
             return Ok(());
         }
-        let relayout = self.system.items() != status.items();
+        let relayout = self.system.items(&self.settings) != status.items(&self.settings);
         self.system = status;
         if relayout {
             self.restatus();
@@ -43,7 +45,32 @@ impl Bars {
 
     pub(super) fn refresh_system(&mut self) -> Result<()> {
         self.worker.refresh_network()?;
-        self.show_status(status(self.system.network.clone()))
+        self.show_status(status(
+            self.system.network.clone(),
+            self.system.input_language,
+        ))
+    }
+
+    pub(super) fn sync_input_indicator(&mut self) -> Result<()> {
+        let enabled = self.settings.enabled(Key::ShowInputLanguageIcon);
+        input::set_timer(self.top.0, enabled)?;
+        self.system.input_language = enabled.then(input::language).flatten();
+        Ok(())
+    }
+
+    pub(super) fn refresh_input_indicator(&mut self) -> Result<()> {
+        let language = if self.settings.enabled(Key::ShowInputLanguageIcon) {
+            input::language()
+        } else {
+            None
+        };
+        if self.system.input_language != language {
+            self.show_status(SystemStatus {
+                input_language: language,
+                ..self.system.clone()
+            })?;
+        }
+        Ok(())
     }
 
     pub(super) fn system_updated(&mut self, owner: HWND) -> Result<Option<SystemItem>> {
@@ -129,21 +156,21 @@ impl Bars {
     }
 
     /// The flyout of `item`, built from freshly queried state.
-    pub(super) fn flyout_menu(&mut self, item: SystemItem) -> Menu<Command> {
-        let mut status = self.system.clone();
-        status.audio = audio::state().ok();
-        if item == SystemItem::Battery {
-            status.battery = power::battery().ok().flatten();
-        }
-        match item {
-            SystemItem::Sound => system::sound_flyout(status.audio.as_ref()),
+    pub(super) fn flyout_menu(&mut self, item: SystemItem) -> Option<Menu<Command>> {
+        Some(match item {
+            SystemItem::Sound => system::sound_flyout(audio::state().ok().as_ref()),
             // A failed query lists no plans; the settings links still work.
-            SystemItem::Battery => {
-                system::battery_flyout(status.battery, &power::plans().unwrap_or_default())
-            }
+            SystemItem::Battery => system::battery_flyout(
+                power::battery().ok().flatten(),
+                &power::plans().unwrap_or_default(),
+            ),
             SystemItem::Display => system::display_flyout(&display::state()),
-            SystemItem::Network => system::network_flyout(&status.network),
+            SystemItem::Network => system::network_flyout(&self.system.network),
             SystemItem::Control => {
+                let status = SystemStatus {
+                    audio: audio::state().ok(),
+                    ..self.system.clone()
+                };
                 let display = Display {
                     brightness: display::brightness(),
                     dark: display::system_dark().unwrap_or(false),
@@ -151,7 +178,10 @@ impl Bars {
                 };
                 system::control_flyout(&status, &display, self.media.as_ref())
             }
-        }
+            SystemItem::InputMethod | SystemItem::InputLanguage | SystemItem::Search => {
+                return None;
+            }
+        })
     }
 
     /// Opens the flyout of a status bar control, with the control highlighted meanwhile.
@@ -166,7 +196,15 @@ impl Bars {
         if matches!(item, SystemItem::Sound | SystemItem::Control) {
             self.watch_audio();
         }
-        let menu = self.flyout_menu(item);
+        let Some(menu) = self.flyout_menu(item) else {
+            if item == SystemItem::Search {
+                if let Err(error) = self.open_launchpad() {
+                    crate::platform::report_error(Some(self.top.0), &error);
+                }
+                return Ok(false);
+            }
+            return self.run_command(Command::Open(system::settings_page(item)));
+        };
         let anchor = match self.status.system.iter().find(|(i, _)| *i == item) {
             Some((_, r)) => self.top_anchor(r.x + r.width / 2),
             None => self.cursor_anchor()?,
