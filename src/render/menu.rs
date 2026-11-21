@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use windows::Win32::{
-    Foundation::HWND,
+    Foundation::{HWND, RECT},
     Graphics::{DirectComposition::*, DirectWrite::*},
     UI::WindowsAndMessaging::HICON,
 };
@@ -13,7 +13,7 @@ use crate::ui::menu::{self, Calendar, Entry, Icon, Menu, MenuLayout, Slider};
 use crate::ui::panel::Area;
 use crate::ui::system::PLAYER_SYMBOL;
 
-use super::canvas::{Canvas, Rgb, Text, paint, text_format};
+use super::canvas::{Canvas, Rgb, Text, paint, paint_region, text_format};
 use super::{Renderer, ease};
 
 /// The panel's corner radius. The highlight inside it, inset by the panel padding,
@@ -47,6 +47,7 @@ pub(super) struct MenuView {
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     _root: IDCompositionVisual2,
+    content: IDCompositionSurface,
     glow: IDCompositionVisual2,
     glow_fade: IDCompositionEffectGroup,
     accent: IDCompositionSurface,
@@ -221,6 +222,7 @@ impl Renderer {
             self.menu = Some(MenuView {
                 _target: target,
                 _root: root,
+                content,
                 glow,
                 glow_fade,
                 accent,
@@ -235,6 +237,38 @@ impl Renderer {
             });
         }
         Ok(())
+    }
+
+    /// Updates changed rows on the existing content surface, preserving the open
+    /// menu and its highlight. Device recovery may have released the menu view.
+    pub fn update_tray_rows<C>(
+        &self,
+        menu: &Menu<C>,
+        layout: &MenuLayout,
+        dpi: u32,
+        tray: &dyn Fn(usize) -> Option<HICON>,
+        rows: &[usize],
+    ) -> Result<bool> {
+        let Some(view) = &self.menu else {
+            return Ok(false);
+        };
+        let (width, _) = layout.pixels();
+        for &index in rows {
+            let (top, bottom) = layout.rows[index];
+            let rect = RECT {
+                left: 0,
+                top: (top * layout.scale).round() as i32,
+                right: width,
+                bottom: (bottom * layout.scale).round() as i32,
+            };
+            paint_region(&view.content, self.palette, rect, dpi, |c| {
+                self.paint_entry(c, &menu.entries[index], layout, index, tray)
+            })?;
+        }
+        if !rows.is_empty() {
+            unsafe { self.device.Commit()? };
+        }
+        Ok(true)
     }
 
     /// A slider's track, fill, knob and icon, `(width, height, dpi)` in size.
@@ -624,7 +658,7 @@ impl Renderer {
                     Icon::Window { active } => {
                         self.badge(c, WINDOW_SYMBOL, icon_x, middle, ICON_BADGE, *active)?;
                     }
-                    Icon::Tray { index, on } => {
+                    Icon::Tray { index, on, .. } => {
                         self.tray_badge(c, tray(*index), icon_x, middle, *on)?;
                     }
                     icon => {

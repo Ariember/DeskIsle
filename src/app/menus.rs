@@ -116,6 +116,7 @@ impl Bars {
             .filter(|(_, icon)| icon.visible())
             .map(|(index, icon)| TrayEntry {
                 index,
+                stamp: icon.stamp,
                 label: &icon.name,
                 status: &icon.label,
                 can_interact: icon.can_interact(),
@@ -238,6 +239,30 @@ impl Bars {
             renderer.close_menu();
         }
         result
+    }
+
+    /// Returns whether replacing the menu layers also reset the hover highlight.
+    fn refresh_menu(
+        &mut self,
+        window: &MenuWindow,
+        anchor: Anchor,
+        current: &Menu<Command>,
+        next: &mut Menu<Command>,
+        layout: &mut MenuLayout,
+    ) -> Result<bool> {
+        if self.overflow_open
+            && let Some(rows) = current.changed_tray_rows(next)
+        {
+            let renderer = self.renderer.as_ref().expect("renderer bound to bars");
+            let resolve = |index: usize| self.tray.icons().get(index).and_then(|icon| icon.icon());
+            if renderer.update_tray_rows(next, layout, self.monitor.dpi, &resolve, &rows)? {
+                return Ok(false);
+            }
+        }
+        *layout = self.menu_layout(next);
+        window.place(layout.place(anchor, self.monitor.bounds));
+        self.paint_menu(window, next, layout, false)?;
+        Ok(true)
     }
 
     /// Runs the menu until the user chooses, dismisses or clicks elsewhere. Bar events
@@ -576,19 +601,20 @@ impl Bars {
                 rebuilt = Some(self.flyout_menu(item));
                 refresh_flyout = false;
             }
-            if let Some(next) = rebuilt {
+            if let Some(mut next) = rebuilt {
+                match self.refresh_menu(&window, anchor, &menu, &mut next, &mut layout) {
+                    Ok(true) => hover = None,
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break None;
+                    }
+                }
                 menu = next;
-                layout = self.menu_layout(&mut menu);
-                window.place(layout.place(anchor, self.monitor.bounds));
                 target = target.filter(|&focus| match focus {
                     Focus::Slider(i) => matches!(menu.entries.get(i), Some(menu::Entry::Slider(s)) if s.value.is_some()),
                     _ => menu.focused_command(focus).is_some(),
                 });
-                hover = None;
-                if let Err(error) = self.paint_menu(&window, &menu, &layout, false) {
-                    failure = Some(error);
-                    break None;
-                }
             }
             if target != hover {
                 let danger = matches!(target, Some(Focus::Item(i)) if matches!(&menu.entries[i], menu::Entry::Item(item) if item.danger));
