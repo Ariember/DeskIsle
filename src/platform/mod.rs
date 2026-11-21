@@ -7,6 +7,7 @@ pub mod media;
 pub mod metrics;
 pub mod network;
 pub mod power;
+pub mod preview;
 pub mod shell;
 pub mod startup;
 pub mod system_worker;
@@ -117,6 +118,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         }
         launchpad::register_class(instance, wc.hCursor)?;
         about::register_class(instance, wc.hCursor)?;
+        preview::register_class(instance)?;
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -358,7 +360,7 @@ pub enum Event {
     TrayNoticeExpired,
     MetricsUpdate,
     Move(HWND, i32, i32),
-    Leave,
+    Leave(HWND),
     Click(HWND, i32, i32),
     RightClick(HWND, i32, i32),
     /// The middle button was released over a bar, in its client pixels.
@@ -486,7 +488,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => Event::Move(hwnd, x, y),
-        windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave,
+        windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::Leave(hwnd),
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => Event::Press {
             owner: hwnd,
             x,

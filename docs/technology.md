@@ -13,6 +13,8 @@ DeskIsle 是面向 Windows 的桌面美化工具。首个开发目标是常驻 D
 | 系统控制 | Core Audio、`IPolicyConfig`、Power、Shutdown（睡眠、重启、关机、注销与锁屏）、DDC/CI 与 DisplayConfig；WinRT 的 `Windows.Devices.Radios`、`Windows.Networking.Connectivity` 和 `Windows.Media.Control` | 这些接口都通过已有的 `windows` 依赖调用，无需安装额外运行时。WinRT 异步操作在 UI 线程上用 `join` 等待结果，只在用户打开面板或执行操作时调用。COM 回调和自定义接口需要 `implement`、`interface` 宏，因此直接依赖 `windows-core`，其版本已在 `Cargo.lock` 中。代价是 `IPolicyConfig` 没有公开文档，亮度只支持 DDC/CI 显示器。 |
 | 状态栏与托盘 | `SHAppBarMessage` 预留顶部条带；同类名 `Shell_TrayWnd` 宿主接收并转发托盘通知 | 只有 AppBar 能让最大化窗口避开全宽状态栏。Windows 11 的托盘由 XAML 绘制。启动时从 Explorer 的 `NotifyIconSettings` 缓存寻找候选项，按当前窗口或 GUID 查询 Shell 确认图标仍在托盘。缓存格式由 Explorer 管理，缺少缓存时依靠应用重新注册。宿主持续接收实时图标和点击回调。代价是其他按类名查找任务栏的工具可能先找到 DeskIsle 的窗口，因此宿主使用顶部栏矩形，回答已布局图标的位置查询，并把其余任务栏请求转发给 Explorer。进程意外终止时，Explorer 可能暂时保留预留的条带。[AppBar 说明](https://learn.microsoft.com/en-us/windows/win32/shell/application-desktop-toolbars) |
 
+Dock 悬停预览通过现有的 `windows` 依赖调用 DWM 缩略图接口，由桌面合成器将源窗口内容绘制到预览窗口。DeskIsle 在显示期间持有注册句柄，关闭预览时释放。缩略图内容取决于 Windows 能为源窗口提供的画面。
+
 ## 资源监控采样
 
 DeskIsle 以普通用户权限在后台读取整机指标。单处理器组使用 `GetSystemTimes` 的连续读数计算 CPU 忙碌时间比例，多处理器组使用 PDH 的整机 CPU 计数器。内存使用 `GlobalMemoryStatusEx`，磁盘活动取物理磁盘总计数器的空闲时间补数。PDH 使用英文计数器路径，由系统处理本地化名称。速率类指标取得基线和下一次读数后才显示百分比。

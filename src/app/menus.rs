@@ -251,6 +251,7 @@ impl Bars {
         anchor: Anchor,
         flyout: Option<SystemItem>,
     ) -> Result<Option<Command>> {
+        self.set_hover(None)?;
         self.tray.cancel_click();
         let mut layout = self.menu_layout(&mut menu);
         let window = MenuWindow::create(layout.place(anchor, self.monitor.bounds))?;

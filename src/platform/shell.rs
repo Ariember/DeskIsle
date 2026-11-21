@@ -201,7 +201,7 @@ pub(super) fn process_path(pid: u32) -> Result<PathBuf> {
     }
 }
 
-fn window_info(hwnd: HWND) -> Result<Option<WindowInfo>> {
+pub(super) fn window_info(hwnd: HWND) -> Result<Option<WindowInfo>> {
     unsafe {
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));

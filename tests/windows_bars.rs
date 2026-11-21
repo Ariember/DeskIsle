@@ -5,12 +5,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BLACK_BRUSH, FillRect, GdiFlush, GetDC, GetPixel, GetStockObject, HBRUSH, ReleaseDC,
+    WHITE_BRUSH,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IPersistFile,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
 };
@@ -18,16 +25,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
-    GWL_EXSTYLE, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA,
-    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_OVERLAPPEDWINDOW,
+    GWL_EXSTYLE, GetClientRect, GetCursorPos, GetShellWindow, GetSystemMetrics, GetWindowLongW,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, IsZoomed, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG,
+    SPI_GETWORKAREA, SPI_SETWORKAREA, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SendMessageTimeoutW, SetCursorPos, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP,
+    WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{BOOL, HSTRING, Interface, w};
+use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
 struct TestProfile(PathBuf);
 
@@ -50,6 +57,7 @@ impl Drop for TestProfile {
         let _ = fs::remove_file(self.0.join("启动测试.lnk"));
         let _ = fs::remove_file(self.0.join("launched.txt"));
         let _ = fs::remove_file(self.0.join("DeskIsle/launchpad.txt"));
+        let _ = fs::remove_file(self.0.join("DeskIsle/pins.txt"));
         let _ = fs::remove_dir(self.0.join("DeskIsle"));
         let _ = fs::remove_dir(&self.0);
     }
@@ -237,6 +245,7 @@ struct Bars {
     dock: Option<HWND>,
     menu: Option<HWND>,
     launchpad: Option<HWND>,
+    preview: Option<HWND>,
 }
 
 impl Bars {
@@ -247,6 +256,7 @@ impl Bars {
             dock: None,
             menu: None,
             launchpad: None,
+            preview: None,
         };
         unsafe { EnumWindows(Some(find_bar), LPARAM((&raw mut bars) as isize)) }.unwrap();
         bars
@@ -266,6 +276,7 @@ unsafe extern "system" fn find_bar(hwnd: HWND, data: LPARAM) -> BOOL {
             "DeskIsle Dock" => bars.dock = Some(hwnd),
             "DeskIsle Menu" => bars.menu = Some(hwnd),
             "DeskIsle 启动台" => bars.launchpad = Some(hwnd),
+            "DeskIsle Preview" => bars.preview = Some(hwnd),
             _ => {}
         }
     }
@@ -278,6 +289,79 @@ fn send_to_child(pid: u32, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
     assert_eq!(owner, pid, "target window no longer belongs to our child");
     let sent = unsafe { SendMessageTimeoutW(hwnd, msg, wp, lp, SMTO_ABORTIFHUNG, 2000, None) };
     assert_ne!(sent.0, 0, "child did not process message {msg:#x}");
+}
+
+fn hovering_the_probe_shows_its_preview(pid: u32, dock: HWND, probe: HWND) {
+    struct SavedCursor(POINT);
+    impl Drop for SavedCursor {
+        fn drop(&mut self) {
+            let _ = unsafe { SetCursorPos(self.0.x, self.0.y) };
+        }
+    }
+
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.unwrap();
+    let _saved = SavedCursor(point);
+    let rect = window_rect(dock);
+    let dpi = unsafe { GetDpiForWindow(dock) } as i32;
+    // The probe is the first pinned app, one 52-DIP slot after the launchpad.
+    let x = rect.left + (84 * dpi + 48) / 96;
+    let y = (rect.top + rect.bottom) / 2;
+    unsafe { SetCursorPos(x, y) }.unwrap();
+    wait_until(
+        "hovering the pinned test window did not show its preview",
+        || {
+            Bars::visible_for(pid)
+                .preview
+                .is_some_and(|hwnd| window_rect(hwnd).bottom <= rect.top)
+        },
+    );
+    // Change only the middle of the source. A blank host or a static image cannot
+    // reproduce both colors at the center of the thumbnail above the Dock.
+    let mut client = RECT::default();
+    unsafe { GetClientRect(probe, &mut client) }.unwrap();
+    let patch = RECT {
+        left: client.right / 3,
+        right: client.right * 2 / 3,
+        top: client.bottom / 3,
+        bottom: client.bottom * 2 / 3,
+    };
+    let preview = window_rect(Bars::visible_for(pid).preview.unwrap());
+    for brush in [WHITE_BRUSH, BLACK_BRUSH] {
+        unsafe {
+            let dc = GetDC(Some(probe));
+            let filled = FillRect(dc, &patch, HBRUSH(GetStockObject(brush).0));
+            let _ = GdiFlush();
+            ReleaseDC(Some(probe), dc);
+            assert_ne!(filled, 0);
+        }
+        wait_until(
+            "preview did not reproduce the source window's color change",
+            || {
+                let pixel = unsafe {
+                    let dc = GetDC(None);
+                    let color = GetPixel(
+                        dc,
+                        (preview.left + preview.right) / 2,
+                        (preview.top + preview.bottom) / 2,
+                    );
+                    ReleaseDC(None, dc);
+                    color.0
+                };
+                let [r, g, b, _] = pixel.to_le_bytes();
+                pixel != u32::MAX
+                    && if brush == WHITE_BRUSH {
+                        r.min(g).min(b) >= 215
+                    } else {
+                        r.max(g).max(b) <= 40
+                    }
+            },
+        );
+    }
+    unsafe { SetCursorPos(x, rect.top - 1) }.unwrap();
+    wait_until("moving off the Dock did not hide the preview", || {
+        Bars::visible_for(pid).preview.is_none()
+    });
 }
 
 fn launchpad_reopens_saved_shortcut(pid: u32, dock: HWND, profile: &Path) {
@@ -387,6 +471,23 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     let initial = window_rect(probe.0);
 
     let profile = TestProfile::new();
+    // Pin the probe using the same Win32 image path that the Dock sees on enumeration.
+    let mut executable = vec![0; 32768];
+    let mut len = executable.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            GetCurrentProcess(),
+            PROCESS_NAME_WIN32,
+            PWSTR(executable.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .unwrap();
+    fs::write(
+        profile.0.join("DeskIsle/pins.txt"),
+        String::from_utf16(&executable[..len as usize]).unwrap(),
+    )
+    .unwrap();
     let mut app = TestInstance::start(&profile.0);
     let (status, dock) = app.wait_for_bars();
 
@@ -463,6 +564,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
         assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "bar can take focus");
     }
     let pid = app.0.id();
+    hovering_the_probe_shows_its_preview(pid, dock, probe.0);
     launchpad_reopens_saved_shortcut(pid, dock, &profile.0);
     // Send Explorer's AppBar notification to the window that registered for it.
     let fullscreen = |open| {

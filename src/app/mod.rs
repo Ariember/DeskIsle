@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
+use crate::platform::preview::PreviewWindow;
 use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::{TrayHost, TrayInput};
@@ -60,6 +61,7 @@ struct Bars {
     /// Keys of tray icons the user moved into the overflow menu.
     hidden: BTreeSet<String>,
     hover: Option<DockHit>,
+    preview: Option<PreviewWindow>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
     /// Wheel movement over the sound icon not yet turned into a volume step.
@@ -178,6 +180,7 @@ pub(crate) fn run() -> Result<()> {
         shown: Vec::new(),
         hidden,
         hover: None,
+        preview: None,
         top_hover: None,
         wheel: 0,
         time,
@@ -267,10 +270,8 @@ pub(crate) fn run() -> Result<()> {
                 platform::track_leave(hwnd)?;
                 bars.set_top_hover(Some(bars.status.hit(x, y)))?;
             }
-            Event::Leave => {
-                bars.set_hover(None)?;
-                bars.set_top_hover(None)?;
-            }
+            Event::Leave(hwnd) if hwnd == bars.bottom.0 => bars.set_hover(None)?,
+            Event::Leave(hwnd) if hwnd == bars.top.0 => bars.set_top_hover(None)?,
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
                 bars.scroll_status(delta, x, y)?;
             }
@@ -292,6 +293,9 @@ pub(crate) fn run() -> Result<()> {
                 double,
             } => {
                 bars.swallow_click = false;
+                if owner == bars.bottom.0 {
+                    bars.set_hover(None)?;
+                }
                 if owner == bars.top.0
                     && let StatusHit::Tray(slot) = bars.status.hit(x, y)
                 {
@@ -382,7 +386,9 @@ impl Bars {
         self.monitor = platform::monitor()?;
         (self.apps, self.foreground) = applications(&self.pins)?;
         self.restatus();
-        self.relayout(self.layout.first)?;
+        if !self.relayout(self.layout.first)? {
+            self.update_preview();
+        }
         self.position()?;
         self.time = platform::clock(self.top.0)?;
         // Windows announces a change of its app mode as a setting change.
@@ -405,9 +411,17 @@ impl Bars {
         }
         let moved = layout.bottom != self.layout.bottom;
         self.layout = layout;
-        self.hover = None;
         if moved {
             self.bottom.position(self.layout.bottom, !self.fullscreen)?;
+        }
+        if self.hover.is_some() {
+            self.hover = platform::cursor().ok().and_then(|point| {
+                self.layout.hit(
+                    point.x - self.layout.bottom.x,
+                    point.y - self.layout.bottom.y,
+                )
+            });
+            self.update_preview();
         }
         Ok(true)
     }
@@ -543,18 +557,60 @@ impl Bars {
         let (apps, foreground) = applications(&self.pins)?;
         self.foreground = foreground;
         if self.apps != apps {
+            let sources_changed = if let Some(DockHit::App(i)) = self.hover {
+                apps.get(i).is_none_or(|new| {
+                    let old = &self.apps[i];
+                    new.app_id != old.app_id
+                        || new
+                            .windows
+                            .iter()
+                            .map(|w| w.id)
+                            .ne(old.windows.iter().map(|w| w.id))
+                })
+            } else {
+                false
+            };
             self.apps = apps;
-            self.relayout(self.layout.first)?;
+            if !self.relayout(self.layout.first)? && sources_changed {
+                self.update_preview();
+            }
         }
         self.draw()
     }
 
     fn set_hover(&mut self, hit: Option<DockHit>) -> Result<()> {
+        let hit = hit.filter(|_| !self.fullscreen);
         if self.hover != hit {
             self.hover = hit;
+            self.update_preview();
             self.draw()?;
         }
         Ok(())
+    }
+
+    fn update_preview(&mut self) {
+        self.preview = None;
+        let Some(DockHit::App(index)) = self.hover else {
+            return;
+        };
+        let windows = &self.apps[index].windows;
+        if windows.is_empty() {
+            return;
+        }
+        let anchor = self.icon_anchor(index);
+        match PreviewWindow::show(
+            windows,
+            anchor.x,
+            anchor.y,
+            self.monitor.work,
+            self.monitor.dpi,
+        ) {
+            Ok(preview) => self.preview = preview,
+            Err(error) => {
+                self.tray_notice = Some(format!("窗口预览不可用（{}）", error.code()));
+                platform::time_tray_notice(self.top.0);
+            }
+        }
     }
 
     /// Highlights the status bar target under the pointer. The title and empty space

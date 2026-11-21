@@ -299,9 +299,9 @@ pub const TEXT_INSET: f32 = 12.;
 pub const LABEL_SIZE: f32 = 13.;
 pub const DETAIL_SIZE: f32 = 12.;
 pub const TITLE_SIZE: f32 = 14.;
-/// Width shared by every menu: the status bar's flyouts, clock, tray overflow and
-/// DeskIsle menu, and the application menus of the Dock and the status bar title.
+/// Standard width for status bar flyouts and application menus, in DIPs.
 pub const DROPDOWN_WIDTH: f32 = 320.;
+const MARK_MENU_WIDTH: f32 = 220.;
 /// Distance between the menu and the target it was opened for, in DIPs.
 const GAP: f32 = 6.;
 
@@ -929,7 +929,7 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
 /// A click on the status bar mark: this computer, Windows settings and tools, then
 /// power and session commands. Those that end the session are marked as dangerous.
 pub fn mark_menu() -> Menu<Command> {
-    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
+    let mut menu = Menu::fixed(MARK_MENU_WIDTH);
     menu.item("关于本机", Icon::Symbol(Symbol::Info), Some(Command::About));
     menu.separator();
     menu.item(
@@ -1463,7 +1463,7 @@ mod tests {
             }
         }
         let layout = MenuLayout::new(&mut menu, 96, measure);
-        assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
+        assert_eq!(layout.width, 220. + 2. * SHADOW);
         assert_eq!(layout.rows.len(), 15);
     }
 
