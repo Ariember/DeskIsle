@@ -97,12 +97,12 @@ fn paint_indicator(
     right: f32,
     height: f32,
 ) -> Result<()> {
-    let (symbol, unit) = match indicator.metric {
-        Metric::Cpu => (Symbol::Chip, "%"),
-        Metric::Memory => (Symbol::Memory, "%"),
-        Metric::Disk => (Symbol::Disk, "%"),
-        Metric::CpuTemperature => (Symbol::Thermometer, "°C"),
-        Metric::GpuTemperature => (Symbol::GraphicsCard, "°C"),
+    let symbol = match indicator.metric {
+        Metric::Cpu => Symbol::Chip,
+        Metric::Memory => Symbol::Memory,
+        Metric::Disk => Symbol::Disk,
+        Metric::CpuTemperature => Symbol::Thermometer,
+        Metric::GpuTemperature => Symbol::GraphicsCard,
     };
     let ink = if indicator.highlight {
         c.p.danger
@@ -117,7 +117,14 @@ fn paint_indicator(
     };
     let cx = (left + 22. + right - 3.) / 2.;
     match indicator.style {
-        Style::Value => c.text(write, &format!("{value}{unit}"), text_rect, 12., false, ink),
+        Style::Value => c.text(
+            write,
+            &indicator.format_value(value),
+            text_rect,
+            12.,
+            false,
+            ink,
+        ),
         Style::Bars => c.symbol(Symbol::MeterBars(value), cx, cy, 18., ink, 1.),
         Style::Ring => c.symbol_weighted(Symbol::MeterRing(value), cx, cy, 18., 2., ink, 1.),
         Style::Graph => c.draw_shapes(
@@ -143,7 +150,8 @@ mod tests {
     fn paints_and_reconfigures_monitors_on_hidden_bars() -> Result<()> {
         let _desktop = Desktop::init()?;
         let (top, bottom) = create_bars()?;
-        let mut renderer = Renderer::new(top.0, bottom.0, false)?;
+        let mut settings = crate::settings::Settings::default();
+        let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
         let mut indicators = [
             Indicator::new(Metric::Cpu, Style::Bars),
             Indicator::new(Metric::Memory, Style::Ring),
@@ -177,9 +185,38 @@ mod tests {
             }
             renderer.draw_metrics(&bar, 144, &indicators)?;
         }
-        renderer.set_dark(true);
+        use crate::settings::Key;
+        settings.set(Key::Accent, 1);
+        settings.set(Key::BoldFont, 1);
+        settings.set(Key::FontFamily, 1);
+        settings.set(Key::FontScale, 120);
+        assert!(renderer.set_appearance(true, &settings));
+        indicators[3].fahrenheit = true;
         indicators[0].configure(Style::Value, true);
         bar = layout(&indicators);
+        for family in 0..=2 {
+            settings.set(Key::FontFamily, family);
+            renderer.set_appearance(true, &settings);
+            for (metric, slot) in indicators.iter().zip(&bar.metrics) {
+                if metric.style == Style::Value {
+                    let maximum = if matches!(
+                        metric.metric,
+                        Metric::CpuTemperature | Metric::GpuTemperature
+                    ) {
+                        150
+                    } else {
+                        100
+                    };
+                    let text = metric.format_value(maximum);
+                    let width = renderer.measure(&text, 12., false);
+                    let available = slot.width as f32 / 1.5 - 25.;
+                    assert!(
+                        width <= available,
+                        "{text} needs {width} DIPs with font {family}, available {available}"
+                    );
+                }
+            }
+        }
         renderer.draw_top(
             &bar,
             144,

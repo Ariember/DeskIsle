@@ -31,6 +31,8 @@ pub struct DockSlot {
 pub struct Layout {
     /// Screen pixels in the target monitor's work area.
     pub bottom: Rect,
+    /// Bottom edge of the work area, including the configured gap below the Dock.
+    work_bottom: i32,
     pub slots: Vec<DockSlot>,
     pub first: usize,
     /// Edge of each icon in pixels.
@@ -41,13 +43,18 @@ pub struct Layout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DockStyle {
     pub icon: i32,
+    pub spacing: i32,
     /// Distance from the bottom of the work area.
     pub gap: i32,
 }
 
 impl Default for DockStyle {
     fn default() -> Self {
-        Self { icon: 34, gap: 8 }
+        Self {
+            icon: 34,
+            spacing: 18,
+            gap: 8,
+        }
     }
 }
 
@@ -62,7 +69,9 @@ impl Layout {
         let inset_x = px(8).min((work.width - 1) / 2);
         let available = work.width - 2 * inset_x;
         let padding = px(6).min((available - 1) / 2);
-        let slot_width = px(style.icon + 18).min(available - 2 * padding).max(1);
+        let slot_width = px(style.icon + style.spacing)
+            .min(available - 2 * padding)
+            .max(1);
         let capacity = ((available - 2 * padding) / slot_width) as usize;
         let count = apps + 1;
         let visible = count.min(capacity);
@@ -108,9 +117,25 @@ impl Layout {
             .max(1);
         Self {
             bottom,
+            work_bottom: work.y + work.height,
             slots,
             first,
             icon,
+        }
+    }
+
+    /// With immersion enabled the bottommost pixel wakes the Dock. When revealed,
+    /// the same window spans the gap so moving up from the edge can reach its icons.
+    pub fn immersive_window(&self, collapsed: bool) -> Rect {
+        let y = if collapsed {
+            self.work_bottom - 1
+        } else {
+            self.bottom.y
+        };
+        Rect {
+            y,
+            height: self.work_bottom - y,
+            ..self.bottom
         }
     }
 
@@ -332,7 +357,9 @@ impl StatusLayout {
         let mut metric_slots = Vec::new();
         for indicator in metrics {
             let w = px(match indicator.style {
-                Style::Value => 60,
+                // A three-digit temperature or percentage at the largest font setting
+                // needs up to 43 DIPs of text, plus the 25 DIPs around it.
+                Style::Value => 70,
                 Style::Graph => 56,
                 Style::Bars | Style::Ring => 44,
             });
@@ -545,7 +572,16 @@ mod tests {
                 width,
                 height: 600,
             };
-            let layout = Layout::new(work, 144, apps, first, DockStyle { icon: 56, gap: 8 });
+            let layout = Layout::new(
+                work,
+                144,
+                apps,
+                first,
+                DockStyle {
+                    icon: 56,
+                    ..DockStyle::default()
+                },
+            );
             let (slots, scale) = layout.insertion_preview(at);
             let icon = layout.icon as f32 * scale;
             let mut left = layout.slots[0].rect.x;
@@ -622,10 +658,14 @@ mod tests {
             width: 1920,
             height: 1040,
         };
-        let style = DockStyle { icon: 48, gap: 0 };
+        let style = DockStyle {
+            icon: 48,
+            spacing: 8,
+            gap: 0,
+        };
         let layout = Layout::new(work, 144, 3, 0, style);
         assert_eq!(layout.icon, 72);
-        assert_eq!(layout.slots[0].rect.width, 99);
+        assert_eq!(layout.slots[0].rect.width, 84);
         assert_eq!(layout.bottom.height, 117);
         assert_eq!(layout.bottom.y + layout.bottom.height, work.height);
         let slot = layout.slots[2].rect;
@@ -633,6 +673,26 @@ mod tests {
             layout.hit(slot.x + slot.width - 1, slot.y),
             Some(DockHit::App(1))
         );
+    }
+
+    #[test]
+    fn revealed_window_connects_edge_strip_to_icons_across_the_gap() {
+        let work = Rect {
+            x: -1024,
+            y: 40,
+            width: 1024,
+            height: 728,
+        };
+        let layout = Layout::new(work, 144, 4, 0, DockStyle::default());
+        let edge = layout.immersive_window(true);
+        let revealed = layout.immersive_window(false);
+        assert_eq!(edge.y, 767);
+        assert_eq!(edge.height, 1);
+        assert_eq!(revealed.y, layout.bottom.y);
+        let x = edge.x + edge.width / 2;
+        assert!(revealed.contains(x, edge.y));
+        assert!(!layout.bottom.contains(x, edge.y));
+        assert!(layout.hit(x - revealed.x, edge.y - revealed.y).is_none());
     }
 
     #[test]

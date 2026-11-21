@@ -40,8 +40,8 @@ pub(super) struct LaunchpadView {
     veil: IDCompositionVisual2,
     veil_fade: IDCompositionEffectGroup,
     deep: Tween,
-    /// Window size, DPI and content height the veil was painted for.
-    veil_key: Option<(i32, i32, u32, u32)>,
+    /// Window size, DPI, content height and drawing settings for the veil's hint.
+    veil_key: Option<(i32, i32, u32, u32, Palette)>,
     icons: HashMap<PathBuf, Option<IWICBitmapSource>>,
     icon_pixels: i32,
 }
@@ -83,7 +83,7 @@ impl Renderer {
             }
         }
         let scale = layout.dpi as f32 / 96.;
-        let p = Palette::new(true);
+        let p = self.palette;
         if let Some(tile) = layout.tiles.first() {
             let pixels = ((tile.icon.right - tile.icon.left) * scale).round() as i32;
             let view = self.launchpad.as_mut().unwrap();
@@ -121,6 +121,7 @@ impl Renderer {
             layout.height,
             layout.dpi,
             layout.content.to_bits(),
+            p,
         );
         if view.veil_key != Some(key) {
             let (w, h) = (layout.width as f32 / scale, layout.height as f32 / scale);

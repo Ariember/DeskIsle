@@ -1,6 +1,7 @@
 mod about;
 mod commands;
 mod drag;
+mod immersion;
 mod launchpad;
 mod menus;
 mod monitor;
@@ -25,6 +26,7 @@ use crate::ui::layout::{
     DockDrop, DockHit, DockStyle, Layout, STATUS_HEIGHT, StatusHit, StatusLayout, SystemItem,
 };
 use crate::ui::system::SystemStatus;
+use immersion::DockExposure;
 use monitor::MetricsWorker;
 use windows::Win32::Foundation::POINT;
 use windows::core::{Error, Result};
@@ -46,6 +48,8 @@ struct Bars {
     worker: SystemWorker,
     metrics_worker: MetricsWorker,
     indicators: Vec<Indicator>,
+    /// Unregister the global shortcut before destroying its owner window.
+    taskbar_shortcut: Option<platform::TaskbarShortcut>,
     top: Bar,
     bottom: Bar,
     pins: Vec<PinnedApp>,
@@ -67,6 +71,7 @@ struct Bars {
     hover: Option<DockHit>,
     dock_press: Option<drag::DockPress>,
     dock_file_target: Option<DockDrop>,
+    dock_exposure: DockExposure,
     preview: Option<PreviewWindow>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
@@ -130,17 +135,24 @@ pub(crate) fn run() -> Result<()> {
         platform::report_error(None, &error);
         BTreeSet::new()
     });
-    let settings = settings::load();
+    let mut settings = settings::load();
+    let taskbar_shortcut =
+        platform::TaskbarShortcut::register(top.0, settings.get(Key::TaskbarShortcut))
+            .unwrap_or_else(|error| {
+                platform::report_error(Some(top.0), &error);
+                settings.set(Key::TaskbarShortcut, 0);
+                None
+            });
     let pins = load_pins()?;
     let (apps, foreground) = applications(&pins)?;
     let mut native_taskbar = NativeTaskbar::default();
-    let monitor = platform::monitor()?;
+    let monitor = settings::primary_monitor(&settings)?;
     let mut appbar = AppBar::new(top.0);
     let top_rect = appbar.place(monitor.bounds, status_height(monitor.dpi))?;
     if settings.enabled(Key::HideTaskbar) {
         native_taskbar.hide()?;
     }
-    let monitor = platform::monitor()?;
+    let monitor = settings::primary_monitor(&settings)?;
     let tray = TrayHost::new()?;
     // The shell may have announced an already full-screen app before registration.
     // Only an application from the window snapshot qualifies (the desktop also fills the screen).
@@ -148,6 +160,7 @@ pub(crate) fn run() -> Result<()> {
         && foreground.is_some_and(|id| platform::window_covers_monitor(id, monitor.bounds));
     let style = DockStyle {
         icon: settings.icon_size(),
+        spacing: settings.get(Key::IconSpacing),
         gap: settings.dock_gap(),
     };
     let layout = Layout::new(
@@ -158,13 +171,19 @@ pub(crate) fn run() -> Result<()> {
         style,
     );
     let time = platform::clock(top.0)?;
-    let renderer = Some(Renderer::new(top.0, bottom.0, settings::dark(&settings))?);
+    let renderer = Some(Renderer::new(
+        top.0,
+        bottom.0,
+        settings::dark(&settings),
+        &settings,
+    )?);
     let audio_watch = audio::AudioWatch::new(top.0).ok();
     let mut worker = SystemWorker::new(top.0)?;
     worker.refresh_network()?;
     let mut bars = Bars {
         metrics_worker: MetricsWorker::new(top.0)?,
         indicators: Vec::new(),
+        taskbar_shortcut,
         worker,
         events,
         renderer,
@@ -189,6 +208,11 @@ pub(crate) fn run() -> Result<()> {
         hover: None,
         dock_press: None,
         dock_file_target: None,
+        dock_exposure: if settings.enabled(Key::DockImmersive) {
+            DockExposure::Edge
+        } else {
+            DockExposure::Shown
+        },
         preview: None,
         top_hover: None,
         wheel: 0,
@@ -244,6 +268,9 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
+                if bars.settings.theme() == crate::settings::Theme::Automatic {
+                    bars.update_theme_from_desktop()?;
+                }
                 if bars.tray_notice.take().is_some() || bars.time != time {
                     bars.time = time;
                     bars.draw()?;
@@ -252,6 +279,12 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh_system()?;
             }
             Event::TrayNoticeExpired => bars.clear_tray_notice()?,
+            Event::TaskbarShortcut(id) if id == bars.settings.get(Key::TaskbarShortcut) => {
+                bars.toggle_taskbar()?;
+            }
+            Event::DockReveal if matches!(bars.dock_exposure, DockExposure::Waiting(_)) => {
+                bars.hover_dock_edge(true)?;
+            }
             Event::Audio => bars.refresh_audio()?,
             Event::MetricsUpdate => match bars.draw_metrics() {
                 Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
@@ -267,14 +300,27 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Move(hwnd, x, y) if hwnd == bars.bottom.0 => {
                 platform::track_leave(hwnd)?;
-                bars.move_dock_pointer(x, y)?;
+                if bars.dock_exposure.collapsed() {
+                    bars.hover_dock_edge(false)?;
+                } else {
+                    bars.move_dock_pointer(x, y)?;
+                }
             }
             Event::CancelPress(hwnd) if hwnd == bars.bottom.0 => bars.cancel_dock_press()?,
             Event::DockFileHover(point) if !bars.fullscreen => {
-                let target = point.and_then(|(x, y)| bars.file_target(x, y));
-                bars.set_dock_file_target(target)?;
+                if bars.dock_exposure.collapsed() && point.is_some() {
+                    bars.hover_dock_edge(false)?;
+                } else {
+                    let target = point.and_then(|(x, y)| bars.file_target(x, y));
+                    bars.set_dock_file_target(target)?;
+                    if point.is_none() {
+                        bars.finish_dock_gesture()?;
+                    }
+                }
             }
-            Event::DropFiles(hwnd, x, y, files) if hwnd == bars.bottom.0 && !bars.fullscreen => {
+            Event::DropFiles(hwnd, x, y, files)
+                if hwnd == bars.bottom.0 && !bars.fullscreen && !bars.dock_exposure.collapsed() =>
+            {
                 let target = bars.file_target(x, y);
                 bars.set_dock_file_target(None)?;
                 if let Some(target) = target {
@@ -285,12 +331,15 @@ pub(crate) fn run() -> Result<()> {
                 platform::track_leave(hwnd)?;
                 bars.set_top_hover(Some(bars.status.hit(x, y)))?;
             }
-            Event::Leave(hwnd) if hwnd == bars.bottom.0 => bars.leave_dock()?,
+            Event::Leave(hwnd) if hwnd == bars.bottom.0 => {
+                bars.leave_dock()?;
+                bars.hide_idle_dock()?;
+            }
             Event::Leave(hwnd) if hwnd == bars.top.0 => bars.set_top_hover(None)?,
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
                 bars.scroll_status(delta, x, y)?;
             }
-            Event::Scroll(_, delta, _, _) if delta != 0 => {
+            Event::Scroll(_, delta, _, _) if delta != 0 && !bars.dock_exposure.collapsed() => {
                 let first = bars
                     .layout
                     .first
@@ -299,7 +348,11 @@ pub(crate) fn run() -> Result<()> {
                     bars.draw()?;
                 }
             }
-            Event::MiddleClick(owner, x, y) => bars.middle_click(owner, x, y)?,
+            Event::MiddleClick(owner, x, y)
+                if owner != bars.bottom.0 || !bars.dock_exposure.collapsed() =>
+            {
+                bars.middle_click(owner, x, y)?
+            }
             Event::Press {
                 owner,
                 x,
@@ -311,7 +364,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.cancel_dock_press()?;
                 if owner == bars.bottom.0 {
                     bars.set_hover(None)?;
-                    if !right && !bars.fullscreen {
+                    if !right && !bars.fullscreen && !bars.dock_exposure.collapsed() {
                         bars.press_dock(x, y);
                     }
                 }
@@ -341,16 +394,23 @@ pub(crate) fn run() -> Result<()> {
                 }
             }
             Event::Click(owner, x, y) if owner == bars.bottom.0 => bars.release_dock(x, y)?,
-            Event::RightClick(owner, x, y) if bars.context_menu(owner, x, y)? => return Ok(()),
+            Event::RightClick(owner, x, y)
+                if (owner != bars.bottom.0 || !bars.dock_exposure.collapsed())
+                    && bars.context_menu(owner, x, y)? =>
+            {
+                return Ok(());
+            }
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
             Event::Launchpad(input) => bars.launchpad_event(input)?,
             Event::About(input) => bars.about_event(input)?,
-            event @ (Event::PanelMove(..)
+            event @ (Event::PanelPress(..)
+            | Event::PanelCancel
+            | Event::PanelMove(..)
             | Event::PanelLeave
             | Event::PanelClick(..)
             | Event::PanelScroll(_)
             | Event::PanelKey(_)
-            | Event::PanelDpi(_)
+            | Event::PanelDpi
             | Event::PanelClose) => bars.panel_event(event)?,
             _ => {}
         }
@@ -383,6 +443,7 @@ impl Bars {
         self.position()?;
         if fullscreen {
             self.cancel_dock_press()?;
+            self.hide_idle_dock()?;
             self.set_dock_file_target(None)?;
             self.tray.cancel_click();
             self.set_hover(None)?;
@@ -406,14 +467,14 @@ impl Bars {
                 .then_some(self.top_rect),
         )?;
         self.top.position(self.top_rect, !self.fullscreen)?;
-        self.bottom.position(self.layout.bottom, !self.fullscreen)
+        self.position_dock()
     }
 
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
     /// asks or the monitor changed, since each negotiation changes the work area again.
     fn display(&mut self, replace: bool) -> Result<()> {
         self.tray.cancel_click();
-        let monitor = platform::monitor()?;
+        let monitor = settings::primary_monitor(&self.settings)?;
         let replace =
             replace || monitor.bounds != self.monitor.bounds || monitor.dpi != self.monitor.dpi;
         if replace {
@@ -427,7 +488,7 @@ impl Bars {
                 self.native_taskbar.refresh_work_area()?;
             }
         }
-        self.monitor = platform::monitor()?;
+        self.monitor = settings::primary_monitor(&self.settings)?;
         (self.apps, self.foreground) = applications(&self.pins)?;
         self.restatus();
         if !self.relayout(self.layout.first)? {
@@ -436,7 +497,7 @@ impl Bars {
         self.position()?;
         self.time = platform::clock(self.top.0)?;
         // Windows announces a change of its app mode as a setting change.
-        self.apply_theme()?;
+        self.update_theme_from_desktop()?;
         self.draw()?;
         self.relayout_panel()?;
         self.resize_launchpad()
@@ -453,14 +514,16 @@ impl Bars {
         if self.layout == layout {
             return Ok(false);
         }
-        let moved = layout.bottom != self.layout.bottom;
+        let moved = layout.bottom != self.layout.bottom
+            || (self.settings.enabled(Key::DockImmersive)
+                && layout.immersive_window(true) != self.layout.immersive_window(true));
         self.layout = layout;
         if moved {
             // A press started against the previous client origin.
             if self.dock_press.take().is_some() {
                 self.bottom.release();
             }
-            self.bottom.position(self.layout.bottom, !self.fullscreen)?;
+            self.position_dock()?;
         }
         if self.hover.is_some() {
             self.hover = platform::cursor().ok().and_then(|point| {
@@ -683,7 +746,7 @@ impl Bars {
         // Release composition targets before binding a new device to these HWNDs.
         self.renderer.take();
         self.renderer = Some(
-            Renderer::new(self.top.0, self.bottom.0, self.dark())
+            Renderer::new(self.top.0, self.bottom.0, self.dark(), &self.settings)
                 .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
         );
         self.draw_frame()?;

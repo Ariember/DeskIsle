@@ -80,7 +80,16 @@ impl Bars {
         let (Some(about), Some(renderer)) = (&self.about, self.renderer.as_mut()) else {
             return Ok(());
         };
-        renderer.draw_about(about.window.0, &about.layout, about.dpi, about.glass)
+        renderer.draw_about(
+            about.window.0,
+            &about.layout,
+            about.dpi,
+            if about.glass {
+                self.settings.get(crate::settings::Key::Backdrop)
+            } else {
+                0
+            },
+        )
     }
 
     fn draw_about(&mut self) -> Result<()> {
@@ -105,18 +114,29 @@ impl Bars {
         if repalette {
             about.window.set_dark(dark);
         }
+        self.refresh_about_appearance()
+    }
+
+    pub(super) fn refresh_about_appearance(&mut self) -> Result<()> {
+        if let Some(about) = self.about.as_mut() {
+            about.dpi = self.settings.ui_dpi(platform::window_dpi(about.window.0));
+            let hover = about.layout.hover;
+            if self.relayout_about(hover)? {
+                return Ok(());
+            }
+        }
         self.draw_about()
     }
 
     /// Lays the card out again for its DPI or hover and repaints only when it changed.
-    fn relayout_about(&mut self, hover: Option<AboutHit>) -> Result<()> {
+    fn relayout_about(&mut self, hover: Option<AboutHit>) -> Result<bool> {
         let Some(about) = self.about.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let layout = self.about_layout(&about.machine, about.dpi, hover);
         let about = self.about.as_mut().expect("checked above");
         if layout == about.layout {
-            return Ok(());
+            return Ok(false);
         }
         if layout.pixels() != about.layout.pixels() {
             let (width, height) = layout.pixels();
@@ -125,7 +145,8 @@ impl Bars {
                 .resize(width, height, layout.controls_pixels())?;
         }
         about.layout = layout;
-        self.draw_about()
+        self.draw_about()?;
+        Ok(true)
     }
 
     pub(super) fn about_event(&mut self, event: AboutEvent) -> Result<()> {
@@ -136,12 +157,12 @@ impl Bars {
         let action = match event {
             AboutEvent::Move(x, y) => {
                 let hover = about.layout.hit(x, y);
-                return self.relayout_about(hover);
+                return self.relayout_about(hover).map(drop);
             }
-            AboutEvent::Leave => return self.relayout_about(None),
+            AboutEvent::Leave => return self.relayout_about(None).map(drop),
             AboutEvent::Dpi(dpi) => {
-                about.dpi = dpi.max(96);
-                return self.relayout_about(hover);
+                about.dpi = self.settings.ui_dpi(dpi.max(96));
+                return self.relayout_about(hover).map(drop);
             }
             AboutEvent::Click(x, y) => about.layout.hit(x, y),
             AboutEvent::Key(AboutKey::Enter) => Some(AboutHit::More),

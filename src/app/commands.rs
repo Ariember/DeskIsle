@@ -23,7 +23,9 @@ impl Bars {
                 return Ok(false);
             }
             Command::Window(id, window) => shell::activate(&id, window).map(drop),
-            Command::NewInstance(path) => shell::execute(owner, &path),
+            Command::NewInstance(path) | Command::OpenDocument(path) => {
+                shell::execute(owner, &path)
+            }
             Command::Reveal(path) => shell::reveal(owner, &path),
             Command::RunAsAdmin(path) => shell::run_as_admin(owner, &path).map(drop),
             Command::Properties(path) => shell::properties(owner, &path),

@@ -28,15 +28,16 @@ const NAV_GAP: f32 = 2.;
 const CONTENT_LEFT: f32 = 220.;
 const CONTENT_RIGHT: f32 = 24.;
 const FOOTER: f32 = 56.;
-/// Rows of a page stack into one grouped list without gaps.
+/// Standard switch and segmented-control rows.
 const CARD: f32 = 60.;
 const MONITOR_CARD: f32 = 76.;
 const MONITOR_INSET: f32 = 72.;
 const CONTROL_INSET: f32 = 16.;
 const SWITCH_WIDTH: f32 = 40.;
 const SWITCH_HEIGHT: f32 = 22.;
-const STEP_BUTTON: f32 = 28.;
-const STEP_VALUE: f32 = 60.;
+const GROUP_GAP: f32 = 14.;
+const SLIDER_CARD: f32 = 86.;
+const SLIDER_PAD: f32 = 7.;
 const SEGMENT: f32 = 56.;
 const CONTROL_HEIGHT: f32 = 28.;
 const RESET_WIDTH: f32 = 112.;
@@ -77,6 +78,7 @@ pub enum Action {
     Page(usize),
     /// Restores the defaults of every setting on the current page.
     Reset,
+    DisplaySettings,
     Change(Key, Adjust),
 }
 
@@ -86,13 +88,13 @@ pub enum Part {
         area: Area,
         on: bool,
     },
-    Stepper {
-        minus: Area,
-        value: Area,
-        plus: Area,
-        text: String,
-        can_down: bool,
-        can_up: bool,
+    Slider {
+        area: Area,
+        min: i32,
+        max: i32,
+        step: i32,
+        value: i32,
+        unit: &'static str,
     },
     Segments {
         options: Vec<(Area, &'static str)>,
@@ -139,9 +141,11 @@ pub struct PanelState {
     pub page: usize,
     /// DIPs the page content moved up.
     pub scroll: f32,
-    /// A row of the current page, shown with a focus ring after keyboard use.
+    /// A row index, or rows.len() for the general page’s display settings button.
     pub focus: Option<usize>,
     pub hover: Option<Action>,
+    /// The value shown while dragging, committed by the coordinator on release.
+    pub slider_preview: Option<(Key, i32)>,
 }
 
 impl PanelState {
@@ -165,7 +169,7 @@ impl PanelState {
 
     /// Handles a key. Focus and scroll change here; the returned action is for the caller.
     pub fn key(&mut self, nav: Nav, layout: &PanelLayout) -> Option<Action> {
-        let count = layout.rows.len();
+        let count = layout.rows.len() + usize::from(layout.display_settings.is_some());
         let focused = self.focus.filter(|&i| i < count);
         let page = |offset: usize| Action::Page((self.page + offset) % SECTIONS.len());
         match nav {
@@ -181,7 +185,7 @@ impl PanelState {
                 };
                 self.focus = Some(next);
                 // Bring the focused card fully into view.
-                let card = layout.rows[next].card;
+                let card = layout.rows.get(next)?.card;
                 let view = layout.view;
                 if card.top < view.top {
                     self.scroll -= view.top - card.top;
@@ -192,7 +196,9 @@ impl PanelState {
                 None
             }
             Nav::Decrease | Nav::Increase | Nav::Activate => {
-                let row = &layout.rows[focused?];
+                let Some(row) = layout.rows.get(focused?) else {
+                    return (nav == Nav::Activate).then_some(Action::DisplaySettings);
+                };
                 let adjust = match nav {
                     Nav::Decrease => Adjust::Step(-1),
                     Nav::Increase => Adjust::Step(1),
@@ -207,6 +213,13 @@ impl PanelState {
             _ => None,
         }
     }
+}
+
+/// Keep the navigation and controls on screen even when both scaling factors are high.
+pub fn panel_dpi(requested: u32, work: Rect) -> u32 {
+    let fit = (i64::from(work.width) * 96 / MIN_WIDTH as i64)
+        .min(i64::from(work.height) * 96 / MIN_HEIGHT as i64);
+    requested.min(fit.max(1) as u32)
 }
 
 /// The panel's geometry in DIPs for the current page.
@@ -224,7 +237,10 @@ pub struct PanelLayout {
     /// Content scrolls inside this area and is clipped to it.
     pub view: Area,
     pub rows: Vec<Row>,
+    pub groups: Vec<Area>,
+    pub backdrop: i32,
     pub reset: Area,
+    pub display_settings: Option<Area>,
     pub max_scroll: f32,
     pub scroll_thumb: Option<Area>,
     pub focus: Option<usize>,
@@ -263,6 +279,7 @@ impl PanelLayout {
             height - FOOTER,
         );
         let mut rows = Vec::new();
+        let mut groups: Vec<Area> = Vec::new();
         let mut top = view.top;
         for spec in SCHEMA
             .iter()
@@ -271,8 +288,31 @@ impl PanelLayout {
             let detail = SCHEMA
                 .iter()
                 .find(|s| detail_parent(s.key) == Some(spec.key));
-            let height = if detail.is_some() { MONITOR_CARD } else { CARD };
+            let starts_group = rows.is_empty()
+                || matches!(
+                    spec.key,
+                    Key::Theme
+                        | Key::Autostart
+                        | Key::TemperatureUnit
+                        | Key::FontFamily
+                        | Key::HoverZoom
+                );
+            if starts_group && !rows.is_empty() {
+                top += GROUP_GAP;
+            }
+            let height = match spec.key {
+                Key::Theme => 122.,
+                key if stacked_choice(key) => SLIDER_CARD,
+                _ if matches!(spec.control, Control::Slider { .. }) => SLIDER_CARD,
+                _ if detail.is_some() => MONITOR_CARD,
+                _ => CARD,
+            };
             let card = Area::new(view.left, top, view.right, top + height);
+            if starts_group {
+                groups.push(card);
+            } else if let Some(group) = groups.last_mut() {
+                group.bottom = card.bottom;
+            }
             rows.push((spec, detail, card));
             top = card.bottom;
         }
@@ -285,18 +325,29 @@ impl PanelLayout {
             let y = view.top + (track - thumb) * state.scroll / max_scroll;
             Area::new(view.right + 6., y, view.right + 10., y + thumb)
         });
-        state.focus = state.focus.filter(|&i| i < rows.len());
+        let general = section == Section::General;
+        state.focus = state
+            .focus
+            .filter(|&i| i < rows.len() + usize::from(general));
+        for group in &mut groups {
+            group.top -= state.scroll;
+            group.bottom -= state.scroll;
+        }
         let rows = rows
             .into_iter()
             .map(|(spec, detail, mut card)| {
                 card.top -= state.scroll;
                 card.bottom -= state.scroll;
+                let value = state
+                    .slider_preview
+                    .filter(|(key, _)| *key == spec.key)
+                    .map_or_else(|| settings.get(spec.key), |(_, value)| value);
                 Row {
                     key: spec.key,
                     label: spec.label,
                     help: spec.help,
                     card,
-                    part: part(spec, settings.get(spec.key), card),
+                    part: part(spec, value, card),
                     detail: detail.map(|s| detail_control(s, settings.get(s.key), card)),
                 }
             })
@@ -312,6 +363,16 @@ impl PanelLayout {
             title: Area::new(view.left, 0., view.right, CAPTION),
             view,
             rows,
+            groups,
+            backdrop: settings.get(Key::Backdrop),
+            display_settings: general.then(|| {
+                Area::new(
+                    view.left,
+                    reset_top,
+                    view.left + 132.,
+                    reset_top + CONTROL_HEIGHT,
+                )
+            }),
             reset: Area::new(
                 view.right - RESET_WIDTH,
                 reset_top,
@@ -359,6 +420,40 @@ impl PanelLayout {
         }
     }
 
+    /// Begins a slider gesture only on its visible hit target.
+    pub fn slider_at(&self, x: i32, y: i32) -> Option<Key> {
+        match self.hit(x, y) {
+            Some(Action::Change(key, Adjust::Set(_))) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Continues a captured gesture, including outside the track or window.
+    pub fn slider_action(&self, key: Key, x: i32) -> Option<Action> {
+        let row = self.rows.iter().find(|row| row.key == key)?;
+        self.slider_action_dip(row, x as f32 / self.scale)
+    }
+
+    fn slider_action_dip(&self, row: &Row, x: f32) -> Option<Action> {
+        let Part::Slider {
+            area,
+            min,
+            max,
+            step,
+            ..
+        } = row.part
+        else {
+            return None;
+        };
+        let (left, right) = slider_track(area);
+        let fraction = ((x - left) / (right - left)).clamp(0., 1.);
+        let steps = (max - min) / step;
+        Some(Action::Change(
+            row.key,
+            Adjust::Set(min + (fraction * steps as f32).round() as i32 * step),
+        ))
+    }
+
     /// `x` and `y` are client pixels of the panel window.
     pub fn hit(&self, x: i32, y: i32) -> Option<Action> {
         let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
@@ -367,6 +462,12 @@ impl PanelLayout {
         }
         if let Some(page) = self.nav.iter().position(|(area, _)| area.contains(x, y)) {
             return Some(Action::Page(page));
+        }
+        if self
+            .display_settings
+            .is_some_and(|area| area.contains(x, y))
+        {
+            return Some(Action::DisplaySettings);
         }
         if self.reset.contains(x, y) {
             return Some(Action::Reset);
@@ -400,20 +501,11 @@ impl PanelLayout {
             }
             // The whole card flips a standalone switch, as in Windows Settings.
             Part::Switch { .. } => Adjust::Toggle,
-            Part::Stepper {
-                minus,
-                plus,
-                can_down,
-                can_up,
-                ..
-            } => {
-                if *can_down && minus.contains(x, y) {
-                    Adjust::Step(-1)
-                } else if *can_up && plus.contains(x, y) {
-                    Adjust::Step(1)
-                } else {
-                    return None;
+            Part::Slider { area, .. } => {
+                if area.contains(x, y) {
+                    return self.slider_action_dip(row, x);
                 }
+                return None;
             }
             Part::Segments { options, .. } => {
                 Adjust::Pick(options.iter().position(|(area, _)| area.contains(x, y))?)
@@ -421,6 +513,18 @@ impl PanelLayout {
         };
         Some(Action::Change(row.key, adjust))
     }
+}
+
+/// The thumb stays entirely inside the clickable area at both limits.
+pub fn slider_track(area: Area) -> (f32, f32) {
+    (area.left + SLIDER_PAD, area.right - SLIDER_PAD)
+}
+
+pub fn stacked_choice(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Theme | Key::Accent | Key::FontFamily | Key::TaskbarShortcut | Key::Language
+    )
 }
 
 /// These controls share a card with the monitor they configure.
@@ -455,7 +559,7 @@ fn detail_control(spec: &settings::Spec, value: i32, card: Area) -> Detail {
                 .collect(),
             selected: value as usize,
         },
-        Control::Stepper { .. } => unreachable!("monitor details are toggles or styles"),
+        Control::Slider { .. } => unreachable!("monitor details are toggles or styles"),
     };
     let label_area = matches!(part, Part::Switch { .. })
         .then(|| Area::new(area.right, area.top, area.right + 44., bottom));
@@ -481,28 +585,66 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
             ),
             on: value != 0,
         },
-        Control::Stepper { min, max, unit, .. } => {
-            let plus = Area::new(right - STEP_BUTTON, top, right, bottom);
-            let value_area = Area::new(plus.left - STEP_VALUE, top, plus.left, bottom);
-            let minus = Area::new(value_area.left - STEP_BUTTON, top, value_area.left, bottom);
-            Part::Stepper {
-                minus,
-                value: value_area,
-                plus,
-                text: format!("{value} {unit}"),
-                can_down: value > min,
-                can_up: value < max,
-            }
-        }
+        Control::Slider {
+            min,
+            max,
+            step,
+            unit,
+        } => Part::Slider {
+            area: Area::new(
+                card.left + CONTROL_INSET,
+                card.bottom - 33.,
+                right,
+                card.bottom - 9.,
+            ),
+            min,
+            max,
+            step,
+            value,
+            unit,
+        },
         Control::Choice(choices) => {
-            let left = right - choices.len() as f32 * SEGMENT;
+            let (left, top, segment, bottom) = if stacked_choice(spec.key) {
+                let left = card.left + CONTROL_INSET;
+                let height = if spec.key == Key::Theme {
+                    64.
+                } else {
+                    CONTROL_HEIGHT
+                };
+                (
+                    left,
+                    card.bottom - height - 9.,
+                    (right - left) / choices.len() as f32,
+                    card.bottom - 9.,
+                )
+            } else {
+                (right - choices.len() as f32 * SEGMENT, top, SEGMENT, bottom)
+            };
+            // Font and shortcut names have very different lengths. Give the long names
+            // room even on the narrowest panel, leaving the other controls evenly spaced.
+            let weight = |label: &str| -> f32 {
+                if matches!(spec.key, Key::FontFamily | Key::TaskbarShortcut) {
+                    4. + label
+                        .chars()
+                        .map(|c| if c.is_ascii() { 1. } else { 2. })
+                        .sum::<f32>()
+                } else {
+                    1.
+                }
+            };
+            let total = choices
+                .iter()
+                .map(|choice| weight(choice.label))
+                .sum::<f32>();
+            let mut x = left;
             Part::Segments {
                 options: choices
                     .iter()
-                    .enumerate()
-                    .map(|(i, choice)| {
-                        let l = left + i as f32 * SEGMENT;
-                        (Area::new(l, top, l + SEGMENT, bottom), choice.label)
+                    .map(|choice| {
+                        let width = segment * choices.len() as f32 * weight(choice.label) / total;
+                        let area = Area::new(x, top, x + width, bottom);
+                        x = area.right;
+                        (area, choice.label)
                     })
                     .collect(),
                 selected: value as usize,
@@ -515,7 +657,8 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
 pub fn text_area(row: &Row) -> Area {
     let control_left = match &row.part {
         Part::Switch { area, .. } => area.left,
-        Part::Stepper { minus, .. } => minus.left,
+        Part::Slider { .. } => row.card.right - 78.,
+        Part::Segments { .. } if stacked_choice(row.key) => row.card.right,
         Part::Segments { options, .. } => options.first().map_or(row.card.right, |o| o.0.left),
     };
     Area::new(
@@ -582,22 +725,24 @@ mod tests {
                 assert!(layout.nav[page].0.right < SIDEBAR && layout.view.left > SIDEBAR);
                 let (x, y) = center(layout.reset, s);
                 assert_eq!(layout.hit(x, y), Some(Action::Reset));
-                for row in &layout.rows {
+                for index in 0..layout.rows.len() {
+                    let current = PanelLayout::new(&mut state, &settings, dpi, work(4000));
+                    state.key(Nav::Next, &current);
+                    let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
+                    let row = &layout.rows[index];
                     let change = |adjust| Some(Action::Change(row.key, adjust));
                     match &row.part {
                         Part::Switch { area, .. } => {
                             let (x, y) = center(*area, s);
                             assert_eq!(layout.hit(x, y), change(Adjust::Toggle));
                         }
-                        Part::Stepper {
-                            minus, plus, value, ..
-                        } => {
-                            let (x, y) = center(*minus, s);
-                            assert_eq!(layout.hit(x, y), change(Adjust::Step(-1)));
-                            let (x, y) = center(*plus, s);
-                            assert_eq!(layout.hit(x, y), change(Adjust::Step(1)));
-                            let (x, y) = center(*value, s);
-                            assert_eq!(layout.hit(x, y), None);
+                        Part::Slider { area, min, max, .. } => {
+                            let (_, y) = center(*area, s);
+                            let left = ((area.left + 1.) * s).round() as i32;
+                            let right = ((area.right - 1.) * s).round() as i32;
+                            assert_eq!(layout.slider_at(left, y), Some(row.key));
+                            assert_eq!(layout.hit(left, y), change(Adjust::Set(*min)));
+                            assert_eq!(layout.hit(right, y), change(Adjust::Set(*max)));
                         }
                         Part::Segments { options, .. } => {
                             for (i, (area, _)) in options.iter().enumerate() {
@@ -608,6 +753,16 @@ mod tests {
                     }
                     assert!(text_area(row).right > text_area(row).left + 120.);
                 }
+                if let Some(button) = layout.display_settings {
+                    let (x, y) = center(button, s);
+                    assert_eq!(layout.hit(x, y), Some(Action::DisplaySettings));
+                    state.key(Nav::Next, &layout);
+                    let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
+                    assert_eq!(
+                        state.key(Nav::Activate, &layout),
+                        Some(Action::DisplaySettings)
+                    );
+                }
                 // The window corner and the caption do nothing.
                 assert_eq!(layout.hit(1, 1), None);
             }
@@ -615,22 +770,28 @@ mod tests {
     }
 
     #[test]
-    fn limits_disable_stepper_buttons() {
-        let mut settings = Settings::default();
-        settings.set(Key::IconSize, 56);
-        let layout = PanelLayout::new(&mut dock_page(), &settings, 96, work(4000));
-        let row = layout.rows.iter().find(|r| r.key == Key::IconSize).unwrap();
-        let Part::Stepper {
-            plus, minus, text, ..
-        } = &row.part
-        else {
-            panic!("icon size is a stepper");
+    fn captured_slider_snaps_to_steps_and_previews_without_changing_settings() {
+        let settings = Settings::default();
+        let mut state = dock_page();
+        state.slider_preview = Some((Key::IconSize, 46));
+        let layout = PanelLayout::new(&mut state, &settings, 144, work(4000));
+        let row = layout
+            .rows
+            .iter()
+            .find(|row| row.key == Key::IconSize)
+            .unwrap();
+        let Part::Slider { area, value, .. } = row.part else {
+            panic!("expected icon size slider")
         };
-        assert_eq!(text, "56 px");
-        let (x, y) = center(*plus, 1.);
-        assert_eq!(layout.hit(x, y), None);
-        let (x, y) = center(*minus, 1.);
-        assert!(layout.hit(x, y).is_some());
+        assert_eq!(value, 46);
+        assert_eq!(settings.icon_size(), 34);
+        let (left, right) = slider_track(area);
+        let x = ((left + 0.342 * (right - left)) * layout.scale).round() as i32;
+        let set = |n| Some(Action::Change(Key::IconSize, Adjust::Set(n)));
+        assert_eq!(layout.slider_action(Key::IconSize, x), set(34));
+        assert_eq!(layout.slider_action(Key::IconSize, -200), set(24));
+        assert_eq!(layout.slider_action(Key::IconSize, i32::MAX), set(56));
+        assert_eq!(layout.slider_at(x, 0), None);
     }
 
     #[test]

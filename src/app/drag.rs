@@ -121,6 +121,7 @@ impl Bars {
             if press.target.is_some() {
                 self.draw()?;
             }
+            self.finish_dock_gesture()?;
         }
         Ok(())
     }
@@ -241,7 +242,7 @@ impl Bars {
                 _ => {}
             }
         }
-        Ok(())
+        self.finish_dock_gesture()
     }
 }
 

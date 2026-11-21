@@ -176,7 +176,7 @@ impl Bars {
         Ok(())
     }
 
-    fn draw_launchpad(&mut self) -> Result<()> {
+    pub(super) fn draw_launchpad(&mut self) -> Result<()> {
         match self.paint_launchpad() {
             Err(error) if is_device_lost(&error) => self.rebuild_renderer(),
             result => result,

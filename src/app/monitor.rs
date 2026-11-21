@@ -8,6 +8,7 @@ use windows::core::{Error, Result};
 use super::Bars;
 use crate::metrics::{Indicator, Metric, Sample, Sources};
 use crate::platform::{self, metrics::Sampler};
+use crate::settings::Key;
 
 const INTERVAL: Duration = Duration::from_secs(2);
 
@@ -27,6 +28,8 @@ impl Bars {
                     .cloned()
                     .unwrap_or_else(|| Indicator::new(metric, style));
                 indicator.configure(style, alert);
+                indicator.fahrenheit = self.settings.enabled(Key::TemperatureUnit)
+                    && matches!(metric, Metric::CpuTemperature | Metric::GpuTemperature);
                 indicator
             })
             .collect();

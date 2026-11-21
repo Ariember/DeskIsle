@@ -460,6 +460,13 @@ impl MenuLayout {
         }
     }
 
+    /// How many recent files can follow the current application menu.
+    pub fn recent_file_capacity(&self, available_px: i32) -> u32 {
+        // Keep the original application commands reachable even with many windows.
+        let remaining = available_px as f32 / self.scale - self.height - LABEL_HEIGHT;
+        (remaining / ITEM_HEIGHT).floor() as u32
+    }
+
     /// The window size in physical pixels.
     pub fn pixels(&self) -> (i32, i32) {
         (
@@ -695,6 +702,7 @@ pub enum Command {
     Select(String),
     Window(String, isize),
     NewInstance(PathBuf),
+    OpenDocument(PathBuf),
     Reveal(PathBuf),
     /// Starts a program or shortcut with administrator rights after the UAC prompt.
     RunAsAdmin(PathBuf),
@@ -863,6 +871,24 @@ pub fn app_menu(
         };
     }
     menu
+}
+
+pub fn append_recent_files(menu: &mut Menu<Command>, files: Vec<PathBuf>) {
+    if !files.is_empty() {
+        menu.label("最近打开的文件");
+    }
+    for path in files {
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        menu.item(
+            name,
+            Icon::Symbol(Symbol::Open),
+            Some(Command::OpenDocument(path)),
+        );
+    }
 }
 
 /// Lets the user pick one of several windows after a click on the Dock icon.
@@ -1324,6 +1350,16 @@ mod tests {
         );
         let layout = MenuLayout::new(&mut idle, 96, measure);
         assert_eq!(layout.width, DROPDOWN_WIDTH + 2. * SHADOW);
+        let available = layout.pixels().1 + (LABEL_HEIGHT + ITEM_HEIGHT) as i32;
+        assert_eq!(layout.recent_file_capacity(available - 1), 0);
+        assert_eq!(layout.recent_file_capacity(available), 1);
+        let path = PathBuf::from(r"C:\reports\工作稿 2.txt");
+        append_recent_files(&mut idle, vec![path.clone()]);
+        assert_eq!(commands(&idle).last(), Some(&Command::OpenDocument(path)));
+        assert_eq!(
+            MenuLayout::new(&mut idle, 96, measure).pixels().1,
+            available
+        );
     }
 
     #[test]

@@ -8,7 +8,22 @@ use crate::metrics::{Metric, Sources, Style};
 /// [`Settings`]; the panel and the settings file go through [`SCHEMA`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
+    InterfaceScale,
+    Backdrop,
     Theme,
+    SyncSystemTheme,
+    Accent,
+    TaskbarShortcut,
+    RecentFiles,
+    Language,
+    TemperatureUnit,
+    FontFamily,
+    FontScale,
+    BoldFont,
+    SmoothText,
+    IconSpacing,
+    DockImmersive,
+    DockRevealDelay,
     IconSize,
     DockGap,
     HoverZoom,
@@ -41,17 +56,15 @@ pub enum MonitorKey {
 /// A page of the settings panel, in navigation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
-    Appearance,
+    General,
     Dock,
-    System,
     Clock,
     Monitor,
 }
 
 pub const SECTIONS: &[Section] = &[
-    Section::Appearance,
+    Section::General,
     Section::Dock,
-    Section::System,
     Section::Clock,
     Section::Monitor,
 ];
@@ -59,9 +72,8 @@ pub const SECTIONS: &[Section] = &[
 impl Section {
     pub fn title(self) -> &'static str {
         match self {
-            Section::Appearance => "外观",
+            Section::General => "常规",
             Section::Dock => "Dock",
-            Section::System => "系统行为",
             Section::Clock => "时间",
             Section::Monitor => "监控",
         }
@@ -74,7 +86,7 @@ pub enum Control {
     /// `0` is off and `1` is on.
     Toggle,
     /// Whole numbers from `min` to `max` in increments of `step`.
-    Stepper {
+    Slider {
         min: i32,
         max: i32,
         step: i32,
@@ -136,6 +148,7 @@ pub enum Theme {
     System,
     Light,
     Dark,
+    Automatic,
 }
 
 pub const THEMES: &[Choice] = &[
@@ -150,6 +163,10 @@ pub const THEMES: &[Choice] = &[
     Choice {
         id: "dark",
         label: "深色",
+    },
+    Choice {
+        id: "auto",
+        label: "自动",
     },
 ];
 
@@ -225,13 +242,246 @@ const fn monitor(
 
 pub const SCHEMA: &[Spec] = &[
     Spec {
+        key: Key::InterfaceScale,
+        id: "general.interface_scale",
+        section: Section::General,
+        label: "界面显示大小",
+        help: "在显示器缩放基础上调整 DeskIsle 界面",
+        control: Control::Slider {
+            min: 80,
+            max: 150,
+            step: 5,
+            unit: "%",
+        },
+        default: 100,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::Backdrop,
+        id: "general.backdrop",
+        section: Section::General,
+        label: "毛玻璃效果强度",
+        help: "调整设置侧栏和关于本机的背景透视效果",
+        control: Control::Slider {
+            min: 0,
+            max: 100,
+            step: 5,
+            unit: "%",
+        },
+        default: 100,
+        store: Store::File,
+    },
+    Spec {
         key: Key::Theme,
         id: "appearance.theme",
-        section: Section::Appearance,
-        label: "颜色主题",
-        help: "双栏、菜单和设置面板的黑白配色",
+        section: Section::General,
+        label: "界面颜色模式",
+        help: "自动模式在 18:00 至次日 06:00 使用深色",
         control: Control::Choice(THEMES),
         default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::SyncSystemTheme,
+        id: "general.sync_system_theme",
+        section: Section::General,
+        label: "同步 Windows 颜色模式",
+        help: "选择浅色、深色或自动时同步 Windows 和应用颜色",
+        control: Control::Toggle,
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::Accent,
+        id: "general.accent",
+        section: Section::General,
+        label: "界面强调色",
+        help: "用于选中项、开关和滑块",
+        control: Control::Choice(&[
+            Choice {
+                id: "blue",
+                label: "蓝",
+            },
+            Choice {
+                id: "purple",
+                label: "紫",
+            },
+            Choice {
+                id: "pink",
+                label: "粉",
+            },
+            Choice {
+                id: "red",
+                label: "红",
+            },
+            Choice {
+                id: "orange",
+                label: "橙",
+            },
+            Choice {
+                id: "green",
+                label: "绿",
+            },
+            Choice {
+                id: "gray",
+                label: "灰",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::Autostart,
+        id: "system.autostart",
+        section: Section::General,
+        label: "开机自动启动",
+        help: "登录 Windows 后启动 DeskIsle",
+        control: Control::Toggle,
+        default: 0,
+        store: Store::System,
+    },
+    Spec {
+        key: Key::HideTaskbar,
+        id: "system.hide_taskbar",
+        section: Section::General,
+        label: "隐藏系统任务栏",
+        help: "运行时隐藏主屏任务栏，退出后恢复",
+        control: Control::Toggle,
+        default: 1,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::TaskbarShortcut,
+        id: "system.taskbar_shortcut",
+        section: Section::General,
+        label: "显示或隐藏任务栏快捷键",
+        help: "在任何应用中切换主屏任务栏",
+        control: Control::Choice(&[
+            Choice {
+                id: "none",
+                label: "关闭",
+            },
+            Choice {
+                id: "ctrl_alt_t",
+                label: "Ctrl+Alt+T",
+            },
+            Choice {
+                id: "ctrl_shift_f11",
+                label: "Ctrl+Shift+F11",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::RecentFiles,
+        id: "general.recent_files",
+        section: Section::General,
+        label: "显示程序最近打开文件个数",
+        help: "在支持 Windows 最近文档列表的应用菜单中显示",
+        control: Control::Slider {
+            min: 0,
+            max: 5,
+            step: 1,
+            unit: "个",
+        },
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::TemperatureUnit,
+        id: "general.temperature_unit",
+        section: Section::General,
+        label: "温度单位",
+        help: "顶部栏的 CPU 和 GPU 温度",
+        control: Control::Choice(&[
+            Choice {
+                id: "celsius",
+                label: "℃",
+            },
+            Choice {
+                id: "fahrenheit",
+                label: "℉",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::Language,
+        id: "general.panel_language",
+        section: Section::General,
+        label: "控制面板语言",
+        help: "设置面板的显示语言",
+        control: Control::Choice(&[
+            Choice {
+                id: "zh-CN",
+                label: "简体中文",
+            },
+            Choice {
+                id: "zh-TW",
+                label: "繁體中文",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::FontFamily,
+        id: "general.font_family",
+        section: Section::General,
+        label: "界面字体",
+        help: "用于 DeskIsle 的文字",
+        control: Control::Choice(&[
+            Choice {
+                id: "segoe",
+                label: "Segoe UI",
+            },
+            Choice {
+                id: "yahei",
+                label: "Microsoft YaHei UI",
+            },
+            Choice {
+                id: "dengxian",
+                label: "等线",
+            },
+        ]),
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::BoldFont,
+        id: "general.bold_font",
+        section: Section::General,
+        label: "使用加粗字体",
+        help: "加粗界面正文",
+        control: Control::Toggle,
+        default: 0,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::SmoothText,
+        id: "general.smooth_text",
+        section: Section::General,
+        label: "高质量渲染字体",
+        help: "平滑文字边缘",
+        control: Control::Toggle,
+        default: 1,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::FontScale,
+        id: "general.font_scale",
+        section: Section::General,
+        label: "字体缩放",
+        help: "调整界面中的文字大小",
+        control: Control::Slider {
+            min: 80,
+            max: 120,
+            step: 5,
+            unit: "%",
+        },
+        default: 100,
         store: Store::File,
     },
     Spec {
@@ -239,27 +489,42 @@ pub const SCHEMA: &[Spec] = &[
         id: "dock.icon_size",
         section: Section::Dock,
         label: "图标大小",
-        help: "Dock 图标的边长，按显示器缩放换算",
-        control: Control::Stepper {
+        help: "图标边长，随显示器缩放",
+        control: Control::Slider {
             min: 24,
             max: 56,
             step: 2,
-            unit: "px",
+            unit: "DIP",
         },
         default: 34,
+        store: Store::File,
+    },
+    Spec {
+        key: Key::IconSpacing,
+        id: "dock.icon_spacing",
+        section: Section::Dock,
+        label: "图标之间的距离",
+        help: "相邻 Dock 图标之间的留白",
+        control: Control::Slider {
+            min: 0,
+            max: 40,
+            step: 1,
+            unit: "DIP",
+        },
+        default: 18,
         store: Store::File,
     },
     Spec {
         key: Key::DockGap,
         id: "dock.bottom_gap",
         section: Section::Dock,
-        label: "底部间距",
+        label: "Dock 距离屏幕边缘",
         help: "Dock 与工作区底边的距离",
-        control: Control::Stepper {
+        control: Control::Slider {
             min: 0,
             max: 32,
             step: 2,
-            unit: "px",
+            unit: "DIP",
         },
         default: 8,
         store: Store::File,
@@ -275,24 +540,29 @@ pub const SCHEMA: &[Spec] = &[
         store: Store::File,
     },
     Spec {
-        key: Key::HideTaskbar,
-        id: "system.hide_taskbar",
-        section: Section::System,
-        label: "隐藏系统任务栏",
-        help: "DeskIsle 运行时隐藏主屏的 Windows 任务栏，退出后恢复",
+        key: Key::DockImmersive,
+        id: "dock.immersive",
+        section: Section::Dock,
+        label: "Dock 空闲时使用沉浸模式",
+        help: "移开指针后收起，移到工作区底边唤出",
         control: Control::Toggle,
-        default: 1,
+        default: 0,
         store: Store::File,
     },
     Spec {
-        key: Key::Autostart,
-        id: "system.autostart",
-        section: Section::System,
-        label: "开机自动启动",
-        help: "登录 Windows 后启动 DeskIsle",
-        control: Control::Toggle,
+        key: Key::DockRevealDelay,
+        id: "dock.reveal_delay",
+        section: Section::Dock,
+        label: "沉浸模式延迟显示时间",
+        help: "指针停留在底部唤出区域后的等待时间",
+        control: Control::Slider {
+            min: 0,
+            max: 1000,
+            step: 50,
+            unit: "ms",
+        },
         default: 0,
-        store: Store::System,
+        store: Store::File,
     },
     clock_preview(
         ClockKey::Format,
@@ -412,6 +682,8 @@ pub enum Adjust {
     Step(i32),
     /// Selects option `n` of a choice.
     Pick(usize),
+    /// Commits a slider position.
+    Set(i32),
 }
 
 impl Spec {
@@ -419,7 +691,7 @@ impl Spec {
     fn valid(&self, value: i32) -> Option<i32> {
         match self.control {
             Control::Toggle => (0..=1).contains(&value).then_some(value),
-            Control::Stepper { min, max, step, .. } => {
+            Control::Slider { min, max, step, .. } => {
                 let value = value.clamp(min, max);
                 Some(min + (value - min) / step * step)
             }
@@ -434,7 +706,7 @@ impl Spec {
                 "false" => 0,
                 _ => return None,
             },
-            Control::Stepper { min, max, .. } => {
+            Control::Slider { min, max, .. } => {
                 let value: i32 = text.parse().ok()?;
                 if !(min..=max).contains(&value) {
                     return None;
@@ -449,7 +721,7 @@ impl Spec {
     pub fn format(&self, value: i32) -> String {
         match self.control {
             Control::Toggle => (value != 0).to_string(),
-            Control::Stepper { .. } => value.to_string(),
+            Control::Slider { .. } => value.to_string(),
             Control::Choice(options) => options[value as usize].id.into(),
         }
     }
@@ -492,9 +764,10 @@ impl Settings {
         let next = match (spec(key).control, adjust) {
             (Control::Toggle, Adjust::Toggle) => 1 - value,
             (Control::Toggle, Adjust::Step(n)) => i32::from(n > 0),
-            (Control::Stepper { step, .. }, Adjust::Step(n)) => {
+            (Control::Slider { step, .. }, Adjust::Step(n)) => {
                 value.saturating_add(step.saturating_mul(n))
             }
+            (Control::Slider { .. }, Adjust::Set(n)) => n,
             (Control::Choice(options), Adjust::Toggle) => (value + 1) % options.len() as i32,
             (Control::Choice(options), Adjust::Step(n)) => {
                 value.saturating_add(n).clamp(0, options.len() as i32 - 1)
@@ -568,6 +841,11 @@ impl Settings {
         self.enabled(Key::Monitor(MonitorKey::Highlight))
     }
 
+    /// Interface pixels per 96 DIPs after applying the user's scale to Windows' DPI.
+    pub fn ui_dpi(&self, monitor_dpi: u32) -> u32 {
+        (monitor_dpi * self.get(Key::InterfaceScale) as u32 + 50) / 100
+    }
+
     /// The Dock icon edge in DIPs.
     pub fn icon_size(&self) -> i32 {
         self.get(Key::IconSize)
@@ -579,7 +857,7 @@ impl Settings {
     }
 
     pub fn theme(&self) -> Theme {
-        [Theme::System, Theme::Light, Theme::Dark][self.get(Key::Theme) as usize]
+        [Theme::System, Theme::Light, Theme::Dark, Theme::Automatic][self.get(Key::Theme) as usize]
     }
 
     /// The scale of a hovered Dock icon.
@@ -650,7 +928,7 @@ mod tests {
         assert_eq!(settings.dock_gap(), 8);
         assert!(!settings.enabled(Key::Autostart));
 
-        // Odd values snap down to the stepper's grid.
+        // Odd values snap down to the slider's grid.
         settings.set(Key::IconSize, 41);
         assert_eq!(settings.icon_size(), 40);
 
@@ -661,6 +939,25 @@ mod tests {
             read.set_text(id, text).unwrap();
         }
         assert_eq!(read, settings);
+    }
+
+    #[test]
+    fn slider_edits_round_trip_without_changing_legacy_settings() {
+        let mut settings = Settings::default();
+        settings.set_text("appearance.theme", "dark").unwrap();
+        settings.set_text("dock.bottom_gap", "14").unwrap();
+        assert!(settings.adjust(Key::InterfaceScale, Adjust::Set(125)));
+        assert_eq!(settings.ui_dpi(144), 180);
+        assert!(settings.adjust(Key::DockRevealDelay, Adjust::Set(300)));
+        assert!(settings.adjust(Key::IconSpacing, Adjust::Set(6)));
+        assert!(settings.adjust(Key::DockImmersive, Adjust::Toggle));
+        let mut restored = Settings::default();
+        for (key, value) in settings.file_entries() {
+            restored.set_text(key, &value).unwrap();
+        }
+        assert_eq!(restored, settings);
+        assert_eq!(restored.theme(), Theme::Dark);
+        assert_eq!(restored.dock_gap(), 14);
     }
 
     #[test]

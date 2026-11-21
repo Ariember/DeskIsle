@@ -27,11 +27,6 @@ const BADGE_ICON: f32 = 0.58;
 /// A tray icon's image inside its round backing. Application images fill their
 /// square, so they are drawn a little larger than DeskIsle's line icons.
 const TRAY_BADGE_ICON: f32 = 16.;
-/// The circle behind a tray icon the user keeps on the status bar. The menu palette is
-/// monochrome, so its `accent` is near black (or white) and would swallow colorful
-/// application icons; this is the same system blue the settings panel uses.
-const TRAY_ON_LIGHT: Rgb = (0, 122, 255);
-const TRAY_ON_DARK: Rgb = (10, 132, 255);
 /// The icon at the start of a slider's track.
 const SLIDER_ICON: f32 = 15.;
 /// Marks a window in an application's list; filled for the foreground window.
@@ -106,14 +101,16 @@ impl Renderer {
             ..Text::default()
         };
         let units = text.encode_utf16().collect::<Vec<_>>();
-        let measured = text_format(&self.write, style, size).and_then(|format| unsafe {
-            let layout = self
-                .write
-                .CreateTextLayout(&units, &format, f32::MAX, f32::MAX)?;
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut metrics)?;
-            Ok(metrics.widthIncludingTrailingWhitespace)
-        });
+        let measured = text_format(&self.write, self.palette.typography, style, 1.).and_then(
+            |format| unsafe {
+                let layout = self
+                    .write
+                    .CreateTextLayout(&units, &format, f32::MAX, f32::MAX)?;
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                layout.GetMetrics(&mut metrics)?;
+                Ok(metrics.widthIncludingTrailingWhitespace)
+            },
+        );
         measured.unwrap_or_else(|_| text.chars().count() as f32 * size * 0.62)
     }
 
@@ -466,17 +463,12 @@ impl Renderer {
         c.symbol(symbol, x, y, size * BADGE_ICON, ink, 1.)
     }
 
-    /// A tray icon's image, on a blue circle while the user keeps it `on` the status
+    /// A tray icon's image, on an accent circle while the user keeps it `on` the status
     /// bar. A registration without an image uses the same dot as the bar.
     fn tray_badge(&self, c: &Canvas, icon: Option<HICON>, x: f32, y: f32, on: bool) -> Result<()> {
         if on {
             let r = ICON_BADGE / 2.;
-            let tint = if c.p.dark {
-                TRAY_ON_DARK
-            } else {
-                TRAY_ON_LIGHT
-            };
-            c.fill(x - r, y - r, x + r, y + r, r, tint, 1.)?;
+            c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)?;
         }
         let Some(bitmap) = icon.and_then(|icon| self.hicon_bitmap(icon).ok()) else {
             let ink = if on { c.p.on_accent } else { c.p.muted };

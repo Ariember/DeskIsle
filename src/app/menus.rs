@@ -51,11 +51,24 @@ impl Bars {
         }
     }
 
-    fn app_menu(&self, index: usize) -> Menu<Command> {
+    fn app_menu(&mut self, index: usize) -> Menu<Command> {
         let app = &self.apps[index];
         let window = app.current_window(self.foreground).map(|w| w.id);
         let tray_menus = self.tray.app_menus(&app.app_id, window);
-        menu::app_menu(app, self.foreground, &tray_menus)
+        let mut menu = menu::app_menu(app, self.foreground, &tray_menus);
+        let limit = self.settings.get(crate::settings::Key::RecentFiles) as u32;
+        if limit > 0 {
+            let available = self.monitor.work.height;
+            let capacity = self.menu_layout(&mut menu).recent_file_capacity(available);
+            if let Some(paths) = platform::shell::recent_documents(
+                &self.apps[index],
+                self.foreground,
+                limit.min(capacity),
+            ) {
+                menu::append_recent_files(&mut menu, paths);
+            }
+        }
+        menu
     }
 
     pub(super) fn bar_menu(&mut self) -> Result<bool> {

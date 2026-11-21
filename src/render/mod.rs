@@ -33,6 +33,7 @@ use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
+use crate::settings::{Key, Settings};
 use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{StatusHit, StatusLayout};
 use crate::ui::system::Mark;
@@ -83,6 +84,7 @@ pub struct Renderer {
     about: Option<AboutView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
+    traditional_panel: bool,
     mark: Option<MarkLayer>,
 }
 
@@ -333,7 +335,7 @@ impl IconLayer {
 
 impl Renderer {
     /// Both HWNDs belong to this UI thread and outlive the renderer.
-    pub fn new(top: HWND, bottom: HWND, dark: bool) -> Result<Self> {
+    pub fn new(top: HWND, bottom: HWND, dark: bool, settings: &Settings) -> Result<Self> {
         unsafe {
             let create = |driver| -> Result<ID3D11Device> {
                 let mut device = None;
@@ -371,16 +373,22 @@ impl Renderer {
                 panel: None,
                 about: None,
                 launchpad: None,
-                palette: Palette::new(dark),
+                palette: Palette::new(dark, settings),
+                traditional_panel: settings.enabled(Key::Language),
                 mark: None,
             })
         }
     }
 
-    /// Switches between the light and dark palette. Returns whether it changed; the bars
-    /// repaint on their next draw, and the caller repaints the open settings panel.
-    pub fn set_dark(&mut self, dark: bool) -> bool {
-        let palette = Palette::new(dark);
+    pub fn is_dark(&self) -> bool {
+        self.palette.dark
+    }
+
+    /// Invalidates painted layers when their colors or text settings change.
+    pub fn set_appearance(&mut self, dark: bool, settings: &Settings) -> bool {
+        // Panel labels are repainted when the changed language choice is laid out.
+        self.traditional_panel = settings.enabled(Key::Language);
+        let palette = Palette::new(dark, settings);
         if self.palette == palette {
             return false;
         }

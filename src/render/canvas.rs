@@ -10,15 +10,37 @@ use windows::Win32::{
 };
 use windows::core::{Result, w};
 
+use crate::settings::{Key, Settings};
 use crate::ui::icon::{self, Paint, Step, Symbol, Tone};
 use crate::ui::panel::Area;
 
 pub(super) type Rgb = (u8, u8, u8);
 
-/// Monochrome colors for one appearance. Washes and hairlines use `line` at low alpha,
-/// so the same alphas read on both light and dark surfaces.
+pub(super) fn accent_color(index: i32, dark: bool) -> Rgb {
+    let (light, night) = [
+        ((0, 104, 218), (14, 108, 213)),
+        ((141, 67, 172), (145, 73, 180)),
+        ((187, 43, 117), (192, 50, 125)),
+        ((191, 52, 50), (195, 57, 58)),
+        ((177, 79, 6), (178, 83, 11)),
+        ((50, 123, 53), (59, 125, 58)),
+        ((99, 103, 111), (107, 110, 117)),
+    ][index as usize];
+    if dark { night } else { light }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Typography {
+    family: i32,
+    bold: bool,
+    scale: i32,
+    smooth: bool,
+}
+
+/// Shared drawing settings for a surface, included in painted layer cache keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
+    pub(super) typography: Typography,
     /// Whether this is the dark appearance, for surfaces that pick their own tones.
     pub(super) dark: bool,
     pub(super) bar: Rgb,
@@ -36,9 +58,17 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn new(dark: bool) -> Self {
+    pub fn new(dark: bool, settings: &Settings) -> Self {
+        let typography = Typography {
+            family: settings.get(Key::FontFamily),
+            bold: settings.enabled(Key::BoldFont),
+            scale: settings.get(Key::FontScale),
+            smooth: settings.enabled(Key::SmoothText),
+        };
+        let accent = accent_color(settings.get(Key::Accent), dark);
         if dark {
             Self {
+                typography,
                 dark,
                 bar: (16, 16, 16),
                 panel: (26, 26, 26),
@@ -46,13 +76,14 @@ impl Palette {
                 edge: (66, 66, 66),
                 ink: (244, 244, 244),
                 muted: (168, 168, 168),
-                accent: (244, 244, 244),
-                on_accent: (18, 18, 18),
+                accent,
+                on_accent: (255, 255, 255),
                 line: (255, 255, 255),
                 danger: (255, 128, 116),
             }
         } else {
             Self {
+                typography,
                 dark,
                 bar: (246, 246, 246),
                 panel: (238, 238, 238),
@@ -60,8 +91,8 @@ impl Palette {
                 edge: (204, 204, 204),
                 ink: (22, 22, 22),
                 muted: (102, 102, 102),
-                accent: (22, 22, 22),
-                on_accent: (250, 250, 250),
+                accent,
+                on_accent: (255, 255, 255),
                 line: (0, 0, 0),
                 danger: (196, 43, 28),
             }
@@ -115,7 +146,11 @@ pub(super) fn paint_region(
         let ctx: ID2D1DeviceContext = surface.BeginDraw(Some(&rect), &mut origin)?;
         // BeginDraw returns the atlas position of the requested rectangle's top left.
         ctx.SetDpi(96., 96.);
-        ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        ctx.SetTextAntialiasMode(if palette.typography.smooth {
+            D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+        } else {
+            D2D1_TEXT_ANTIALIAS_MODE_ALIASED
+        });
         let bounds = D2D_RECT_F {
             left: origin.x as f32,
             top: origin.y as f32,
@@ -524,7 +559,7 @@ impl Canvas {
             return Ok(());
         }
         unsafe {
-            let format = text_format(factory, style, style.size * self.scale)?;
+            let format = text_format(factory, self.p.typography, style, self.scale)?;
             self.ctx.DrawText(
                 &text.encode_utf16().collect::<Vec<_>>(),
                 &format,
@@ -564,25 +599,27 @@ impl Default for Text {
     }
 }
 
-/// A single vertically centered line that ends in an ellipsis when clipped. `size` is in
-/// the units the caller draws or measures in.
+/// The same format for drawing in pixels and measuring in DIPs.
 pub(super) fn text_format(
     factory: &IDWriteFactory,
+    typography: Typography,
     style: Text,
-    size: f32,
+    scale: f32,
 ) -> Result<IDWriteTextFormat> {
     unsafe {
         let format = factory.CreateTextFormat(
-            w!("Segoe UI"),
+            [w!("Segoe UI"), w!("Microsoft YaHei UI"), w!("DengXian")][typography.family as usize],
             None,
-            if style.bold {
+            if typography.bold {
+                DWRITE_FONT_WEIGHT_BOLD
+            } else if style.bold {
                 DWRITE_FONT_WEIGHT_SEMI_BOLD
             } else {
                 DWRITE_FONT_WEIGHT_NORMAL
             },
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            size,
+            style.size * scale * typography.scale as f32 / 100.,
             w!(""),
         )?;
         format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;

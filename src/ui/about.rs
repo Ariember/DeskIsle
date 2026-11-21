@@ -97,7 +97,7 @@ impl AboutLayout {
         hover: Option<AboutHit>,
         measure: impl Fn(&str, f32, bool) -> f32,
     ) -> Self {
-        let scale = dpi.max(96) as f32 / 96.;
+        let scale = dpi as f32 / 96.;
         let width = WIDTH;
         let close = Area::new(
             LIGHT_X - LIGHT_HIT,

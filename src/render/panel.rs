@@ -1,15 +1,17 @@
+use std::borrow::Cow;
 use windows::Win32::{
     Foundation::HWND,
+    Globalization::{LCMAP_TRADITIONAL_CHINESE, LCMapStringEx},
     Graphics::{DirectComposition::*, DirectWrite::*},
 };
-use windows::core::Result;
+use windows::core::{Error, Result, w};
 
 use crate::settings::{Adjust, Key, MonitorKey, SECTIONS, Section};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
 use super::Renderer;
-use super::canvas::{Canvas, Rgb, Text, paint};
+use super::canvas::{Canvas, Rgb, Text, accent_color, paint};
 
 const WHITE: Rgb = (255, 255, 255);
 const BLACK: Rgb = (0, 0, 0);
@@ -19,11 +21,38 @@ const CLOSE_CROSS: Rgb = (110, 12, 8);
 const LIGHT_RADIUS: f32 = 6.;
 const GROUP_RADIUS: f32 = 10.;
 
+/// Only panel-owned captions pass here. Each language keeps its own name in the selector.
+fn panel_caption(text: &str, traditional: bool) -> Result<Cow<'_, str>> {
+    if !traditional || text.is_ascii() || matches!(text, "简体中文" | "繁體中文") {
+        return Ok(Cow::Borrowed(text));
+    }
+    let source: Vec<_> = text.encode_utf16().collect();
+    let map = |destination: Option<&mut [u16]>| unsafe {
+        LCMapStringEx(
+            w!("zh-TW"),
+            LCMAP_TRADITIONAL_CHINESE,
+            &source,
+            destination,
+            None,
+            None,
+            Default::default(),
+        )
+    };
+    let size = map(None);
+    if size == 0 {
+        return Err(Error::from_thread());
+    }
+    let mut result = vec![0; size as usize];
+    if map(Some(&mut result)) == 0 {
+        return Err(Error::from_thread());
+    }
+    Ok(String::from_utf16_lossy(&result).into())
+}
+
 fn section_color(section: Section) -> Rgb {
     match section {
-        Section::Appearance => (141, 83, 180),
+        Section::General => (87, 102, 116),
         Section::Dock => (27, 112, 178),
-        Section::System => (87, 102, 116),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
     }
@@ -32,9 +61,8 @@ fn section_color(section: Section) -> Rgb {
 /// The icon on a page's colored tile in the sidebar.
 fn section_symbol(section: Section) -> Symbol {
     match section {
-        Section::Appearance => Symbol::Palette,
+        Section::General => Symbol::Computer,
         Section::Dock => Symbol::Dock,
-        Section::System => Symbol::Computer,
         Section::Clock => Symbol::Clock,
         Section::Monitor => Symbol::Chip,
     }
@@ -72,7 +100,7 @@ struct Tones {
 }
 
 impl Tones {
-    fn new(dark: bool) -> Self {
+    fn new(dark: bool, accent: Rgb) -> Self {
         if dark {
             Self {
                 window: (30, 30, 31),
@@ -83,7 +111,7 @@ impl Tones {
                 group: 0.05,
                 group_rim: 0.07,
                 separator: 0.08,
-                accent: (10, 132, 255),
+                accent,
                 face: (92, 92, 95),
                 face_rim: (WHITE, 0.08),
                 face_shadow: 0.3,
@@ -101,7 +129,7 @@ impl Tones {
                 group: 0.035,
                 group_rim: 0.06,
                 separator: 0.07,
-                accent: (0, 122, 255),
+                accent,
                 face: WHITE,
                 face_rim: (BLACK, 0.13),
                 face_shadow: 0.07,
@@ -202,7 +230,7 @@ impl Renderer {
         let style = Text { size, bold, align };
         c.draw_text(
             &self.write,
-            text,
+            &panel_caption(text, self.traditional_panel)?,
             c.rect(a.left, a.top, a.right, a.bottom),
             style,
             ink,
@@ -237,7 +265,7 @@ impl Renderer {
     }
 
     fn paint_panel(&self, c: &Canvas, layout: &PanelLayout, glass: bool) -> Result<()> {
-        let t = Tones::new(c.p.dark);
+        let t = Tones::new(c.p.dark, c.p.accent);
         let (w, h) = (layout.width, layout.height);
         let hover = |action: Action| layout.hover == Some(action);
         let side = panel::SIDEBAR;
@@ -246,7 +274,16 @@ impl Renderer {
         // The sidebar runs the full height, under the window lights, as in macOS.
         if glass {
             let (tint, alpha) = t.sidebar_glass;
-            c.fill(0., 0., side, h, 0., tint, alpha)?;
+            let glass_strength = layout.backdrop as f32 / 100.;
+            c.fill(
+                0.,
+                0.,
+                side,
+                h,
+                0.,
+                tint,
+                1. - (1. - alpha) * glass_strength,
+            )?;
         } else {
             c.gradient(
                 0.,
@@ -358,8 +395,8 @@ impl Renderer {
         }
 
         c.clipped(c.rect(view.left, view.top, view.right, view.bottom), || {
-            if let (Some(first), Some(last)) = (first, last) {
-                let (l, top, r, bottom) = (first.left, first.top, first.right, last.bottom);
+            for group in &layout.groups {
+                let (l, top, r, bottom) = (group.left, group.top, group.right, group.bottom);
                 c.fill(l, top, r, bottom, GROUP_RADIUS, c.p.line, t.group)?;
                 c.stroke(l, top, r, bottom, GROUP_RADIUS, c.p.line, t.group_rim)?;
             }
@@ -400,6 +437,30 @@ impl Renderer {
             };
             self.label(c, text, note, 11., false, c.p.muted, 1.)?;
         }
+        if let Some(button) = layout.display_settings {
+            self.button_face(c, &t, button, 6., hover(Action::DisplaySettings))?;
+            if layout.focus == Some(layout.rows.len()) {
+                c.stroke(
+                    button.left,
+                    button.top,
+                    button.right,
+                    button.bottom,
+                    6.,
+                    t.accent,
+                    1.,
+                )?;
+            }
+            self.label_aligned(
+                c,
+                "屏幕刷新率…",
+                button,
+                13.,
+                false,
+                c.p.ink,
+                1.,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?;
+        }
         self.button_face(c, &t, r, 6., hover(Action::Reset))?;
         self.label_aligned(
             c,
@@ -422,7 +483,7 @@ impl Renderer {
         row: &panel::Row,
     ) -> Result<()> {
         let a = row.card;
-        if index > 0 {
+        if index > 0 && layout.rows[index - 1].card.bottom == a.top {
             // Inset separators between the grouped rows.
             let y = a.top;
             c.fill(
@@ -468,11 +529,25 @@ impl Renderer {
             )?;
         }
         let text = panel::text_area(row);
-        let middle = a.middle();
+        let stacked = matches!(row.part, Part::Slider { .. }) || panel::stacked_choice(row.key);
+        let middle = if stacked { a.top + 25. } else { a.middle() };
         let label = Area {
             top: a.top + 8.,
             bottom: middle + 2.,
             ..text
+        };
+        let label = if row.key == Key::Accent {
+            let icon = Area {
+                right: label.left + 18.,
+                ..label
+            };
+            c.symbol_in(Symbol::Palette, icon, 15., c.p.muted, 1.)?;
+            Area {
+                left: icon.right + 4.,
+                ..label
+            }
+        } else {
+            label
         };
         self.label(c, row.label, label, 13., false, c.p.ink, 1.)?;
         if let Some(detail) = &row.detail {
@@ -540,6 +615,14 @@ impl Renderer {
                 bottom: a.bottom - 9.,
                 ..text
             };
+            let help = if stacked {
+                Area {
+                    bottom: a.top + 47.,
+                    ..help
+                }
+            } else {
+                help
+            };
             self.label(c, row.help, help, 11., false, c.p.muted, 1.)?;
         }
         self.paint_panel_control(c, t, layout, row.key, &row.part)
@@ -593,33 +676,113 @@ impl Renderer {
                 )?;
                 c.round(x - knob, y - knob, x + knob, y + knob, knob, WHITE)?;
             }
-            Part::Stepper {
-                minus,
+            Part::Slider {
+                area,
+                min,
+                max,
                 value,
-                plus,
-                text,
-                can_down,
-                can_up,
+                unit,
+                ..
             } => {
-                for (area, symbol, enabled, step) in [
-                    (minus, Symbol::Minus, can_down, -1),
-                    (plus, Symbol::Plus, can_up, 1),
-                ] {
-                    let lit = *enabled && hover(Adjust::Step(step));
-                    self.button_face(c, t, *area, 6., lit)?;
-                    let alpha = if *enabled { 0.9 } else { 0.3 };
-                    c.symbol_in(symbol, *area, 12., c.p.ink, alpha)?;
+                let (left, right) = panel::slider_track(*area);
+                let y = area.middle();
+                let x = left + (right - left) * (*value - *min) as f32 / (*max - *min) as f32;
+                c.fill(left, y - 2., right, y + 2., 2., c.p.line, t.track)?;
+                if x > left {
+                    c.round(left, y - 2., x, y + 2., 2., t.accent)?;
                 }
+                self.button_face(c, t, Area::new(x - 5., y - 10., x + 5., y + 10.), 5., false)?;
+                let readout =
+                    Area::new(area.right - 76., area.top - 45., area.right, area.top - 25.);
                 self.label_aligned(
                     c,
-                    text,
-                    *value,
-                    13.,
+                    &format!("{value} {unit}"),
+                    readout,
+                    12.,
                     false,
                     c.p.ink,
                     1.,
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
                 )?;
+            }
+            Part::Segments { options, selected } if key == Key::Accent => {
+                for (i, (area, _)) in options.iter().enumerate() {
+                    let (x, y) = ((area.left + area.right) / 2., area.middle());
+                    let color = accent_color(i as i32, c.p.dark);
+                    c.round(x - 9., y - 9., x + 9., y + 9., 9., color)?;
+                    if i == *selected {
+                        c.round(x - 3., y - 3., x + 3., y + 3., 3., WHITE)?;
+                    } else if hover(Adjust::Pick(i)) {
+                        c.stroke(x - 11., y - 11., x + 11., y + 11., 11., color, 0.65)?;
+                    }
+                }
+            }
+            Part::Segments { options, selected } if key == Key::Theme => {
+                for (i, (area, label)) in options.iter().enumerate() {
+                    let x = (area.left + area.right) / 2.;
+                    let top = area.top + 3.;
+                    let width = ((area.right - area.left) * 0.70).min(66.);
+                    let preview = Area::new(x - width / 2., top, x + width / 2., top + 34.);
+                    // System and scheduled modes show both appearances.
+                    let light = (216, 221, 228);
+                    let dark = (55, 58, 65);
+                    let base = if i == 2 { dark } else { light };
+                    c.round(preview.left, top, preview.right, preview.bottom, 5., base)?;
+                    if i == 0 || i == 3 {
+                        c.clipped(c.rect(x, top, preview.right, preview.bottom), || {
+                            c.round(preview.left, top, preview.right, preview.bottom, 5., dark)
+                        })?;
+                    }
+                    let icon = match i {
+                        0 => Symbol::Computer,
+                        1 => Symbol::Sun,
+                        2 => Symbol::Moon,
+                        _ => Symbol::Clock,
+                    };
+                    let tile =
+                        Area::new(preview.left + 3., top + 2., preview.left + 23., top + 22.);
+                    c.symbol_in(icon, tile, 13., if i == 2 { WHITE } else { dark }, 0.9)?;
+                    c.fill(
+                        x - width * 0.28,
+                        top + 24.,
+                        x + width * 0.28,
+                        top + 30.,
+                        3.,
+                        WHITE,
+                        0.65,
+                    )?;
+                    let selected = i == *selected;
+                    let rim = if selected { t.accent } else { c.p.line };
+                    c.stroke(
+                        preview.left - 1.,
+                        top - 1.,
+                        preview.right + 1.,
+                        preview.bottom + 1.,
+                        6.,
+                        rim,
+                        if selected {
+                            1.
+                        } else if hover(Adjust::Pick(i)) {
+                            0.5
+                        } else {
+                            0.18
+                        },
+                    )?;
+                    let caption = Area {
+                        top: preview.bottom + 3.,
+                        ..*area
+                    };
+                    self.label_aligned(
+                        c,
+                        label,
+                        caption,
+                        12.,
+                        selected,
+                        c.p.ink,
+                        1.,
+                        DWRITE_TEXT_ALIGNMENT_CENTER,
+                    )?;
+                }
             }
             Part::Segments { options, selected } => {
                 // A macOS segmented control: a recessed track with the chosen segment
@@ -670,5 +833,107 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::panel_caption;
+
+    #[test]
+    fn panel_script_changes_while_language_names_stay_recognizable() {
+        assert_eq!(panel_caption("常规", true).unwrap(), "常規");
+        assert_eq!(panel_caption("常规", false).unwrap(), "常规");
+        assert_eq!(panel_caption("简体中文", true).unwrap(), "简体中文");
+        assert_eq!(panel_caption("繁體中文", false).unwrap(), "繁體中文");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::geometry::Rect;
+    use crate::settings::Settings;
+    use crate::ui::panel::PanelState;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+    };
+    use windows::core::w;
+
+    struct HiddenWindow(HWND);
+
+    impl HiddenWindow {
+        fn create() -> Result<Self> {
+            // The built-in STATIC class needs no shared test class registration.
+            unsafe {
+                CreateWindowExW(
+                    WS_EX_NOREDIRECTIONBITMAP,
+                    w!("STATIC"),
+                    None,
+                    WS_POPUP,
+                    0,
+                    0,
+                    900,
+                    700,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(Self)
+            }
+        }
+    }
+
+    impl Drop for HiddenWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows desktop compositor"]
+    fn general_and_dock_pages_commit_in_both_appearances() -> Result<()> {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+        let result = paint_pages();
+        // All windows and graphics objects were owned by this test thread.
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    fn paint_pages() -> Result<()> {
+        let top = HiddenWindow::create()?;
+        let bottom = HiddenWindow::create()?;
+        let panel = HiddenWindow::create()?;
+        let work = Rect {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 700,
+        };
+        let mut settings = Settings::default();
+        settings.set(Key::FontScale, 120);
+        let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
+        for dark in [false, true] {
+            renderer.set_appearance(dark, &settings);
+            for section in [Section::General, Section::Dock] {
+                let mut state = PanelState {
+                    page: SECTIONS.iter().position(|&s| s == section).unwrap(),
+                    ..Default::default()
+                };
+                loop {
+                    let layout = PanelLayout::new(&mut state, &settings, 120, work);
+                    renderer.draw_panel(panel.0, &layout, 120, dark)?;
+                    if state.scroll >= layout.max_scroll {
+                        break;
+                    }
+                    state.scroll = (state.scroll + layout.view.bottom - layout.view.top)
+                        .min(layout.max_scroll);
+                }
+            }
+        }
+        unsafe { renderer.device.WaitForCommitCompletion()? };
+        renderer.check_device()
     }
 }

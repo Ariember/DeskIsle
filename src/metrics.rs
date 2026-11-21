@@ -88,6 +88,8 @@ pub struct Indicator {
     pub value: Option<u8>,
     pub history: Vec<Option<u8>>,
     pub highlight: bool,
+    /// Display preference only. Samples and history always use the sensor's Celsius value.
+    pub fahrenheit: bool,
 }
 
 impl Indicator {
@@ -98,6 +100,18 @@ impl Indicator {
             value: None,
             history: Vec::new(),
             highlight: false,
+            fahrenheit: false,
+        }
+    }
+
+    pub fn format_value(&self, value: u8) -> String {
+        match self.metric {
+            Metric::CpuTemperature | Metric::GpuTemperature if self.fahrenheit => {
+                let degrees = (u16::from(value) * 9 + 2) / 5 + 32;
+                format!("{degrees}°F")
+            }
+            Metric::CpuTemperature | Metric::GpuTemperature => format!("{value}°C"),
+            Metric::Cpu | Metric::Memory | Metric::Disk => format!("{value}%"),
         }
     }
 
@@ -168,5 +182,9 @@ mod tests {
             true,
         );
         assert!(!temperature.highlight);
+        assert_eq!(temperature.format_value(23), "23°C");
+        temperature.fahrenheit = true;
+        assert_eq!(temperature.format_value(23), "73°F");
+        assert_eq!(temperature.format_value(150), "302°F");
     }
 }

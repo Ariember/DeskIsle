@@ -75,7 +75,7 @@ impl Renderer {
         hwnd: HWND,
         layout: &AboutLayout,
         dpi: u32,
-        glass: bool,
+        backdrop: i32,
     ) -> Result<()> {
         if self.about.as_ref().map(|view| view.hwnd) != Some(hwnd) {
             self.close_about();
@@ -92,7 +92,7 @@ impl Renderer {
         }
         let (width, height) = layout.pixels();
         let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-            self.paint_about(c, layout, glass)
+            self.paint_about(c, layout, backdrop)
         })?;
         let view = self.about.as_ref().expect("about card bound above");
         unsafe {
@@ -130,12 +130,20 @@ impl Renderer {
         )
     }
 
-    fn paint_about(&self, c: &Canvas, layout: &AboutLayout, glass: bool) -> Result<()> {
+    fn paint_about(&self, c: &Canvas, layout: &AboutLayout, backdrop: i32) -> Result<()> {
         let t = Tones::new(c.p.dark);
         let (w, h) = (layout.width, layout.height);
-        if glass {
+        if backdrop > 0 {
             let (tint, alpha) = t.glass;
-            c.fill(0., 0., w, h, 0., tint, alpha)?;
+            c.fill(
+                0.,
+                0.,
+                w,
+                h,
+                0.,
+                tint,
+                1. - (1. - alpha) * backdrop as f32 / 100.,
+            )?;
         } else {
             c.gradient(0., 0., w, h, 0., (t.top, 1.), (t.bottom, 1.))?;
         }

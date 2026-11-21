@@ -68,6 +68,38 @@ impl Drop for Desktop {
 
 pub struct Bar(pub HWND, Option<drop_files::Registration>);
 
+/// The registering UI thread owns the window and drops this binding before destroying it.
+pub struct TaskbarShortcut {
+    hwnd: HWND,
+    id: i32,
+}
+
+impl TaskbarShortcut {
+    pub fn register(hwnd: HWND, choice: i32) -> Result<Option<Self>> {
+        let (modifiers, key, label) = match choice {
+            0 => return Ok(None),
+            1 => (MOD_CONTROL | MOD_ALT, VK_T, "Ctrl+Alt+T"),
+            2 => (MOD_CONTROL | MOD_SHIFT, VK_F11, "Ctrl+Shift+F11"),
+            _ => return Err(Error::new(E_INVALIDARG, "未知的任务栏快捷键")),
+        };
+        // A distinct ID per preset lets the old registration survive a conflict.
+        unsafe { RegisterHotKey(Some(hwnd), choice, modifiers | MOD_NOREPEAT, key.0 as u32) }
+            .map_err(|error| {
+                Error::new(
+                    error.code(),
+                    format!("无法注册任务栏快捷键 {label}：{error}"),
+                )
+            })?;
+        Ok(Some(Self { hwnd, id: choice }))
+    }
+}
+
+impl Drop for TaskbarShortcut {
+    fn drop(&mut self) {
+        let _ = unsafe { UnregisterHotKey(Some(self.hwnd), self.id) };
+    }
+}
+
 impl Drop for Bar {
     fn drop(&mut self) {
         // Both bars are created, used and destroyed on the same UI thread.
@@ -184,6 +216,7 @@ pub fn monitor() -> Result<Monitor> {
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
 const TRAY_NOTICE_TIMER: usize = 2;
+const DOCK_REVEAL_TIMER: usize = 3;
 const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
@@ -309,9 +342,9 @@ impl Bar {
     pub fn release(&self) {
         // Cancellation can arrive after a different window took capture.
         if unsafe { GetCapture() } == self.0 {
-            RELEASING_BAR.set(true);
+            RELEASING_CAPTURE.set(true);
             let _ = unsafe { ReleaseCapture() };
-            RELEASING_BAR.set(false);
+            RELEASING_CAPTURE.set(false);
         }
     }
 
@@ -332,6 +365,18 @@ impl Bar {
                 SWP_NOACTIVATE | show,
             )
         }
+    }
+
+    /// Arms a one-shot dwell timer on the Dock window.
+    pub fn time_dock_reveal(&self, delay_ms: u32) -> Result<()> {
+        if unsafe { SetTimer(Some(self.0), DOCK_REVEAL_TIMER, delay_ms, None) } == 0 {
+            return Err(Error::from_thread());
+        }
+        Ok(())
+    }
+
+    pub fn cancel_dock_reveal(&self) {
+        let _ = unsafe { KillTimer(Some(self.0), DOCK_REVEAL_TIMER) };
     }
 }
 
@@ -392,6 +437,8 @@ pub enum Event {
     Display,
     Clock,
     TrayNoticeExpired,
+    DockReveal,
+    TaskbarShortcut(i32),
     MetricsUpdate,
     Move(HWND, i32, i32),
     Leave(HWND),
@@ -451,11 +498,13 @@ pub enum Event {
     /// Pointer input in the settings panel, in its client pixels.
     PanelMove(i32, i32),
     PanelLeave,
+    PanelPress(i32, i32),
+    PanelCancel,
     PanelClick(i32, i32),
     PanelScroll(i16),
     PanelKey(PanelKey),
     /// The panel moved to a monitor with this DPI and already took the suggested size.
-    PanelDpi(u32),
+    PanelDpi,
     PanelClose,
     Launchpad(launchpad::LaunchpadEvent),
     About(about::AboutEvent),
@@ -481,11 +530,13 @@ impl Event {
         matches!(
             self,
             Event::PanelMove(..)
+                | Event::PanelPress(..)
+                | Event::PanelCancel
                 | Event::PanelLeave
                 | Event::PanelClick(..)
                 | Event::PanelScroll(_)
                 | Event::PanelKey(_)
-                | Event::PanelDpi(_)
+                | Event::PanelDpi
                 | Event::PanelClose
         )
     }
@@ -494,7 +545,7 @@ impl Event {
 thread_local! {
     /// ReleaseCapture synchronously sends WM_CAPTURECHANGED. The application
     /// already finished that press and may start a new one before reading events.
-    static RELEASING_BAR: Cell<bool> = const { Cell::new(false) };
+    static RELEASING_CAPTURE: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     /// The settings panel's caption height and the left and right edges of its close
@@ -511,6 +562,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Event::Paint
         }
         WM_CLOSE => Event::Quit,
+        WM_HOTKEY if matches!(wp.0, 1 | 2) => Event::TaskbarShortcut(wp.0 as i32),
         shell::WINDOWS_CHANGED => Event::Refresh,
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => Event::Display,
         WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => Event::Display,
@@ -527,6 +579,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let _ = unsafe { KillTimer(Some(hwnd), TRAY_NOTICE_TIMER) };
             Event::TrayNoticeExpired
         }
+        WM_TIMER if wp.0 == DOCK_REVEAL_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DOCK_REVEAL_TIMER) };
+            Event::DockReveal
+        }
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => {
             // A non-activating bar may miss a release outside its visible area.
@@ -535,7 +591,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             Event::Move(hwnd, x, y)
         }
-        WM_CAPTURECHANGED if !RELEASING_BAR.get() => Event::CancelPress(hwnd),
+        WM_CAPTURECHANGED if !RELEASING_CAPTURE.get() => Event::CancelPress(hwnd),
         WM_CANCELMODE => {
             queue(hwnd, Event::CancelPress(hwnd));
             // Default processing releases this window's capture.
@@ -642,6 +698,15 @@ pub fn cursor() -> Result<POINT> {
     let mut pt = POINT::default();
     unsafe { GetCursorPos(&mut pt)? };
     Ok(pt)
+}
+
+pub fn local_hour() -> u16 {
+    unsafe { GetLocalTime() }.wHour
+}
+
+/// HWND belongs to a live DeskIsle window on the calling UI thread.
+pub fn window_dpi(hwnd: HWND) -> u32 {
+    unsafe { GetDpiForWindow(hwnd) }
 }
 
 pub fn clock(hwnd: HWND) -> Result<String> {
@@ -794,6 +859,18 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 pub struct PanelWindow(pub HWND, bool);
 
 impl PanelWindow {
+    pub fn capture(&self) {
+        unsafe { SetCapture(self.0) };
+    }
+
+    pub fn release(&self) {
+        if unsafe { GetCapture() } == self.0 {
+            RELEASING_CAPTURE.set(true);
+            let _ = unsafe { ReleaseCapture() };
+            RELEASING_CAPTURE.set(false);
+        }
+    }
+
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
     /// height and the left and right edges of the close button, and `sidebar` the
     /// sidebar's width, in client pixels.
@@ -963,7 +1040,13 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             Event::PanelMove(x, y)
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Event::PanelLeave,
+        WM_LBUTTONDOWN => Event::PanelPress(x, y),
         WM_LBUTTONUP => Event::PanelClick(x, y),
+        WM_CAPTURECHANGED if !RELEASING_CAPTURE.get() => Event::PanelCancel,
+        WM_CANCELMODE => {
+            queue(hwnd, Event::PanelCancel);
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
         WM_MOUSEWHEEL => Event::PanelScroll((wp.0 >> 16) as i16),
         WM_KEYDOWN => {
             let held = |key: VIRTUAL_KEY| unsafe { GetKeyState(key.0 as i32) } < 0;
@@ -996,7 +1079,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
-            Event::PanelDpi((wp.0 & 0xffff) as u32)
+            Event::PanelDpi
         }
         WM_CLOSE => Event::PanelClose,
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

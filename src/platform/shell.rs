@@ -25,6 +25,9 @@ use windows::core::{BOOL, Error, HSTRING, Interface, Owned, PCWSTR, PWSTR, Resul
 
 use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
 
+mod recent;
+pub use recent::recent_documents;
+
 pub const WINDOWS_CHANGED: u32 = WM_APP + 1;
 
 /// A simple program shortcut shares its executable's running windows. Keep launching
@@ -42,15 +45,26 @@ pub fn pin_from_path(path: PathBuf) -> PinnedApp {
     pin
 }
 
-fn shortcut_program(path: &Path) -> Option<PathBuf> {
-    // Read the saved target without invoking Resolve, which can search or prompt.
-    // Virtual, unreadable and parameterized links remain independently launchable.
+fn load_shortcut(path: &Path) -> Option<IShellLinkW> {
     let link: IShellLinkW =
         unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
     let file: IPersistFile = link.cast().ok()?;
+    unsafe { file.Load(&HSTRING::from(path), STGM_READ) }.ok()?;
+    Some(link)
+}
+
+fn shortcut_program(path: &Path) -> Option<PathBuf> {
+    // Read the saved target without invoking Resolve, which can search or prompt.
+    // Virtual, unreadable and parameterized links remain independently launchable.
+    let path = plain_link_target(&load_shortcut(path)?)?;
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        .then_some(path)
+}
+
+fn plain_link_target(link: &IShellLinkW) -> Option<PathBuf> {
     let mut text = vec![0u16; 32_768];
     unsafe {
-        file.Load(&HSTRING::from(path), STGM_READ).ok()?;
         link.GetArguments(&mut text).ok()?;
         if text[0] != 0 {
             return None;
@@ -59,11 +73,7 @@ fn shortcut_program(path: &Path) -> Option<PathBuf> {
     }
     let len = text.iter().position(|&unit| unit == 0)?;
     let path = PathBuf::from(OsString::from_wide(&text[..len]));
-    (path.is_absolute()
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe")))
-    .then_some(path)
+    path.is_absolute().then_some(path)
 }
 
 /// The name an executable gives itself in its version resource: the product name, else

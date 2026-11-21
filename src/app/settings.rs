@@ -4,10 +4,10 @@
 use super::Bars;
 use crate::platform::{self, Event, PanelKey, PanelWindow, display, startup};
 use crate::render::is_device_lost;
-use crate::settings::{Key, SCHEMA, SECTIONS, Settings, Store, Theme};
+use crate::settings::{Adjust, Key, SCHEMA, SECTIONS, Settings, Store, Theme};
 use crate::storage;
 use crate::ui::layout::DockStyle;
-use crate::ui::panel::{Action, Nav, PanelLayout, PanelState};
+use crate::ui::panel::{Action, Nav, PanelLayout, PanelState, panel_dpi};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::core::{Error, Result};
 
@@ -18,6 +18,7 @@ pub(super) struct Panel {
     dpi: u32,
     /// Whether the sidebar is painted translucent over the acrylic backdrop.
     glass: bool,
+    pressed: Option<Action>,
 }
 
 /// The sidebar shows its backdrop only where DWM draws acrylic: the build supports it and
@@ -50,6 +51,12 @@ pub(super) fn load() -> Settings {
         }
         Err(error) => platform::report_error(None, &error),
     }
+    if settings.theme() == Theme::Automatic
+        && settings.enabled(Key::SyncSystemTheme)
+        && let Err(error) = display::set_system_dark(dark(&settings))
+    {
+        platform::report_error(None, &error);
+    }
     settings
 }
 
@@ -60,7 +67,14 @@ pub(super) fn dark(settings: &Settings) -> bool {
         Theme::System => display::system_dark().unwrap_or(false),
         Theme::Light => false,
         Theme::Dark => true,
+        Theme::Automatic => !(6..18).contains(&platform::local_hour()),
     }
+}
+
+pub(super) fn primary_monitor(settings: &Settings) -> Result<platform::Monitor> {
+    let mut monitor = platform::monitor()?;
+    monitor.dpi = settings.ui_dpi(monitor.dpi);
+    Ok(monitor)
 }
 
 fn nav(key: PanelKey) -> Option<Nav> {
@@ -82,11 +96,26 @@ impl Bars {
         DockStyle {
             icon: self.settings.icon_size(),
             gap: self.settings.dock_gap(),
+            spacing: self.settings.get(Key::IconSpacing),
         }
     }
 
     pub(super) fn dark(&self) -> bool {
         dark(&self.settings)
+    }
+
+    pub(super) fn update_theme_from_desktop(&mut self) -> Result<()> {
+        if self.settings.theme() == Theme::Automatic
+            && self.settings.enabled(Key::SyncSystemTheme)
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.is_dark() != self.dark())
+            && let Err(error) = display::set_system_dark(self.dark())
+        {
+            platform::report_error(Some(self.settings_owner()), &error);
+        }
+        self.apply_theme()
     }
 
     /// Switches the palette after the theme setting or Windows' app mode changed, and the
@@ -97,8 +126,11 @@ impl Bars {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let repalette = renderer.set_dark(dark);
+        let repalette = renderer.set_appearance(dark, &self.settings);
         self.retheme_about(dark, repalette)?;
+        if repalette {
+            self.draw_launchpad()?;
+        }
         let Some(panel) = self.panel.as_mut() else {
             return Ok(());
         };
@@ -126,7 +158,7 @@ impl Bars {
             panel.window.show();
             return Ok(());
         }
-        let dpi = self.monitor.dpi;
+        let dpi = panel_dpi(self.monitor.dpi, self.monitor.work);
         let mut state = PanelState::default();
         let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work);
         let window = PanelWindow::create(
@@ -138,6 +170,7 @@ impl Bars {
         self.panel = Some(Panel {
             glass: glass(&window),
             window,
+            pressed: None,
             state,
             layout,
             dpi,
@@ -171,7 +204,7 @@ impl Bars {
     fn draw_panel(&mut self) -> Result<()> {
         match self.paint_panel() {
             // Rebuilding the device for the bars repaints the panel too.
-            Err(error) if is_device_lost(&error) => self.draw(),
+            Err(error) if is_device_lost(&error) => self.rebuild_renderer(),
             result => result,
         }
     }
@@ -183,6 +216,10 @@ impl Bars {
             return Ok(());
         };
         let work = panel.window.work_area()?;
+        panel.dpi = panel_dpi(
+            self.settings.ui_dpi(platform::window_dpi(panel.window.0)),
+            work,
+        );
         let layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work);
         if layout == panel.layout {
             return Ok(());
@@ -206,22 +243,65 @@ impl Bars {
             return Ok(());
         };
         let action = match event {
+            Event::PanelPress(x, y) => {
+                panel.pressed = panel.layout.hit(x, y);
+                if let Some(key) = panel.layout.slider_at(x, y)
+                    && let Some(Action::Change(_, Adjust::Set(value))) =
+                        panel.layout.slider_action(key, x)
+                {
+                    panel.window.capture();
+                    panel.state.slider_preview = Some((key, value));
+                }
+                None
+            }
+            Event::PanelCancel => {
+                panel.state.slider_preview = None;
+                panel.pressed = None;
+                None
+            }
             Event::PanelMove(x, y) => {
-                panel.state.hover = panel.layout.hit(x, y);
+                if let Some((key, _)) = panel.state.slider_preview {
+                    if let Some(Action::Change(_, Adjust::Set(value))) =
+                        panel.layout.slider_action(key, x)
+                    {
+                        panel.state.slider_preview = Some((key, value));
+                    }
+                } else {
+                    panel.state.hover = panel.layout.hit(x, y);
+                }
                 None
             }
             Event::PanelLeave => {
                 panel.state.hover = None;
                 None
             }
-            Event::PanelClick(x, y) => panel.layout.hit(x, y),
+            Event::PanelClick(x, y) => {
+                let pressed = panel.pressed.take();
+                if let Some((key, _)) = panel.state.slider_preview.take() {
+                    panel.window.release();
+                    panel.layout.slider_action(key, x)
+                } else {
+                    pressed.filter(|action| Some(*action) == panel.layout.hit(x, y))
+                }
+            }
+            Event::PanelKey(PanelKey::Escape) if panel.state.slider_preview.is_some() => {
+                panel.state.slider_preview = None;
+                panel.pressed = None;
+                panel.window.release();
+                None
+            }
+            Event::PanelScroll(_) | Event::PanelKey(_) if panel.state.slider_preview.is_some() => {
+                None
+            }
             Event::PanelScroll(delta) => {
                 panel.state.scroll_by(delta, &panel.layout);
                 None
             }
             Event::PanelKey(key) => nav(key).and_then(|nav| panel.state.key(nav, &panel.layout)),
-            Event::PanelDpi(dpi) => {
-                panel.dpi = dpi.max(96);
+            Event::PanelDpi => {
+                panel.state.slider_preview = None;
+                panel.pressed = None;
+                panel.window.release();
                 None
             }
             Event::PanelClose => Some(Action::Close),
@@ -231,6 +311,13 @@ impl Bars {
             Some(Action::Close) => {
                 self.close_settings();
                 return Ok(());
+            }
+            Some(Action::DisplaySettings) => {
+                let owner = panel.window.0;
+                if let Err(error) = platform::shell::execute(owner, "ms-settings:display-advanced")
+                {
+                    platform::report_error(Some(owner), &error);
+                }
             }
             Some(Action::Page(page)) => panel.state.open_page(page),
             Some(Action::Reset) => {
@@ -252,6 +339,15 @@ impl Bars {
         self.relayout_panel()
     }
 
+    pub(super) fn toggle_taskbar(&mut self) -> Result<()> {
+        let mut next = self.settings.clone();
+        next.set(
+            Key::HideTaskbar,
+            i32::from(!self.settings.enabled(Key::HideTaskbar)),
+        );
+        self.apply_settings(next)
+    }
+
     /// Makes `next` the current settings: applies every changed value, reverts those the
     /// system refused, then saves the file-backed values. Failures are reported and the
     /// remaining changes still apply.
@@ -260,19 +356,48 @@ impl Bars {
         let changed: Vec<_> = self.settings.changed(&previous).collect();
         let (mut relayout, mut redisplay, mut save, mut retheme) = (false, false, false, false);
         let mut monitor_changed = false;
+        let mut immersion_changed = false;
+        let mut backdrop_changed = false;
         for spec in changed {
             let enabled = self.settings.enabled(spec.key);
             let result = match spec.key {
-                Key::Theme => {
+                Key::InterfaceScale => {
+                    redisplay = true;
+                    Ok(())
+                }
+                Key::Theme | Key::SyncSystemTheme => {
+                    retheme = true;
+                    if self.settings.enabled(Key::SyncSystemTheme)
+                        && self.settings.theme() != Theme::System
+                    {
+                        display::set_system_dark(self.dark())
+                    } else {
+                        Ok(())
+                    }
+                }
+                Key::Backdrop => {
+                    backdrop_changed = true;
+                    Ok(())
+                }
+                Key::Accent
+                | Key::Language
+                | Key::FontFamily
+                | Key::FontScale
+                | Key::BoldFont
+                | Key::SmoothText => {
                     retheme = true;
                     Ok(())
                 }
-                Key::IconSize | Key::DockGap => {
+                Key::IconSize | Key::DockGap | Key::IconSpacing => {
                     relayout = true;
                     Ok(())
                 }
                 // The next hover animates to the new scale.
                 Key::HoverZoom => Ok(()),
+                Key::DockImmersive | Key::DockRevealDelay => {
+                    immersion_changed = true;
+                    Ok(())
+                }
                 Key::HideTaskbar => {
                     redisplay = true;
                     if enabled {
@@ -282,8 +407,12 @@ impl Bars {
                     }
                 }
                 Key::Autostart => startup::set(enabled),
-                Key::Clock(_) => Ok(()),
-                Key::Monitor(_) => {
+                Key::TaskbarShortcut => {
+                    platform::TaskbarShortcut::register(self.top.0, self.settings.get(spec.key))
+                        .map(|registered| self.taskbar_shortcut = registered)
+                }
+                Key::Clock(_) | Key::RecentFiles => Ok(()),
+                Key::Monitor(_) | Key::TemperatureUnit => {
                     monitor_changed = true;
                     Ok(())
                 }
@@ -304,6 +433,14 @@ impl Bars {
         }
         if retheme {
             self.apply_theme()?;
+        }
+        if backdrop_changed
+            || self.settings.get(Key::InterfaceScale) != previous.get(Key::InterfaceScale)
+        {
+            self.refresh_about_appearance()?;
+        }
+        if immersion_changed {
+            self.sync_dock_immersion()?;
         }
         if redisplay {
             // Showing or hiding the taskbar changes the work area the Dock sits in.
