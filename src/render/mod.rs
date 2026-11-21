@@ -127,11 +127,15 @@ impl Bar {
     }
 }
 
-/// The DeskIsle mark on its own layer above the status bar, so a click can squash and
-/// stretch it on the compositor without repainting the bar.
+/// The DeskIsle mark on its own layer above the status bar, so the compositor can animate
+/// it without repainting the bar. A container holds the ring and the core that grows
+/// inside it while the system menu is open, each scaled about the ring's center.
 struct MarkLayer {
     visual: IDCompositionVisual2,
-    scale: IDCompositionScaleTransform,
+    ring: IDCompositionScaleTransform,
+    core: IDCompositionScaleTransform,
+    core_size: Tween,
+    open: bool,
     /// The bar height in pixels, DPI and palette the ring was painted for.
     key: (i32, u32, Palette),
 }
@@ -179,15 +183,16 @@ const MARK_RADIUS: f32 = 6.;
 const MARK_STROKE: f32 = 1.75;
 /// Edge of the mark's layer in DIPs, with room for the ring's antialiased rim.
 const MARK_BOX: f32 = 20.;
-/// The mark's squash and stretch on a click: (seconds, horizontal, vertical scale).
-/// It flattens wide, springs back tall and narrow, wobbles once and settles round.
-const MARK_BOUNCE: [(f32, f32, f32); 5] = [
-    (0., 1., 1.),
-    (0.07, 1.32, 0.72),
-    (0.17, 0.86, 1.14),
-    (0.26, 1.06, 0.95),
-    (0.36, 1., 1.),
-];
+/// Radius in DIPs of the core that fills the ring while the system menu is open, so the
+/// ring reads as an isle with land at its middle. It is painted at this size and scaled
+/// down to nothing at rest, so it is crisp whenever it is fully shown.
+const MARK_CORE: f32 = 2.5;
+/// The ring's press as the menu opens: (seconds, scale). It draws in slightly while the
+/// core grows, then settles back to its painted size.
+const MARK_PRESS: [(f32, f32); 3] = [(0., 1.), (0.08, 0.86), (0.22, 1.)];
+/// Seconds for the core to grow as the menu opens and to recede after it closes.
+const MARK_GROW: f32 = 0.22;
+const MARK_SHRINK: f32 = 0.16;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
 fn ease(
@@ -237,6 +242,29 @@ fn keyframes(
             curve.End(time as f64, value)?;
         }
         Ok(curve)
+    }
+}
+
+/// A child of `parent` showing `content`, scaled by `scale` about `center` in the
+/// parent's pixels. Returns the transform so the caller can animate the scale.
+fn scaled_child(
+    device: &IDCompositionDesktopDevice,
+    parent: &IDCompositionVisual2,
+    content: &IDCompositionSurface,
+    (x, y): (f32, f32),
+    scale: f32,
+) -> Result<IDCompositionScaleTransform> {
+    unsafe {
+        let visual = device.CreateVisual()?;
+        visual.SetContent(content)?;
+        let transform = device.CreateScaleTransform()?;
+        transform.SetCenterX2(x)?;
+        transform.SetCenterY2(y)?;
+        transform.SetScaleX2(scale)?;
+        transform.SetScaleY2(scale)?;
+        visual.SetTransform(&transform)?;
+        parent.AddVisual(&visual, true, None)?;
+        Ok(transform)
     }
 }
 
@@ -620,12 +648,14 @@ impl Renderer {
     }
 
     /// Paints the DeskIsle mark, a ring as round as the controls beside it, onto its own
-    /// layer above the bar. The layer is kept while the bar's height, DPI and palette are.
+    /// layer above the bar. The layer is kept while the bar's height, DPI and palette are;
+    /// a repainted layer keeps showing the core if the system menu is still open.
     fn place_mark(&mut self, height: i32, dpi: u32, palette: Palette) -> Result<()> {
         let key = (height, dpi, palette);
         if self.mark.as_ref().is_some_and(|mark| mark.key == key) {
             return Ok(());
         }
+        let open = self.mark.as_ref().is_some_and(|mark| mark.open);
         let s = dpi as f32 / 96.;
         // Whole-pixel offsets keep the ring as crisp as when it was painted into the bar.
         let (cx, cy) = (MARK_X * s, height as f32 / 2.);
@@ -633,40 +663,63 @@ impl Renderer {
         let top = (cy - MARK_BOX / 2. * s).floor();
         let (x, y) = (cx - left, cy - top);
         let edge = (MARK_BOX * s).ceil() as i32 + 1;
-        let surface = paint(&self.device, palette, edge, edge, dpi, |c| {
+        let ring_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
             c.ring(x / s, y / s, MARK_RADIUS, MARK_STROKE, c.p.accent)
         })?;
+        let core_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
+            let (x, y, r) = (x / s, y / s, MARK_CORE);
+            c.round(x - r, y - r, x + r, y + r, r, c.p.accent)
+        })?;
+        let core_goal = if open { 1. } else { 0. };
         unsafe {
             if let Some(old) = self.mark.take() {
                 self.top.root.RemoveVisual(&old.visual)?;
             }
             let visual = self.device.CreateVisual()?;
-            visual.SetContent(&surface)?;
             visual.SetOffsetX2(left)?;
             visual.SetOffsetY2(top)?;
-            let scale = self.device.CreateScaleTransform()?;
-            scale.SetCenterX2(x)?;
-            scale.SetCenterY2(y)?;
-            scale.SetScaleX2(1.)?;
-            scale.SetScaleY2(1.)?;
-            visual.SetTransform(&scale)?;
+            let ring = scaled_child(&self.device, &visual, &ring_surface, (x, y), 1.)?;
+            let core = scaled_child(&self.device, &visual, &core_surface, (x, y), core_goal)?;
             self.top.root.AddVisual(&visual, true, None)?;
-            self.mark = Some(MarkLayer { visual, scale, key });
+            self.mark = Some(MarkLayer {
+                visual,
+                ring,
+                core,
+                core_size: Tween::new(core_goal),
+                open,
+                key,
+            });
         }
         Ok(())
     }
 
-    /// Squashes and stretches the DeskIsle mark once, as feedback for a click. A click
-    /// during the bounce starts it over.
-    pub fn bounce_mark(&self) -> Result<()> {
-        let Some(mark) = &self.mark else {
+    /// Turns the DeskIsle mark into an isle while its system menu is `open`: the ring
+    /// presses in once as a core grows from its center, and the core recedes after the
+    /// menu closes. Only compositor transforms change, so the bar is not repainted. A
+    /// change midway continues from the core's current size.
+    pub fn focus_mark(&mut self, open: bool) -> Result<()> {
+        let Some(mark) = self.mark.as_mut() else {
             return Ok(());
         };
-        let wide = keyframes(&self.device, MARK_BOUNCE.iter().map(|&(t, x, _)| (t, x)))?;
-        let tall = keyframes(&self.device, MARK_BOUNCE.iter().map(|&(t, _, y)| (t, y)))?;
+        if mark.open == open {
+            return Ok(());
+        }
+        mark.open = open;
+        let (goal, duration) = if open {
+            (1., MARK_GROW)
+        } else {
+            (0., MARK_SHRINK)
+        };
         unsafe {
-            mark.scale.SetScaleX(&wide)?;
-            mark.scale.SetScaleY(&tall)?;
+            if open {
+                let press = keyframes(&self.device, MARK_PRESS.into_iter())?;
+                mark.ring.SetScaleX(&press)?;
+                mark.ring.SetScaleY(&press)?;
+            }
+            if let Some(curve) = mark.core_size.retarget(&self.device, goal, duration)? {
+                mark.core.SetScaleX(&curve)?;
+                mark.core.SetScaleY(&curve)?;
+            }
             self.device.Commit()
         }
     }

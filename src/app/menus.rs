@@ -77,15 +77,26 @@ impl Bars {
         self.show_menu(menu, anchor)
     }
 
-    /// The system menu, below the status bar mark.
+    /// The system menu, below the status bar mark. The mark stays focused while the
+    /// menu is open and relaxes before the chosen command runs.
     pub(super) fn mark_menu(&mut self) -> Result<bool> {
-        // The bounce is only feedback: if it fails, the menu still opens.
-        if let Some(renderer) = &self.renderer {
-            let _ = renderer.bounce_mark();
-        }
+        self.focus_mark(true);
         let mark = self.status.mark;
         let anchor = self.top_anchor(mark.x + mark.width / 2);
-        self.show_menu(menu::mark_menu(), anchor)
+        let choice = self.popup(menu::mark_menu(), anchor, None);
+        self.focus_mark(false);
+        match choice? {
+            Some(command) => self.run_command(command),
+            None => Ok(false),
+        }
+    }
+
+    /// The mark's animation is only feedback: if it fails, the menu still works. A
+    /// renderer rebuilt during the menu starts with the mark at rest.
+    fn focus_mark(&mut self, open: bool) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            let _ = renderer.focus_mark(open);
+        }
     }
 
     pub(super) fn clock_menu(&mut self) -> Result<bool> {
