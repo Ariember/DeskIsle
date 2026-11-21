@@ -1,5 +1,5 @@
 use windows::Win32::{
-    Foundation::POINT,
+    Foundation::{POINT, RECT},
     Graphics::{
         Direct2D::{Common::*, *},
         DirectComposition::{IDCompositionDesktopDevice, IDCompositionSurface},
@@ -84,31 +84,53 @@ pub(super) fn paint(
     dpi: u32,
     draw: impl FnOnce(&Canvas) -> Result<()>,
 ) -> Result<IDCompositionSurface> {
-    unsafe {
-        let surface = device.CreateSurface(
+    let surface = unsafe {
+        device.CreateSurface(
             width as u32,
             height as u32,
             DXGI_FORMAT_B8G8R8A8_UNORM,
             DXGI_ALPHA_MODE_PREMULTIPLIED,
-        )?;
+        )?
+    };
+    let rect = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    paint_region(&surface, palette, rect, dpi, draw)?;
+    Ok(surface)
+}
+
+/// Clears and repaints a physical pixel rectangle using the full surface's coordinates.
+pub(super) fn paint_region(
+    surface: &IDCompositionSurface,
+    palette: Palette,
+    rect: RECT,
+    dpi: u32,
+    draw: impl FnOnce(&Canvas) -> Result<()>,
+) -> Result<()> {
+    unsafe {
         let mut origin = POINT::default();
-        let ctx: ID2D1DeviceContext = surface.BeginDraw(None, &mut origin)?;
-        // BeginDraw may hand out an atlas region at a nonzero offset. Work in physical pixels
-        // and clip the clear along with the drawing to that region.
+        let ctx: ID2D1DeviceContext = surface.BeginDraw(Some(&rect), &mut origin)?;
+        // BeginDraw returns the atlas position of the requested rectangle's top left.
         ctx.SetDpi(96., 96.);
         ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let bounds = D2D_RECT_F {
             left: origin.x as f32,
             top: origin.y as f32,
-            right: (origin.x + width) as f32,
-            bottom: (origin.y + height) as f32,
+            right: (origin.x + (rect.right - rect.left)) as f32,
+            bottom: (origin.y + (rect.bottom - rect.top)) as f32,
         };
         ctx.PushAxisAlignedClip(&bounds, D2D1_ANTIALIAS_MODE_ALIASED);
         ctx.Clear(Some(&D2D1_COLOR_F::default()));
         let canvas = Canvas {
             ctx,
             p: palette,
-            origin,
+            origin: POINT {
+                x: origin.x - rect.left,
+                y: origin.y - rect.top,
+            },
             scale: dpi as f32 / 96.,
         };
         let result = draw(&canvas);
@@ -116,8 +138,7 @@ pub(super) fn paint(
         drop(canvas);
         // End the DComp update even when a brush, icon or font fails to load.
         let end = surface.EndDraw();
-        result.and(end)?;
-        Ok(surface)
+        result.and(end)
     }
 }
 

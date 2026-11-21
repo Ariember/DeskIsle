@@ -22,6 +22,8 @@ pub enum Icon {
     Tray {
         index: usize,
         on: bool,
+        /// Changes when the tray host updates the displayed icon.
+        stamp: u64,
     },
     /// Marks a window of an application; the foreground window is highlighted.
     Window {
@@ -34,7 +36,7 @@ pub enum Icon {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item<C> {
     pub label: String,
     /// Right-aligned secondary text.
@@ -1015,6 +1017,7 @@ pub fn clock_menu(today: (i32, u8, u8), shown: (i32, u8)) -> Menu<Command> {
 /// A tray icon as the overflow menu lists it.
 pub struct TrayEntry<'a> {
     pub index: usize,
+    pub stamp: u64,
     /// The application's name.
     pub label: &'a str,
     /// Its tooltip, shown beside the name when it says something else, such as Clash
@@ -1026,6 +1029,24 @@ pub struct TrayEntry<'a> {
 }
 
 impl Menu<Command> {
+    /// Compares two pages from `tray_menu`. Every row, including the page controls,
+    /// has the same height and icon column in a fixed-width menu.
+    pub fn changed_tray_rows(&self, next: &Self) -> Option<Vec<usize>> {
+        if self.entries.len() != next.entries.len() {
+            return None;
+        }
+        let mut changed = Vec::new();
+        for (row, (old, new)) in self.entries.iter().zip(&next.entries).enumerate() {
+            let (Entry::Item(old), Entry::Item(new)) = (old, new) else {
+                return None;
+            };
+            if old != new {
+                changed.push(row);
+            }
+        }
+        Some(changed)
+    }
+
     /// Recover the same row or leading icon after the live tray list changes.
     pub fn tray_focus(&self, command: &Command) -> Option<Focus> {
         self.entries.iter().enumerate().find_map(|(row, entry)| {
@@ -1090,6 +1111,7 @@ pub fn tray_menu(
             Icon::Tray {
                 index: icon.index,
                 on: icon.kept,
+                stamp: icon.stamp,
             },
             icon.can_interact
                 .then_some(Command::TrayActivate(icon.index)),
@@ -1254,6 +1276,7 @@ mod tests {
         let icons = [
             TrayEntry {
                 index: 0,
+                stamp: 0,
                 label: "a",
                 status: "a",
                 can_interact: false,
@@ -1261,6 +1284,7 @@ mod tests {
             },
             TrayEntry {
                 index: 3,
+                stamp: 0,
                 label: "Sparkle",
                 status: "\u{2191} 943 B/s\n\u{2193} 0 B/s",
                 can_interact: true,
@@ -1298,13 +1322,18 @@ mod tests {
             menu.entries[..],
             [
                 Entry::Item(Item {
-                    icon: Icon::Tray { index: 0, on: true },
+                    icon: Icon::Tray {
+                        index: 0,
+                        on: true,
+                        ..
+                    },
                     ..
                 }),
                 Entry::Item(Item {
                     icon: Icon::Tray {
                         index: 3,
-                        on: false
+                        on: false,
+                        ..
                     },
                     ..
                 })
@@ -1313,10 +1342,38 @@ mod tests {
     }
 
     #[test]
+    fn live_tray_updates_repaint_only_changed_rows_on_the_current_page() {
+        let mut icons = [0, 1, 2].map(|index| TrayEntry {
+            index,
+            stamp: 0,
+            label: "App",
+            status: "",
+            can_interact: true,
+            kept: true,
+        });
+        let full = tray_menu(&icons, &mut 0, None, 720, 96);
+        let first_page = tray_menu(&icons, &mut 0, None, 108, 96);
+
+        icons[1].status = "↑ 943 B/s";
+        let speed_update = tray_menu(&icons, &mut 0, None, 720, 96);
+        assert_eq!(full.changed_tray_rows(&speed_update), Some(vec![1]));
+
+        icons[1].stamp += 1;
+        let image_update = tray_menu(&icons, &mut 0, None, 720, 96);
+        assert_eq!(speed_update.changed_tray_rows(&image_update), Some(vec![1]));
+        let off_page_update = tray_menu(&icons, &mut 0, None, 108, 96);
+        assert_eq!(first_page.changed_tray_rows(&off_page_update), Some(vec![]));
+
+        let removed = tray_menu(&icons[..2], &mut 0, None, 720, 96);
+        assert_eq!(image_update.changed_tray_rows(&removed), None);
+    }
+
+    #[test]
     fn every_tray_registration_can_be_reached_on_screen() {
         let icons: Vec<_> = (0..53)
             .map(|n| TrayEntry {
                 index: 2 * n + 1,
+                stamp: 0,
                 label: "Tray app",
                 status: "",
                 can_interact: true,
@@ -1375,6 +1432,7 @@ mod tests {
     fn shrinking_tray_list_clamps_the_page_and_keeps_focus_on_the_same_control() {
         let icons = [3, 9, 11].map(|index| TrayEntry {
             index,
+            stamp: 0,
             label: "App",
             status: "",
             can_interact: true,
@@ -1404,6 +1462,7 @@ mod tests {
     fn tray_rows_split_their_icon_from_the_rest_of_the_row() {
         let icons = [TrayEntry {
             index: 2,
+            stamp: 0,
             label: "a",
             status: "",
             can_interact: true,
