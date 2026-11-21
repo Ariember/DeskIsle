@@ -285,6 +285,7 @@ pub(crate) fn run() -> Result<()> {
                 // and a full-screen application, so check again on every switch.
                 bars.sync_fullscreen()?;
             }
+            Event::TrayRecovery => bars.tray.retry_incomplete_icons(),
             Event::Tray if bars.tray.update(false) => {
                 bars.restatus();
                 bars.draw()?;

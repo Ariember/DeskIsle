@@ -506,6 +506,7 @@ impl Bars {
                     held.push(Event::Quit);
                     break None;
                 }
+                Event::TrayRecovery if self.overflow_open => self.tray.retry_incomplete_icons(),
                 Event::Tray if self.overflow_open => refresh_tray = true,
                 Event::Refresh => {
                     if self.overflow_open {

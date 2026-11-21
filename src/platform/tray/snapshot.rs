@@ -1,6 +1,6 @@
 //! Rebuild the Win11 tray inventory from Explorer's settings. The registry includes
 //! old installations, so each candidate must also pass a live Shell position query.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -83,8 +83,18 @@ struct AppWindow {
     message_only: bool,
 }
 
-fn windows_by_path() -> Result<HashMap<String, Vec<AppWindow>>> {
-    let mut handles: Vec<_> = shell::window_handles()?
+fn windows_by_path(
+    top_level: Vec<HWND>,
+    known: &[TrayIcon],
+    request: &mut impl FnMut(HWND),
+) -> HashMap<String, Vec<AppWindow>> {
+    let pending: HashSet<_> = known
+        .iter()
+        .filter(|icon| icon.awaiting_registration && icon.owner != 0 && icon.visible())
+        .map(|icon| shell::window_process(HWND(icon.owner as _)))
+        .filter(|&pid| pid != 0)
+        .collect();
+    let mut handles: Vec<_> = top_level
         .into_iter()
         .map(|hwnd| AppWindow {
             hwnd,
@@ -103,6 +113,10 @@ fn windows_by_path() -> Result<HashMap<String, Vec<AppWindow>>> {
     let mut by_path: HashMap<String, Vec<AppWindow>> = HashMap::new();
     for window in handles {
         let pid = shell::window_process(window.hwnd);
+        // Some apps handle TaskbarCreated on a different window in the same process.
+        if pending.contains(&pid) {
+            request(window.hwnd);
+        }
         let exe = paths
             .entry(pid)
             .or_insert_with(|| shell::process_path(pid).ok().map(|p| path_id(&p)));
@@ -110,7 +124,7 @@ fn windows_by_path() -> Result<HashMap<String, Vec<AppWindow>>> {
             by_path.entry(exe.clone()).or_default().push(window);
         }
     }
-    Ok(by_path)
+    by_path
 }
 
 pub(super) fn read(known: &[TrayIcon], mut request: impl FnMut(HWND)) -> Result<Vec<Notify>> {
@@ -127,7 +141,7 @@ pub(super) fn read(known: &[TrayIcon], mut request: impl FnMut(HWND)) -> Result<
     };
     // RegOpenKeyExW returned an owned subkey; HKCU itself is borrowed.
     let key = unsafe { Owned::new(raw) };
-    let windows = windows_by_path()?;
+    let windows = windows_by_path(shell::window_handles()?, known, &mut request);
     let mut items = Vec::new();
     for index in 0.. {
         // A registry subkey name can contain at most 255 UTF-16 code units.
@@ -162,16 +176,23 @@ pub(super) fn read(known: &[TrayIcon], mut request: impl FnMut(HWND)) -> Result<
             .filter(|g| *g != GUID::zeroed());
         let mut owners = Vec::new();
         let id = if let Some(guid) = guid {
+            let existing = known.iter().find(|icon| icon.guid == Some(guid));
             if filter::is_system_indicator(Some(guid), HWND::default())
-                || known.iter().any(|icon| icon.guid == Some(guid))
+                || existing.is_some_and(|icon| icon.owner != 0 || !icon.awaiting_registration)
                 || !registered(0, 0, Some(guid))
             {
                 continue;
             }
-            // Shell ignores HWND when addressed by GUID. Only a live notification can
-            // identify its callback window. Message-only windows miss the broadcast.
-            for window in candidates.iter().filter(|w| w.message_only) {
+            // Message-only listeners miss the broadcast. For an icon that still
+            // lacks an owner, retry the app's top-level listeners as well.
+            for window in candidates
+                .iter()
+                .filter(|w| existing.is_some() || w.message_only)
+            {
                 request(window.hwnd);
+            }
+            if existing.is_some() {
+                continue;
             }
             owners.push(0);
             0
@@ -234,6 +255,66 @@ pub(super) fn read(known: &[TrayIcon], mut request: impl FnMut(HWND)) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_owner_also_requests_its_process_listener() -> Result<()> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetDesktopWindow,
+        };
+
+        let create_window = || unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!(""),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        };
+        let owner = create_window()?;
+        let listener = create_window()?;
+        let mut icon = TrayIcon {
+            key: String::new(),
+            name: String::new(),
+            label: String::new(),
+            stamp: 0,
+            registration: 0,
+            attention: Default::default(),
+            icon: None,
+            owner: owner.0 as isize,
+            id: 1,
+            guid: None,
+            system_indicator: false,
+            callback: 0,
+            version: 0,
+            state: 0,
+            awaiting_registration: true,
+        };
+        let mut targets = Vec::new();
+        let desktop = unsafe { GetDesktopWindow() };
+        windows_by_path(vec![desktop], std::slice::from_ref(&icon), &mut |w| {
+            targets.push(w)
+        });
+        assert!(targets.contains(&listener));
+        assert!(!targets.contains(&desktop));
+        targets.clear();
+        // An app can explicitly add a noninteractive icon.
+        icon.awaiting_registration = false;
+        windows_by_path(Vec::new(), &[icon], &mut |w| targets.push(w));
+        assert!(targets.is_empty());
+        unsafe {
+            DestroyWindow(listener)?;
+            DestroyWindow(owner)?;
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires Explorer on the interactive Windows desktop"]

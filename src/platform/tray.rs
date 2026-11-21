@@ -52,6 +52,8 @@ const NIS_HIDDEN: u32 = 0x01;
 const NIN_SELECT: u32 = WM_USER;
 const HWND_BROADCAST: HWND = HWND(0xffff as _);
 const FORWARD_TIMEOUT_MS: u32 = 3000;
+const RECOVERY_TIMER: usize = 1;
+const RECOVERY_DELAY_MS: u32 = 2000;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
 
 #[repr(C)]
@@ -134,6 +136,8 @@ pub struct TrayIcon {
     id: u32,
     guid: Option<GUID>,
     system_indicator: bool,
+    // A snapshot or partial update has not supplied the application's callback choice.
+    awaiting_registration: bool,
     callback: u32,
     version: u32,
     state: u32,
@@ -211,7 +215,7 @@ pub struct TrayHost {
     icons: Vec<TrayIcon>,
     next_stamp: u64,
     last_press: Option<(u64, bool)>,
-    /// Owner windows already asked to add their icons again since the last broadcast.
+    /// Windows already asked during this recovery attempt, including on live updates.
     asked: HashSet<isize>,
 }
 
@@ -270,16 +274,32 @@ impl TrayHost {
     /// Seed existing registrations before requesting their callback details. Call once
     /// the UI loop can answer applications that immediately call Shell_NotifyIcon.
     pub fn request_icons(&mut self) -> Result<()> {
-        self.asked.clear();
-        self.raise();
         self.recover_icons();
-        unsafe { SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0)) }
+        unsafe {
+            SendNotifyMessageW(HWND_BROADCAST, TASKBAR_CREATED.get(), WPARAM(0), LPARAM(0))?;
+            // Give applications time to answer while startup AppBar messages settle.
+            // A later opening of the overflow also retries if no timer is available.
+            SetTimer(Some(self.hwnd), RECOVERY_TIMER, RECOVERY_DELAY_MS, None);
+        }
+        Ok(())
+    }
+
+    pub fn retry_incomplete_icons(&mut self) {
+        if self
+            .icons
+            .iter()
+            .any(|i| i.visible() && i.awaiting_registration)
+        {
+            self.recover_icons();
+        }
     }
 
     /// Older shells may lack the settings key; live registrations still populate
     /// the host. Retry the snapshot when the user opens the list, including after
     /// Explorer was too busy to confirm an icon at startup.
     pub fn recover_icons(&mut self) {
+        self.raise();
+        self.request_incomplete_owners();
         if let Ok(mut items) =
             snapshot::read(&self.icons, |owner| request_owner(&mut self.asked, owner))
             && !items.is_empty()
@@ -290,6 +310,15 @@ impl TrayHost {
                 *commands = items;
             });
             queue(self.hwnd, Event::Tray);
+        }
+    }
+
+    fn request_incomplete_owners(&mut self) {
+        self.asked.clear();
+        for icon in &self.icons {
+            if icon.visible() && icon.awaiting_registration && icon.owner != 0 {
+                request_owner(&mut self.asked, HWND(icon.owner as _));
+            }
         }
     }
 
@@ -448,6 +477,7 @@ impl TrayHost {
                 if n.flags & NIF_MESSAGE != 0 {
                     let interactive = icon.can_interact();
                     icon.callback = n.callback;
+                    icon.awaiting_registration = false;
                     changed |= interactive != icon.can_interact();
                 }
                 if n.balloon {
@@ -476,6 +506,7 @@ impl TrayHost {
             // An icon can predate this host. Keep the fields we have (even a tooltip
             // alone) and request a full registration, including the callback/version.
             (NIM_ADD, _) | (NIM_MODIFY, None) => {
+                let awaiting_registration = n.message == NIM_MODIFY && n.flags & NIF_MESSAGE == 0;
                 if n.message == NIM_MODIFY {
                     ask_to_register(&mut self.asked, &n);
                 }
@@ -515,6 +546,7 @@ impl TrayHost {
                     id: n.id,
                     guid,
                     system_indicator: filter::is_system_indicator(guid, HWND(n.owner as _)),
+                    awaiting_registration,
                     callback: if n.flags & NIF_MESSAGE != 0 {
                         n.callback
                     } else {
@@ -706,7 +738,7 @@ fn display_name(product: Option<String>, tip: &str, stem: Option<&str>) -> Strin
         .unwrap_or_else(|| "托盘图标".into())
 }
 
-/// Posts TaskbarCreated to the owner of `n`, once per owner until the next broadcast.
+/// Posts TaskbarCreated to the owner of `n`, once per owner per recovery attempt.
 /// Applications answer it by adding their icons again, as after an Explorer restart.
 /// Windows' own indicators are left alone.
 fn ask_to_register(asked: &mut HashSet<isize>, n: &Notify) {
@@ -808,6 +840,11 @@ unsafe fn parse(data: &COPYDATASTRUCT) -> Option<Notify> {
 
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_TIMER if wp.0 == RECOVERY_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), RECOVERY_TIMER) };
+            queue(hwnd, Event::TrayRecovery);
+            LRESULT(0)
+        }
         WM_COPYDATA => {
             let data = lp.0 as *const COPYDATASTRUCT;
             let mut accepted = None;
@@ -933,6 +970,39 @@ mod tests {
         assert!(tray.icons[0].visible());
         assert_eq!(tray.icons[0].label, update().tip);
         assert_eq!(received(), 1);
+        // A missed startup request gets another chance. Two pending icons on the
+        // same window need only one request. The owner can also choose no callback.
+        tray.apply(Notify { id: 4, ..update() });
+        assert_eq!(received(), 0);
+        tray.request_incomplete_owners();
+        assert_eq!(received(), 1);
+        let callback = WM_APP + 3;
+        tray.apply(Notify {
+            message: NIM_ADD,
+            flags: NIF_MESSAGE,
+            callback,
+            ..update()
+        });
+        tray.apply(Notify {
+            id: 4,
+            message: NIM_ADD,
+            ..update()
+        });
+        assert!(tray.icons[0].can_interact());
+        assert!(!tray.icons[1].can_interact());
+        tray.click(0, TrayInput::KeySelect, POINT::default())?;
+        let mut delivered = MSG::default();
+        assert!(unsafe {
+            PeekMessageW(&mut delivered, Some(owner), callback, callback, PM_REMOVE).as_bool()
+        });
+        assert_eq!(delivered.wParam.0, 3);
+        tray.request_incomplete_owners();
+        assert_eq!(received(), 0);
+        tray.apply(Notify {
+            id: 4,
+            message: NIM_DELETE,
+            ..update()
+        });
         // Shell resolves a GUID without providing the HWND. Its subsequent full
         // registration replaces the recovered row, even with a nonzero numeric ID.
         let guid = GUID::from_u128(0x1234);
