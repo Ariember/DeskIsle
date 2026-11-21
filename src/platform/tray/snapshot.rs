@@ -58,9 +58,10 @@ fn value(key: HKEY, entry: PCWSTR, field: PCWSTR, ty: REG_ROUTINE_FLAGS) -> Opti
 
 fn text(key: HKEY, entry: PCWSTR, field: PCWSTR) -> Option<String> {
     let bytes = value(key, entry, field, RRF_RT_REG_SZ)?;
-    let units: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units: Vec<_> = pairs
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .take_while(|&u| u != 0)
         .collect();
     String::from_utf16(&units).ok()

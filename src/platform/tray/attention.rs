@@ -31,7 +31,8 @@ impl Pixels {
             source
                 .CopyPixels(std::ptr::null(), width * 4, &mut bytes)
                 .ok()?;
-            if bytes.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+            let (pixels, _) = bytes.as_chunks::<4>();
+            if pixels.iter().all(|pixel| pixel[3] == 0) {
                 return Some(Self::default());
             }
             Some(Self { width, bytes })

@@ -43,10 +43,11 @@ pub fn product_name(path: &Path) -> Option<String> {
     let mut languages = Vec::new();
     if let Some((data, len)) = query(r"\VarFileInfo\Translation") {
         let pairs = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), len as usize / 2) };
+        let (translations, _) = pairs.as_chunks::<2>();
         languages.extend(
-            pairs
-                .chunks_exact(2)
-                .map(|p| format!("{:04x}{:04x}", p[0], p[1])),
+            translations
+                .iter()
+                .map(|[language, page]| format!("{language:04x}{page:04x}")),
         );
     }
     languages.extend(["040904b0".to_owned(), "040904e4".to_owned()]);
