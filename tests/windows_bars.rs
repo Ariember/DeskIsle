@@ -25,14 +25,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
-    GWL_EXSTYLE, GetClientRect, GetCursorPos, GetShellWindow, GetSystemMetrics, GetWindowLongW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, IsZoomed, MSG,
-    PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG,
-    SPI_GETWORKAREA, SPI_SETWORKAREA, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SendMessageTimeoutW, SetCursorPos, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP,
-    WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+    GWL_EXSTYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetShellWindow,
+    GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN,
+    SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA, SW_HIDE, SW_MAXIMIZE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE,
+    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
@@ -176,13 +177,13 @@ fn window_rect(hwnd: HWND) -> RECT {
     rect
 }
 
-struct MaximizedWindow(HWND);
+struct TestWindow(HWND);
 
 unsafe extern "system" fn probe_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-impl MaximizedWindow {
+impl TestWindow {
     fn create() -> Self {
         unsafe {
             let instance = GetModuleHandleW(None).unwrap().into();
@@ -214,9 +215,35 @@ impl MaximizedWindow {
             Self(hwnd)
         }
     }
+
+    /// A borderless window over the whole primary monitor in the foreground, the way a
+    /// full-screen game runs. `create` registers its class.
+    fn cover() -> Self {
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap().into();
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                w!("DeskIsle.TestWindow"),
+                w!("DeskIsle full-screen test"),
+                WS_POPUP,
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+            .unwrap();
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            Self(hwnd)
+        }
+    }
 }
 
-impl Drop for MaximizedWindow {
+impl Drop for TestWindow {
     fn drop(&mut self) {
         let _ = unsafe { DestroyWindow(self.0) };
     }
@@ -467,7 +494,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     } else {
         work.bottom
     };
-    let probe = MaximizedWindow::create();
+    let probe = TestWindow::create();
     let initial = window_rect(probe.0);
 
     let profile = TestProfile::new();
@@ -576,6 +603,12 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
             LPARAM(isize::from(open)),
         );
     };
+    // The shell reports the desktop as full screen too, so the bars only step aside
+    // while an application covering the monitor is in front.
+    let cover = TestWindow::cover();
+    wait_until("full-screen window did not reach the foreground", || {
+        (unsafe { GetForegroundWindow() }) == cover.0
+    });
     fullscreen(true);
     wait_until("full-screen notification did not hide both bars", || {
         !unsafe { IsWindowVisible(status) }.as_bool() && !unsafe { IsWindowVisible(dock) }.as_bool()
@@ -605,6 +638,7 @@ fn bars_open_in_the_primary_work_area_and_close_together() {
     wait_until("leaving full screen did not restore both bars", || {
         unsafe { IsWindowVisible(status) }.as_bool() && unsafe { IsWindowVisible(dock) }.as_bool()
     });
+    drop(cover);
     assert!(!unsafe { IsWindowVisible(taskbar.hwnd) }.as_bool());
     let point = LPARAM(18 << 16 | 18);
     send_to_child(pid, status, WM_LBUTTONDOWN, WPARAM(1), point);

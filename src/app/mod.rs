@@ -55,6 +55,9 @@ struct Bars {
     top_rect: Rect,
     /// Both bars step aside while a full-screen application covers their monitor.
     fullscreen: bool,
+    /// What the shell last reported. It also reports the desktop as a full-screen
+    /// window, so the bars only step aside while an application is in front as well.
+    shell_fullscreen: bool,
     layout: Layout,
     status: StatusLayout,
     /// Indices into `tray.icons()` kept on the bar, in display order.
@@ -178,6 +181,7 @@ pub(crate) fn run() -> Result<()> {
         monitor,
         top_rect,
         fullscreen,
+        shell_fullscreen: fullscreen,
         layout,
         shown: Vec::new(),
         hidden,
@@ -214,6 +218,9 @@ pub(crate) fn run() -> Result<()> {
                     bars.restatus();
                 }
                 bars.refresh()?;
+                // The shell reports nothing new when focus moves between the desktop
+                // and a full-screen application, so check again on every switch.
+                bars.sync_fullscreen()?;
             }
             Event::Tray if bars.tray.update(false) => {
                 bars.restatus();
@@ -228,20 +235,10 @@ pub(crate) fn run() -> Result<()> {
                 bars.tray.request_icons()?;
             }
             Event::FullScreen(fullscreen) => {
-                let was_hidden = bars.fullscreen;
-                bars.fullscreen = fullscreen;
-                bars.sync_sampling();
-                bars.publish_tray_rects();
-                if was_hidden && !fullscreen {
-                    bars.draw()?;
-                }
-                bars.position()?;
-                if fullscreen {
-                    bars.cancel_dock_press()?;
-                    bars.tray.cancel_click();
-                    bars.set_hover(None)?;
-                    bars.set_top_hover(None)?;
-                }
+                bars.shell_fullscreen = fullscreen;
+                // The notification can arrive before the foreground change it follows.
+                bars.refresh()?;
+                bars.sync_fullscreen()?;
             }
             Event::Clock => {
                 let time = platform::clock(bars.top.0)?;
@@ -353,6 +350,38 @@ pub(crate) fn run() -> Result<()> {
 }
 
 impl Bars {
+    /// Whether the foreground window is an application covering the bars' monitor.
+    /// The desktop is not in the window snapshot, so it never qualifies.
+    fn fullscreen_app(&self) -> bool {
+        self.apps.iter().any(|app| app.active)
+            && self
+                .foreground
+                .is_some_and(|id| platform::window_covers_monitor(id, self.monitor.bounds))
+    }
+
+    /// Hides both bars while the shell reports a full-screen window and that window is
+    /// an application, and shows them again otherwise.
+    fn sync_fullscreen(&mut self) -> Result<()> {
+        let fullscreen = self.shell_fullscreen && self.fullscreen_app();
+        if fullscreen == self.fullscreen {
+            return Ok(());
+        }
+        self.fullscreen = fullscreen;
+        self.sync_sampling();
+        self.publish_tray_rects();
+        if !fullscreen {
+            self.draw()?;
+        }
+        self.position()?;
+        if fullscreen {
+            self.cancel_dock_press()?;
+            self.tray.cancel_click();
+            self.set_hover(None)?;
+            self.set_top_hover(None)?;
+        }
+        Ok(())
+    }
+
     /// Hides Explorer's taskbar again, unless the user keeps it.
     fn hide_taskbar(&mut self) -> Result<()> {
         if self.settings.enabled(Key::HideTaskbar) {
