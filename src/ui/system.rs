@@ -287,7 +287,7 @@ fn plan_symbol(kind: PlanKind) -> Symbol {
     }
 }
 
-/// Brightness, dark mode, Symbol::Hdr and the display settings.
+/// Brightness, dark mode, HDR and the display settings.
 pub fn display_flyout(display: &Display) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     menu.label("显示器");
@@ -306,7 +306,7 @@ pub fn display_flyout(display: &Display) -> Menu<Command> {
     if let Some(on) = display.hdr {
         choice(
             &mut menu,
-            "Symbol::Hdr",
+            "HDR",
             Symbol::Hdr,
             on,
             Some(SystemCommand::SetHdr(!on)),
@@ -629,13 +629,17 @@ mod tests {
             dark: true,
             hdr: Some(false),
         };
-        let shown = commands(&display_flyout(&display));
+        let menu = display_flyout(&display);
+        let shown = commands(&menu);
         assert!(shown.contains(&Command::System(SystemCommand::SetDark(false))));
-        assert!(shown.contains(&Command::System(SystemCommand::SetHdr(true))));
+        let enable_hdr = Some(Command::System(SystemCommand::SetHdr(true)));
+        assert!(menu.entries.iter().any(|entry| {
+            matches!(entry, Entry::Item(item) if item.label == "HDR" && item.command == enable_hdr)
+        }));
         let slider: fn(&Entry<Command>) -> bool = |e| matches!(e, Entry::Slider(_));
         let player: fn(&Entry<Command>) -> bool = |e| matches!(e, Entry::Player { .. });
         // A monitor without DDC/CI shows no brightness slider at all.
-        assert_eq!(count(&display_flyout(&display), slider), 0);
+        assert_eq!(count(&menu, slider), 0);
 
         // Missing radios fall back to their settings pages.
         let status = SystemStatus {
