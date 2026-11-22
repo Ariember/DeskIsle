@@ -276,13 +276,45 @@ pub enum SystemItem {
 }
 
 impl SystemItem {
-    /// Width of the control's slot on the status bar in DIPs. The battery also shows
-    /// its charge beside the glyph.
-    pub fn slot_width(self) -> i32 {
+    /// Width in DIPs of what the control shows. The input language's single character
+    /// fits an icon's width.
+    pub fn width(self) -> i32 {
         match self {
-            Self::Battery => 60,
-            _ => 30,
+            Self::Battery => BATTERY_ICON,
+            _ => BAR_ICON,
         }
+    }
+}
+
+/// Edge in DIPs of the icons on the status bar: tray images, system icons, the overflow
+/// list and each monitor's symbol.
+pub const BAR_ICON: i32 = 16;
+/// The battery is drawn wider, so its level reads at the bar's height.
+pub const BATTERY_ICON: i32 = 22;
+/// Space in DIPs between the visible content of neighboring status bar items. A slot
+/// pads its content by half of it on each side and slots abut, so icons, readings and
+/// the time all stand one gap apart and every point between them hits one.
+pub const BAR_GAP: i32 = 12;
+/// Space in DIPs between a monitor's symbol and its readout.
+pub const METRIC_SPACING: i32 = 4;
+/// Text sizes in DIPs, shared with the renderer so the text measured is the text drawn.
+/// The clock is semibold.
+pub const CLOCK_TEXT: f32 = 13.;
+pub const METRIC_TEXT: f32 = 12.;
+/// The widest the clock gets: it shows two-digit hours and minutes.
+const CLOCK_SAMPLE: &str = "00:00";
+/// Distance in DIPs from the trailing edge to the clock's slot, which leaves the time as
+/// far from that edge as the mark's ring is from the leading one.
+const TRAILING: i32 = 6;
+
+/// Width in DIPs of a monitor's readout beside its symbol. A value reserves its widest
+/// reading in the bar's font, three digits, and is drawn right-aligned, so changing
+/// readings never move their neighbors.
+pub fn readout_width(indicator: &Indicator, measure: &dyn Fn(&str, f32, bool) -> f32) -> f32 {
+    match indicator.style {
+        Style::Value => measure(&indicator.format_value(100), METRIC_TEXT, false),
+        Style::Bars | Style::Ring => 16.,
+        Style::Graph => 26.,
     }
 }
 
@@ -326,6 +358,9 @@ impl StatusLayout {
     /// stay reachable through the overflow button.
     /// `system` lists the system controls to show, in display order; they always fit
     /// before tray icons do.
+    /// `measure` gives the width in DIPs of one line of text at a size, semibold when
+    /// asked, in the bar's font.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         size: (i32, i32),
         dpi: u32,
@@ -334,8 +369,15 @@ impl StatusLayout {
         system: &[SystemItem],
         metrics: &[Indicator],
         close_maximized: bool,
+        measure: impl Fn(&str, f32, bool) -> f32,
     ) -> Self {
         let px = scaled(dpi);
+        // Every item's slot is its content plus one gap.
+        let padded = |content: f32| {
+            ((content + BAR_GAP as f32) * dpi as f32 / 96.)
+                .round()
+                .max(1.) as i32
+        };
         let width = size.0.max(1);
         let height = size.1.max(1);
         let cell = |x, w| Rect {
@@ -344,17 +386,17 @@ impl StatusLayout {
             width: w,
             height,
         };
-        let close_width = px(28).min(width);
-        let close = close_maximized.then(|| cell(width - close_width, close_width));
-        let clock_end = close.map_or(width - px(10), |r| r.x).max(0);
-        let clock_width = px(48).min(clock_end);
+        let slot = padded(BAR_ICON as f32);
+        // Flush with the corner, so a throw of the pointer there closes the window.
+        let close = close_maximized.then(|| cell(width - slot.min(width), slot.min(width)));
+        let clock_end = close.map_or(width - px(TRAILING), |r| r.x).max(0);
+        let clock_width = padded(measure(CLOCK_SAMPLE, CLOCK_TEXT, true)).min(clock_end);
         let clock = cell(clock_end - clock_width, clock_width);
-        let slot = px(28).max(1);
         let widths = system
             .iter()
-            .map(|&item| px(item.slot_width()).max(1))
+            .map(|&item| padded(item.width() as f32))
             .collect::<Vec<_>>();
-        let system_start = (clock.x - px(4) - widths.iter().sum::<i32>()).max(0);
+        let system_start = (clock.x - widths.iter().sum::<i32>()).max(0);
         let mut next = system_start;
         let system = system
             .iter()
@@ -371,13 +413,8 @@ impl StatusLayout {
         let mut metrics_width = 0;
         let mut metric_slots = Vec::new();
         for indicator in metrics {
-            let w = px(match indicator.style {
-                // A three-digit temperature or percentage at the largest font setting
-                // needs up to 43 DIPs of text, plus the 25 DIPs around it.
-                Style::Value => 70,
-                Style::Graph => 56,
-                Style::Bars | Style::Ring => 44,
-            });
+            let symbol = (BAR_ICON + METRIC_SPACING) as f32;
+            let w = padded(symbol + readout_width(indicator, &measure));
             if metrics_width + w > metrics_room {
                 break;
             }
@@ -388,21 +425,8 @@ impl StatusLayout {
         for r in &mut metric_slots {
             r.x += metrics_start;
         }
-        // With no monitors, center the overflow chevron on the tray's pitch relative
-        // to the first system icon. Otherwise the chevron precedes the monitor strip.
-        let first_center = if metric_slots.is_empty() {
-            system
-                .first()
-                .map_or(system_start + slot / 2, |(_, r)| r.x + r.width / 2)
-        } else {
-            metrics_start + slot / 2
-        };
-        let half = px(13).max(1);
-        let overflow = (total > 0).then(|| {
-            let center = (first_center - slot).max(half);
-            cell(center - half, 2 * half)
-        });
-        let tray_end = overflow.map_or(metrics_start, |r| r.x + r.width / 2 - slot / 2);
+        let overflow = (total > 0).then(|| cell((metrics_start - slot).max(0), slot));
+        let tray_end = overflow.map_or(metrics_start, |r| r.x);
         // Keep room for the mark and the active application's name.
         let title_min = px(220);
         let capacity = ((tray_end - title_min).max(0) / slot) as usize;
@@ -475,6 +499,11 @@ mod tests {
     use super::*;
 
     const STATUS_HEIGHT: i32 = 30;
+
+    /// Text widths as the renderer estimates them when DirectWrite cannot lay text out.
+    fn estimate(text: &str, size: f32, _bold: bool) -> f32 {
+        text.chars().count() as f32 * size * 0.62
+    }
 
     #[test]
     fn offset_monitor_keeps_dock_centered_and_hit_edges_half_open() {
@@ -734,14 +763,15 @@ mod tests {
             let px = scaled(dpi);
             let (width, height) = (px(1920), px(STATUS_HEIGHT));
             let system = [SystemItem::Network, SystemItem::Sound, SystemItem::Control];
-            let layout = StatusLayout::new((width, height), dpi, 3, 5, &system, &[], false);
+            let layout =
+                StatusLayout::new((width, height), dpi, 3, 5, &system, &[], false, estimate);
             assert_eq!(layout.tray.len(), 3);
             let overflow = layout.overflow.unwrap();
             let last = layout.tray[2].rect;
             assert!(last.x + last.width <= overflow.x);
             let (first, sound) = (layout.system[0].1, layout.system[1].1);
             assert!(overflow.x + overflow.width <= first.x);
-            // The chevron sits on the tray's pitch, evenly between its neighbors.
+            // The overflow list sits on the tray's pitch, evenly between its neighbors.
             let center = |r: Rect| r.x + r.width / 2;
             let before = center(overflow) - center(last);
             let after = center(first) - center(overflow);
@@ -768,27 +798,36 @@ mod tests {
             assert_eq!(layout.hit(layout.clock.x, px(10)), StatusHit::Clock);
 
             // A narrow bar moves icons into the overflow list but keeps the title area.
-            let close = StatusLayout::new((width, height), dpi, 3, 5, &system, &[], true);
+            let close = StatusLayout::new((width, height), dpi, 3, 5, &system, &[], true, estimate);
             assert_eq!(close.hit(width - 1, 0), StatusHit::CloseMaximized);
             assert_eq!(close.hit(close.close.unwrap().x - 1, 0), StatusHit::Clock);
             assert_eq!(layout.hit(width - 1, 0), StatusHit::Bar);
-            let narrow = StatusLayout::new((px(520), height), dpi, 40, 40, &system, &[], false);
+            let narrow = StatusLayout::new(
+                (px(520), height),
+                dpi,
+                40,
+                40,
+                &system,
+                &[],
+                false,
+                estimate,
+            );
             assert!(narrow.tray.len() < 40);
             assert!(narrow.tray[0].rect.x >= px(220));
             assert!(narrow.overflow.is_some());
         }
-        let empty = StatusLayout::new((800, 30), 96, 0, 0, &[], &[], false);
+        let empty = StatusLayout::new((800, 30), 96, 0, 0, &[], &[], false, estimate);
         assert!(empty.tray.is_empty() && empty.overflow.is_none());
         assert_eq!(empty.hit(700, 10), StatusHit::Title);
         assert_eq!(empty.hit(735, 10), StatusHit::Bar);
     }
 
     #[test]
-    fn battery_slot_has_room_for_its_charge_and_targets_highlight_slots() {
+    fn battery_slot_fits_its_wider_icon_and_targets_highlight_slots() {
         let system = [SystemItem::Battery, SystemItem::Control];
-        let layout = StatusLayout::new((1920, 30), 96, 0, 0, &system, &[], false);
+        let layout = StatusLayout::new((1920, 30), 96, 0, 0, &system, &[], false, estimate);
         let (battery, control) = (layout.system[0].1, layout.system[1].1);
-        assert_eq!(battery.width, 60);
+        assert_eq!((battery.width, control.width), (34, 28));
         assert_eq!(battery.x + battery.width, control.x);
         let target = layout
             .target(StatusHit::System(SystemItem::Control))
@@ -816,6 +855,7 @@ mod tests {
                     &[SystemItem::Network, SystemItem::Sound],
                     &metrics,
                     false,
+                    estimate,
                 )
             };
             let full = layout(1000, 5);
@@ -841,6 +881,79 @@ mod tests {
             let empty_tray = layout(1000, 0);
             assert!(empty_tray.overflow.is_none());
             assert!(empty_tray.title.x + empty_tray.title.width <= empty_tray.metrics[0].x);
+        }
+    }
+
+    #[test]
+    fn neighbors_stand_one_gap_apart_whatever_they_show() {
+        use crate::metrics::Metric;
+
+        let metrics = [
+            Indicator::new(Metric::Memory, Style::Value),
+            Indicator::new(Metric::CpuTemperature, Style::Value),
+            Indicator::new(Metric::Cpu, Style::Bars),
+            Indicator::new(Metric::Disk, Style::Graph),
+            Indicator::new(Metric::Cpu, Style::Ring),
+        ];
+        let system = [
+            SystemItem::InputLanguage,
+            SystemItem::Network,
+            SystemItem::Battery,
+            SystemItem::Sound,
+            SystemItem::Control,
+        ];
+        let wide = |text: &str, size, bold| estimate(text, size, bold) * 1.4;
+        for measure in [&estimate as &dyn Fn(&str, f32, bool) -> f32, &wide] {
+            for dpi in [96, 120, 144, 192] {
+                let s = dpi as f32 / 96.;
+                let px = scaled(dpi);
+                let layout = StatusLayout::new(
+                    (px(1920), px(STATUS_HEIGHT)),
+                    dpi,
+                    4,
+                    6,
+                    &system,
+                    &metrics,
+                    true,
+                    measure,
+                );
+                assert_eq!(layout.metrics.len(), metrics.len());
+                // Every slot from the first tray icon to the close button, with the width
+                // in DIPs of what it shows.
+                let icon = BAR_ICON as f32;
+                let mut row = layout
+                    .tray
+                    .iter()
+                    .map(|slot| (slot.rect, icon))
+                    .collect::<Vec<_>>();
+                row.push((layout.overflow.unwrap(), icon));
+                row.extend(layout.metrics.iter().zip(&metrics).map(|(&r, indicator)| {
+                    let symbol = (BAR_ICON + METRIC_SPACING) as f32;
+                    (r, symbol + readout_width(indicator, measure))
+                }));
+                row.extend(
+                    layout
+                        .system
+                        .iter()
+                        .map(|&(item, r)| (r, item.width() as f32)),
+                );
+                let clock = measure(CLOCK_SAMPLE, CLOCK_TEXT, true);
+                row.extend([(layout.clock, clock), (layout.close.unwrap(), icon)]);
+                for (rect, content) in &row {
+                    let padding = rect.width as f32 - content * s;
+                    assert!(
+                        (padding - BAR_GAP as f32 * s).abs() <= 0.5,
+                        "{dpi}: {rect:?} pads {content} DIPs by {padding} pixels"
+                    );
+                }
+                for pair in row.windows(2) {
+                    assert_eq!(pair[0].0.x + pair[0].0.width, pair[1].0.x, "{dpi}");
+                }
+                assert_eq!(
+                    row.last().unwrap().0.x + row.last().unwrap().0.width,
+                    px(1920)
+                );
+            }
         }
     }
 }

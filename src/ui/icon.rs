@@ -23,9 +23,13 @@ pub enum Symbol {
     /// Two switches, the control center's mark.
     Controls,
     Keyboard,
-    /// The tray overflow button while its menu is closed: more icons below.
+    /// The tray overflow button: a bulleted list, reversed out of a solid tile while
+    /// the list is expanded.
+    List {
+        expanded: bool,
+    },
+    /// The next and previous pages of a long list; a dropdown's arrow.
     ChevronDown,
-    /// The tray overflow button while its menu is open.
     ChevronUp,
     /// The calendar's previous and next month.
     ChevronLeft,
@@ -142,6 +146,11 @@ pub struct Shape {
     pub tone: Tone,
     /// Multiplies the caller's opacity, for unlit parts such as quiet sound waves.
     pub alpha: f32,
+    /// Merges this figure into the one before it by exclusive or, as do the merging
+    /// figures that follow: where they overlap neither is painted, and the rest takes the
+    /// earlier figure's color. A mark drawn over a solid area stays legible this way, cut
+    /// out where it crosses the area.
+    pub xor: bool,
 }
 
 /// The figures of `symbol`, in drawing order.
@@ -203,30 +212,31 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
         Symbol::Battery { percent, charging } => {
             s.rect(1.5, 6.5, 19.5, 17.5, 3.5, Stroke);
             s.rect(21., 10., 22.75, 14., 0.9, Fill);
-            if let Some(percent) = percent.filter(|&p| p > 0) {
+            // The level alone tells the charge, so it stays solid in every state.
+            let level = percent.filter(|&p| p > 0).map(|percent| {
                 let width = (13. * f32::from(percent.min(100)) / 100.).max(2.);
                 let level = s.rect(4., 9., 4. + width, 15., 1.5, Fill);
-                if charging {
-                    // Faded so the bolt on top stays legible at any charge.
-                    level.alpha = 0.35;
-                } else if percent <= LOW_BATTERY {
+                if percent <= LOW_BATTERY && !charging {
                     level.tone = Tone::Alert;
                 }
-            }
+            });
             if charging {
+                // Cut out of the level where they overlap and solid beyond it, so the
+                // level's edge stays readable through the bolt.
                 s.polyline(
                     &[
-                        (11.5, 7.5),
-                        (7.5, 12.8),
-                        (10.3, 12.8),
-                        (9.5, 16.5),
-                        (13.5, 11.2),
-                        (10.7, 11.2),
+                        (11.4, 7.9),
+                        (7.75, 12.75),
+                        (10.3, 12.75),
+                        (9.6, 16.1),
+                        (13.25, 11.25),
+                        (10.7, 11.25),
                     ],
                     0.6,
                     true,
                     Fill,
-                );
+                )
+                .xor = level.is_some();
             }
         }
         Symbol::Volume(_) | Symbol::Muted => {
@@ -263,7 +273,21 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
             s.rect(2.5, 13., 21.5, 20.5, 3.75, Stroke);
             s.circle(6.25, 16.75, 1.75, Fill).alpha = 0.45;
         }
-        // Mirror images around the grid's middle, so the button keeps its place as it flips.
+        Symbol::List { expanded: false } => {
+            for y in [6.5, 12., 17.5] {
+                s.circle(4.75, y, 1.6, Fill);
+                s.line(&[(9.25, y), (19.75, y)]);
+            }
+        }
+        // The same rows, smaller, cut out of a solid tile: the button reads as switched
+        // on while its list is open.
+        Symbol::List { expanded: true } => {
+            s.rect(1.5, 1.5, 22.5, 22.5, 5.5, Fill);
+            for y in [7.5, 12., 16.5] {
+                s.circle(6.6, y, 1.3, Fill).xor = true;
+                s.line(&[(10.2, y), (17.6, y)]).xor = true;
+            }
+        }
         Symbol::ChevronDown => {
             s.line(&[(6.5, 9.25), (12., 14.75), (17.5, 9.25)]);
         }
@@ -812,6 +836,7 @@ impl Sketch {
             paint,
             tone: Tone::Ink,
             alpha: 1.,
+            xor: false,
         });
         self.0.last_mut().expect("a shape was just pushed")
     }
@@ -925,10 +950,16 @@ mod tests {
             percent: Some(100),
             charging: false,
         },
+        Symbol::Battery {
+            percent: Some(60),
+            charging: true,
+        },
         Symbol::Volume(0),
         Symbol::Volume(3),
         Symbol::Muted,
         Symbol::Controls,
+        Symbol::List { expanded: false },
+        Symbol::List { expanded: true },
         Symbol::ChevronDown,
         Symbol::ChevronUp,
         Symbol::ChevronLeft,
@@ -1069,21 +1100,35 @@ mod tests {
         };
         assert!(low(false));
         assert!(!low(true));
-        // Nothing to fill without a reported charge.
+        // Charging keeps the level solid, with the bolt cut out of it.
+        let charging = sketch(Symbol::Battery {
+            percent: Some(60),
+            charging: true,
+        });
+        assert_eq!((charging[2].alpha, charging[2].tone), (1., Tone::Ink));
+        assert!(charging[3].xor);
+        // Nothing to fill without a reported charge, and nothing to cut the bolt from.
         let unknown = sketch(Symbol::Battery {
             percent: None,
             charging: false,
         });
         assert_eq!(unknown.len(), 2);
+        let unknown = sketch(Symbol::Battery {
+            percent: None,
+            charging: true,
+        });
+        assert!(!unknown[2].xor);
     }
 
     #[test]
-    fn overflow_chevrons_mirror_each_other() {
-        let flipped: Vec<Point> = points(&sketch(Symbol::ChevronDown)[0])
-            .into_iter()
-            .map(|(x, y)| (x, GRID - y))
-            .collect();
-        assert_eq!(flipped, points(&sketch(Symbol::ChevronUp)[0]));
+    fn expanded_list_reverses_its_rows_out_of_a_tile() {
+        let collapsed = sketch(Symbol::List { expanded: false });
+        assert!(collapsed.iter().all(|shape| !shape.xor));
+        let expanded = sketch(Symbol::List { expanded: true });
+        assert_eq!(expanded[0].paint, Paint::Fill);
+        // Painted over the tile in the same ink the rows would vanish.
+        assert!(expanded[1..].iter().all(|shape| shape.xor));
+        assert_eq!(collapsed.len(), expanded.len() - 1);
     }
 
     #[test]

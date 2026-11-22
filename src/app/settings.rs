@@ -452,13 +452,14 @@ impl Bars {
                     backdrop_changed = true;
                     Ok(())
                 }
-                Key::Accent
-                | Key::Language
-                | Key::FontFamily
-                | Key::FontScale
-                | Key::BoldFont
-                | Key::SmoothText => {
+                Key::Accent | Key::Language | Key::SmoothText => {
                     retheme = true;
+                    Ok(())
+                }
+                // The status bar sizes its clock and readings to the text.
+                Key::FontFamily | Key::FontScale | Key::BoldFont => {
+                    retheme = true;
+                    status_changed = true;
                     Ok(())
                 }
                 Key::IconSize | Key::DockGap | Key::IconSpacing => {

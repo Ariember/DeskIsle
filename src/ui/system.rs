@@ -42,11 +42,8 @@ pub enum Mark {
         dim: bool,
     },
     Text(&'static str),
-    /// The battery icon followed by the charge, when the battery reports it.
-    Battery {
-        symbol: Symbol,
-        percent: Option<u8>,
-    },
+    /// The battery icon, drawn wider than the others; its level shows the charge.
+    Battery(Symbol),
 }
 
 impl SystemStatus {
@@ -85,19 +82,13 @@ impl SystemStatus {
                 dim: true,
             },
             SystemItem::Display => icon(Symbol::Display),
-            SystemItem::Battery => match self.battery {
-                Some(battery) => Mark::Battery {
-                    symbol: battery_symbol(battery),
-                    percent: battery.percent.map(|p| p.min(100)),
-                },
-                None => Mark::Battery {
-                    symbol: Symbol::Battery {
-                        percent: None,
-                        charging: false,
-                    },
+            SystemItem::Battery => Mark::Battery(match self.battery {
+                Some(battery) => battery_symbol(battery),
+                None => Symbol::Battery {
                     percent: None,
+                    charging: false,
                 },
-            },
+            }),
             SystemItem::Sound => match &self.audio {
                 Some(audio) => icon(volume_symbol(audio.volume, audio.muted)),
                 None => Mark::Icon {
@@ -560,13 +551,10 @@ mod tests {
         assert!(items.contains(&SystemItem::Battery));
         assert_eq!(
             status.mark(SystemItem::Battery),
-            Mark::Battery {
-                symbol: Symbol::Battery {
-                    percent: Some(64),
-                    charging: false
-                },
-                percent: Some(64)
-            }
+            Mark::Battery(Symbol::Battery {
+                percent: Some(64),
+                charging: false
+            })
         );
         assert_eq!(volume_symbol(80, true), Symbol::Muted);
         assert_eq!(volume_symbol(0, false), Symbol::Volume(0));

@@ -35,7 +35,7 @@ use crate::geometry::Rect;
 use crate::metrics::Indicator;
 use crate::settings::{Key, Settings, TopBarBackground};
 use crate::ui::icon::{self, Symbol};
-use crate::ui::layout::{StatusHit, StatusLayout};
+use crate::ui::layout::{self, StatusHit, StatusLayout};
 use crate::ui::panel::Area;
 use crate::ui::system::Mark;
 
@@ -171,12 +171,13 @@ const DOT_BOX: (f32, f32) = (20., 8.);
 const DOT_TOP: f32 = 10.5;
 /// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
 const PILL_RADIUS: f32 = 7.;
-/// Size of the system icons on the status bar, in DIPs. The battery is drawn larger with
-/// the same stroke weight, so its body reads at the bar's height.
-const BAR_ICON: f32 = 16.;
-const BATTERY_ICON: f32 = 22.;
-/// The chevron of the tray overflow button, smaller than the icons beside it.
-const OVERFLOW_ICON: f32 = 13.;
+/// Size of the icons on the status bar, in DIPs. The battery is drawn larger with the
+/// same stroke weight, so its body reads at the bar's height.
+const BAR_ICON: f32 = layout::BAR_ICON as f32;
+const BATTERY_ICON: f32 = layout::BATTERY_ICON as f32;
+/// Opacity of a status icon whose feature is unavailable: visibly faded, yet keeping
+/// more than 3:1 contrast with the light bar.
+const DIM: f32 = 0.55;
 /// The DeskIsle mark: a ring centered this far from the bar's leading edge, in DIPs.
 const MARK_X: f32 = 18.;
 const MARK_RADIUS: f32 = 6.;
@@ -452,7 +453,7 @@ impl Renderer {
     /// Each stamp identifies the current tray image and its attention indicator.
     /// `marks[i]` is drawn in `layout.system[i]`, with a backing behind the target whose
     /// menu is `open` and a fainter one behind the `hover` target. The overflow button
-    /// points down while its menu is closed and up while it is open.
+    /// shows its list reversed out of a solid tile while its menu is open.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_top(
         &mut self,
@@ -532,7 +533,7 @@ impl Renderer {
                 if let Some(slot) = open_slot {
                     backing(c, slot, 0.15)?;
                 }
-                let icon_size = (16. * s).round();
+                let icon_size = (BAR_ICON * s).round();
                 for (slot, image) in layout.tray.iter().zip(icons) {
                     let r = slot.rect;
                     let bitmap = image.icon.and_then(|icon| self.hicon_bitmap(icon).ok());
@@ -544,7 +545,10 @@ impl Renderer {
                             if self.color_tray_icons {
                                 c.bitmap(&bitmap, rect)?;
                             } else {
-                                c.grayscale_bitmap(&bitmap, rect)?;
+                                // An image that cannot be read is drawn as it is.
+                                let faint = pixels(&bitmap)
+                                    .is_ok_and(|pixels| faint(&pixels, c.p.light_ground()));
+                                c.gray_bitmap(&bitmap, rect, faint)?;
                             }
                         }
                         // An icon without a usable image keeps its slot visible and clickable.
@@ -563,12 +567,7 @@ impl Renderer {
                 if let Some(r) = layout.overflow {
                     let x = (dip(r.x) + dip(r.x + r.width)) / 2.;
                     let expanded = open == Some(StatusHit::Overflow);
-                    let (symbol, ink) = match (expanded, hover == Some(StatusHit::Overflow)) {
-                        (true, _) => (Symbol::ChevronUp, c.p.ink),
-                        (false, true) => (Symbol::ChevronDown, c.p.ink),
-                        (false, false) => (Symbol::ChevronDown, c.p.muted),
-                    };
-                    c.symbol(symbol, x, h / 2., OVERFLOW_ICON, ink, 1.)?;
+                    c.symbol(Symbol::List { expanded }, x, h / 2., BAR_ICON, c.p.ink, 1.)?;
                 }
                 for (&(_, r), mark) in layout.system.iter().zip(marks) {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));
@@ -587,35 +586,12 @@ impl Renderer {
                             1.,
                         )?,
                         Mark::Icon { symbol, dim } => {
-                            let alpha = if dim { 0.4 } else { 1. };
+                            let alpha = if dim { DIM } else { 1. };
                             c.symbol(symbol, x, y, BAR_ICON, c.p.ink, alpha)?;
                         }
-                        Mark::Battery { symbol, percent } => {
+                        Mark::Battery(symbol) => {
                             let weight = icon::weight(BAR_ICON);
-                            let Some(percent) = percent else {
-                                c.symbol_weighted(symbol, x, y, BATTERY_ICON, weight, c.p.ink, 1.)?;
-                                continue;
-                            };
-                            c.symbol_weighted(
-                                symbol,
-                                l + 15.,
-                                y,
-                                BATTERY_ICON,
-                                weight,
-                                c.p.ink,
-                                1.,
-                            )?;
-                            c.draw_text(
-                                &self.write,
-                                &format!("{percent}%"),
-                                c.rect(l + 27., 0., right - 2., h),
-                                Text {
-                                    size: 11.5,
-                                    ..Text::default()
-                                },
-                                c.p.ink,
-                                1.,
-                            )?;
+                            c.symbol_weighted(symbol, x, y, BATTERY_ICON, weight, c.p.ink, 1.)?;
                         }
                     }
                 }
@@ -630,13 +606,19 @@ impl Renderer {
                         1.,
                     )?;
                 }
-                c.text(
+                // The slot is the time's width plus a gap, so centering leaves half the
+                // gap on each side.
+                c.draw_text(
                     &self.write,
                     time,
                     c.rect(dip(r.x), 0., dip(r.x + r.width), h),
-                    13.,
-                    true,
+                    Text {
+                        size: layout::CLOCK_TEXT,
+                        bold: true,
+                        align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                    },
                     c.p.ink,
+                    1.,
                 )
             },
         )?;
@@ -949,5 +931,62 @@ impl Renderer {
             let copied = self.imaging.CreateBitmapFromHICON(icon)?;
             WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, &copied)
         }
+    }
+}
+
+/// The premultiplied BGRA pixels of an image from [`Renderer::hicon_bitmap`].
+fn pixels(bitmap: &IWICBitmapSource) -> Result<Vec<u8>> {
+    unsafe {
+        let (mut width, mut height) = (0, 0);
+        bitmap.GetSize(&mut width, &mut height)?;
+        let stride = width * 4;
+        let mut pixels = vec![0; stride as usize * height as usize];
+        bitmap.CopyPixels(std::ptr::null(), stride, &mut pixels)?;
+        Ok(pixels)
+    }
+}
+
+/// Whether a tray image barely shows on the bar: less than a third of what it covers is
+/// darker than mid gray on a light bar, or lighter than it on a dark one. Such images
+/// are usually drawn for a taskbar of the other theme. `pixels` are premultiplied BGRA.
+fn faint(pixels: &[u8], light_ground: bool) -> bool {
+    let (mut covered, mut standing) = (0, 0);
+    for pixel in pixels.chunks_exact(4) {
+        let [b, g, r, a] = [pixel[0], pixel[1], pixel[2], pixel[3]].map(u32::from);
+        // Premultiplied luma against half the coverage, without dividing.
+        let light = 2 * (299 * r + 587 * g + 114 * b) > 1000 * a;
+        covered += a;
+        if light != light_ground {
+            standing += a;
+        }
+    }
+    3 * standing < covered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::faint;
+
+    /// Premultiplied BGRA pixels: `count` of gray `level` at coverage `alpha`.
+    fn gray(level: u8, alpha: u8, count: usize) -> Vec<u8> {
+        let v = (u16::from(level) * u16::from(alpha) / 255) as u8;
+        [v, v, v, alpha].repeat(count)
+    }
+
+    #[test]
+    fn only_icons_that_blend_into_the_bar_are_faint() {
+        // A light gray glyph drawn for a dark taskbar, with transparent surroundings.
+        let light = [gray(200, 255, 40), gray(0, 0, 200)].concat();
+        assert!(faint(&light, true));
+        assert!(!faint(&light, false));
+        // A black tile with a white glyph shows on a light bar; on a dark one only the
+        // glyph does, which is too little of it.
+        let tile = [gray(0, 255, 75), gray(255, 255, 25)].concat();
+        assert!(!faint(&tile, true));
+        assert!(faint(&tile, false));
+        // Antialiased edges count by their coverage.
+        let silhouette = [gray(0, 255, 30), gray(0, 64, 60)].concat();
+        assert!(faint(&silhouette, false));
+        assert!(!faint(&gray(0, 0, 16), true));
     }
 }

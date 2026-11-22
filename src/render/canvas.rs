@@ -16,6 +16,15 @@ use crate::ui::panel::Area;
 
 pub(super) type Rgb = (u8, u8, u8);
 
+/// Largest distance in pixels between a curve and the segments that replace it where
+/// icon figures are widened or combined; finer than a pixel's antialiasing can show.
+const TOLERANCE: f32 = 0.05;
+
+/// Share of the gray range a faint tray icon is pressed into. Its lightest tone on a
+/// light bar, or darkest on a dark one, keeps at least about 3:1 contrast with the
+/// palette's bar color, the minimum WCAG asks of icons.
+const FAINT_TONES: f32 = 0.56;
+
 pub(super) fn accent_color(index: i32, dark: bool) -> Rgb {
     let (light, night) = [
         ((0, 104, 218), (14, 108, 213)),
@@ -58,6 +67,12 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// Whether the ink is dark, so whatever it is drawn on is light.
+    pub(super) fn light_ground(&self) -> bool {
+        let (r, g, b) = self.ink;
+        299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) < 127_500
+    }
+
     /// Match the foreground of an opaque window-caption color (a Win32 COLORREF).
     pub(super) fn for_top_bar(self, caption: Option<u32>) -> Self {
         let Some(color) = caption else { return self };
@@ -431,15 +446,42 @@ impl Canvas {
         Ok(())
     }
 
-    pub(super) fn grayscale_bitmap(
+    /// Draws `bitmap` in gray. A `faint` image is pressed into the tones away from the
+    /// bar, the darker part of the range on a light bar and the lighter part on a dark
+    /// one, so an icon drawn for the other theme still stands out while keeping its
+    /// inner contrast.
+    pub(super) fn gray_bitmap(
         &self,
         bitmap: &IWICBitmapSource,
         rect: D2D_RECT_F,
+        faint: bool,
     ) -> Result<()> {
+        let (low, high) = match (faint, self.p.light_ground()) {
+            (false, _) => (0., 1.),
+            (true, true) => (0., FAINT_TONES),
+            (true, false) => (1. - FAINT_TONES, 1.),
+        };
+        let k = high - low;
+        // The matrix maps the unpremultiplied (red, green, blue, alpha, 1) row to the
+        // output's four channels: every color channel gets the same luma.
+        #[rustfmt::skip]
+        let matrix: [f32; 20] = [
+            0.299 * k, 0.299 * k, 0.299 * k, 0.,
+            0.587 * k, 0.587 * k, 0.587 * k, 0.,
+            0.114 * k, 0.114 * k, 0.114 * k, 0.,
+            0., 0., 0., 1.,
+            low, low, low, 0.,
+        ];
+        let matrix: Vec<u8> = matrix.iter().flat_map(|v| v.to_ne_bytes()).collect();
         unsafe {
             let texture = self.ctx.CreateBitmapFromWicBitmap(bitmap, None)?;
-            let effect = self.ctx.CreateEffect(&CLSID_D2D1Grayscale)?;
+            let effect = self.ctx.CreateEffect(&CLSID_D2D1ColorMatrix)?;
             effect.SetInput(0, &texture, true);
+            effect.SetValue(
+                D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                D2D1_PROPERTY_TYPE_MATRIX_5X4,
+                &matrix,
+            )?;
             let image = effect.GetOutput()?;
             let size = texture.GetSize();
             let mut previous = Default::default();
@@ -560,7 +602,7 @@ impl Canvas {
                 },
                 None,
             )?;
-            for shape in shapes {
+            let outline = |shape: &icon::Shape| -> Result<ID2D1PathGeometry> {
                 let geometry = factory.CreatePathGeometry()?;
                 let sink = geometry.Open()?;
                 let begin = match shape.paint {
@@ -608,18 +650,59 @@ impl Canvas {
                     D2D1_FIGURE_END_OPEN
                 });
                 sink.Close()?;
+                Ok(geometry)
+            };
+            // The area a figure covers, with a stroke turned into the band it paints.
+            let area = |shape: &icon::Shape| -> Result<ID2D1PathGeometry> {
+                let geometry = outline(shape)?;
+                if shape.paint == Paint::Fill {
+                    return Ok(geometry);
+                }
+                let band = factory.CreatePathGeometry()?;
+                let sink = band.Open()?;
+                geometry.Widen(weight * self.scale, &style, None, TOLERANCE, &sink)?;
+                sink.Close()?;
+                Ok(band)
+            };
+            let mut index = 0;
+            while index < shapes.len() {
+                let shape = &shapes[index];
+                let merged = shapes[index + 1..]
+                    .iter()
+                    .take_while(|shape| shape.xor)
+                    .count();
                 let tint = match shape.tone {
                     Tone::Ink => color,
                     Tone::Alert => self.p.danger,
                 };
                 let brush = self.brush_alpha(tint, alpha * shape.alpha)?;
-                match shape.paint {
-                    Paint::Stroke => {
-                        self.ctx
-                            .DrawGeometry(&geometry, &brush, weight * self.scale, &style)
+                if merged > 0 {
+                    let mut combined = area(shape)?;
+                    for other in &shapes[index + 1..=index + merged] {
+                        let next = factory.CreatePathGeometry()?;
+                        let sink = next.Open()?;
+                        combined.CombineWithGeometry(
+                            &area(other)?,
+                            D2D1_COMBINE_MODE_XOR,
+                            None,
+                            TOLERANCE,
+                            &sink,
+                        )?;
+                        sink.Close()?;
+                        combined = next;
                     }
-                    Paint::Fill => self.ctx.FillGeometry(&geometry, &brush, None),
+                    self.ctx.FillGeometry(&combined, &brush, None);
+                } else {
+                    let geometry = outline(shape)?;
+                    match shape.paint {
+                        Paint::Stroke => {
+                            self.ctx
+                                .DrawGeometry(&geometry, &brush, weight * self.scale, &style)
+                        }
+                        Paint::Fill => self.ctx.FillGeometry(&geometry, &brush, None),
+                    }
                 }
+                index += 1 + merged;
             }
         }
         Ok(())

@@ -199,12 +199,18 @@ pub(crate) fn run() -> Result<()> {
         style,
     );
     let time = platform::clock(top.0)?;
-    let renderer = Some(Renderer::new(
-        top.0,
-        bottom.0,
-        settings::dark(&settings),
-        &settings,
-    )?);
+    let renderer = Renderer::new(top.0, bottom.0, settings::dark(&settings), &settings)?;
+    let status = StatusLayout::new(
+        (top_rect.width, top_rect.height),
+        monitor.dpi,
+        0,
+        0,
+        &[],
+        &[],
+        false,
+        |text, size, bold| renderer.measure(text, size, bold),
+    );
+    let renderer = Some(renderer);
     let audio_watch = audio::AudioWatch::new(top.0).ok();
     let mut worker = SystemWorker::new(top.0)?;
     worker.refresh_network()?;
@@ -229,15 +235,7 @@ pub(crate) fn run() -> Result<()> {
         maximized_window: None,
         top_window_color: None,
         close_press: None,
-        status: StatusLayout::new(
-            (top_rect.width, top_rect.height),
-            monitor.dpi,
-            0,
-            0,
-            &[],
-            &[],
-            false,
-        ),
+        status,
         monitor,
         top_rect,
         top_glass_theme: None,
@@ -687,6 +685,7 @@ impl Bars {
                     .unwrap_or(usize::MAX)
             });
         }
+        let renderer = self.renderer.as_ref().expect("renderer bound to bars");
         self.status = StatusLayout::new(
             (self.top_rect.width, self.top_rect.height),
             self.monitor.dpi,
@@ -695,6 +694,7 @@ impl Bars {
             &self.system.items(&self.settings),
             &self.indicators,
             self.settings.enabled(Key::TopBarCloseMaximized) && self.maximized_window.is_some(),
+            |text, size, bold| renderer.measure(text, size, bold),
         );
         self.publish_tray_rects();
         self.sync_sampling();
