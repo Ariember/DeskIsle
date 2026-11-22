@@ -560,6 +560,59 @@ pub fn close_windows(app_id: &str, ids: &[isize]) -> Result<()> {
     }
 }
 
+/// Minimizes each window of `app_id` that still exists, as its title bar button would.
+pub fn minimize_windows(app_id: &str, ids: &[isize]) -> Result<()> {
+    for &id in ids {
+        let hwnd = HWND(id as _);
+        // The handle may have closed or been reused since the menu opened.
+        if window_info(hwnd)?.is_none_or(|info| info.app_id != app_id) {
+            continue;
+        }
+        // Asynchronous, so a hung application cannot stall the Dock. The return value
+        // only tells whether the window was visible before.
+        let _ = unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
+    }
+    Ok(())
+}
+
+/// Replaces the clipboard's content with `text`.
+pub fn copy_text(owner: HWND, text: &OsStr) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    let wide: Vec<u16> = text.encode_wide().chain([0]).collect();
+    let bytes = wide.len() * size_of::<u16>();
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
+        let target = GlobalLock(memory).cast::<u16>();
+        if target.is_null() {
+            let error = Error::from_thread();
+            let _ = GlobalFree(Some(memory));
+            return Err(error);
+        }
+        // `memory` holds `bytes` bytes and stays locked until the copy is done.
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+        // Fails with NO_ERROR once unlocked, which is the expected outcome.
+        let _ = GlobalUnlock(memory);
+        let result = OpenClipboard(Some(owner)).and_then(|()| {
+            let set = EmptyClipboard().and_then(|()| {
+                SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(memory.0)))
+            });
+            let _ = CloseClipboard();
+            set
+        });
+        // The clipboard owns the memory only after SetClipboardData succeeds.
+        if result.is_err() {
+            let _ = GlobalFree(Some(memory));
+        }
+        result.map(drop)
+    }
+}
+
 pub fn activate(app_id: &str, id: isize) -> Result<bool> {
     let hwnd = HWND(id as _);
     if window_info(hwnd)?.is_none_or(|info| info.app_id != app_id) {

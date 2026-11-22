@@ -704,6 +704,8 @@ pub enum Command {
     NewInstance(PathBuf),
     OpenDocument(PathBuf),
     Reveal(PathBuf),
+    /// Puts the full path of a program on the clipboard as text.
+    CopyPath(PathBuf),
     /// Starts a program or shortcut with administrator rights after the UAC prompt.
     RunAsAdmin(PathBuf),
     /// The Shell's property sheet, where a shortcut's icon can be changed.
@@ -712,6 +714,8 @@ pub enum Command {
     LaunchpadRemove(PathBuf),
     Pin(PathBuf),
     Unpin(String),
+    /// Minimizes the listed windows of an application to the taskbar.
+    Minimize(String, Vec<isize>),
     CloseWindow(String, isize),
     CloseAllWindows(String, Vec<isize>),
     TaskManager,
@@ -783,7 +787,8 @@ fn app_header(menu: &mut Menu<Command>, app: &AppGroup, has_tray_menu: bool) {
     menu.separator();
 }
 
-/// The menu of one application's Dock icon or status bar title.
+/// The menu of one application's Dock icon or status bar title, in groups: its
+/// windows, starting it, the program file, the Dock, then the open windows.
 pub fn app_menu(
     app: &AppGroup,
     foreground: Option<isize>,
@@ -791,36 +796,59 @@ pub fn app_menu(
 ) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     app_header(&mut menu, app, !tray_menus.is_empty());
+    if !app.windows.is_empty() {
+        menu.label(match app.windows.len() {
+            1 => "窗口".to_string(),
+            n => format!("窗口 · {n}"),
+        });
+    }
     windows_list(&mut menu, app, foreground);
     menu.separator();
     let id = app.app_id.clone();
-    match app.executable() {
-        Some(path) if app.windows.is_empty() => {
+    if let Some(path) = app.executable() {
+        if app.windows.is_empty() {
             menu.item(
                 "打开",
                 Icon::Symbol(Symbol::Open),
                 Some(Command::Select(id.clone())),
             );
-            menu.item(
-                "打开文件所在位置",
-                Icon::Symbol(Symbol::Folder),
-                Some(Command::Reveal(path.into())),
-            );
-        }
-        Some(path) => {
+        } else {
             menu.item(
                 "新建窗口",
                 Icon::Symbol(Symbol::Plus),
                 Some(Command::NewInstance(path.into())),
-            );
-            menu.item(
-                "打开文件所在位置",
-                Icon::Symbol(Symbol::Folder),
-                Some(Command::Reveal(path.into())),
-            );
+            )
+            .detail = "中键单击".into();
         }
-        None => {}
+        menu.item(
+            "以管理员身份运行",
+            Icon::Symbol(Symbol::Shield),
+            Some(Command::RunAsAdmin(path.into())),
+        );
+        menu.separator();
+        menu.item(
+            "打开文件所在位置",
+            Icon::Symbol(Symbol::Folder),
+            Some(Command::Reveal(path.into())),
+        );
+        menu.item(
+            "复制程序路径",
+            Icon::Symbol(Symbol::Copy),
+            Some(Command::CopyPath(path.into())),
+        );
+        let properties = menu.item(
+            "属性",
+            Icon::Symbol(Symbol::Info),
+            Some(Command::Properties(path.into())),
+        );
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+        {
+            properties.detail = "可更改图标".into();
+        }
     }
+    menu.separator();
     if app.pinned() {
         menu.item(
             "从 Dock 取消固定",
@@ -836,22 +864,36 @@ pub fn app_menu(
     }
     if let Some(window) = app.current_window(foreground) {
         menu.separator();
+        let ids: Vec<isize> = app.windows.iter().map(|w| w.id).collect();
+        let several = ids.len() > 1;
+        menu.item(
+            if several {
+                "最小化全部窗口"
+            } else {
+                "最小化窗口"
+            },
+            Icon::Symbol(Symbol::Minimize),
+            Some(Command::Minimize(id.clone(), ids.clone())),
+        );
         let close = menu.item(
             "关闭窗口",
             Icon::Symbol(Symbol::Close),
             Some(Command::CloseWindow(id.clone(), window.id)),
         );
-        if app.windows.len() > 1 {
+        if several {
             close.detail = window.title.clone();
         }
         if tray_menus.is_empty() {
-            let ids = app.windows.iter().map(|w| w.id).collect();
             let exit = menu.item(
                 "退出程序",
                 Icon::Symbol(Symbol::SignOut),
                 Some(Command::CloseAllWindows(id, ids)),
             );
-            exit.detail = "请求关闭所有窗口".into();
+            exit.detail = if several {
+                "关闭所有窗口".into()
+            } else {
+                "请求关闭窗口".into()
+            };
             exit.danger = true;
         }
     }
@@ -1314,6 +1356,15 @@ mod tests {
             Some(&Command::CloseAllWindows("viewer".into(), vec![7, 8]))
         );
         assert!(running.contains(&Command::CloseWindow("viewer".into(), 8)));
+        for command in [
+            Command::RunAsAdmin("viewer.exe".into()),
+            Command::CopyPath("viewer.exe".into()),
+            Command::Properties("viewer.exe".into()),
+            Command::Minimize("viewer".into(), vec![7, 8]),
+        ] {
+            assert!(running.contains(&command), "{command:?}");
+        }
+        assert!(!idle.iter().any(|c| matches!(c, Command::Minimize(..))));
         let tray = commands(&app_menu(&apps[1], None, &[(4, "Viewer")]));
         assert!(tray.contains(&Command::CloseWindow("viewer".into(), 7)));
         assert!(tray.contains(&Command::TrayMenu(4)));

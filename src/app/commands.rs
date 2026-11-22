@@ -28,6 +28,7 @@ impl Bars {
                 shell::execute(owner, &path)
             }
             Command::Reveal(path) => shell::reveal(owner, &path),
+            Command::CopyPath(path) => shell::copy_text(owner, path.as_os_str()),
             Command::RunAsAdmin(path) => shell::run_as_admin(owner, &path).map(drop),
             Command::Properties(path) => shell::properties(owner, &path),
             Command::LaunchpadRemove(path) => self.remove_launchpad_entry(&path),
@@ -41,6 +42,7 @@ impl Bars {
                 pins.retain(|pin| pin.app_id != id);
                 self.save_pins(pins).map(drop)
             }
+            Command::Minimize(id, windows) => shell::minimize_windows(&id, &windows),
             Command::CloseWindow(id, window) => shell::close_windows(&id, &[window]),
             Command::CloseAllWindows(id, windows) => shell::close_windows(&id, &windows),
             Command::TaskManager => shell::execute(owner, "taskmgr.exe"),

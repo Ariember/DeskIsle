@@ -79,6 +79,10 @@ pub enum Symbol {
     Calendar,
     Bell,
     Window,
+    /// Copying text, such as a path, to the clipboard.
+    Copy,
+    /// Minimizing windows to the taskbar.
+    Minimize,
     // Settings panel pages and monitor rows.
     Palette,
     Dock,
@@ -673,6 +677,25 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
             s.rect(3., 4., 21., 20., 2.5, Stroke);
             s.line(&[(3., 8.5), (21., 8.5)]);
         }
+        Symbol::Copy => {
+            s.rect(8.5, 8.5, 20.5, 20.5, 2.5, Stroke);
+            s.polyline(
+                &[
+                    (15.5, 5.5),
+                    (15.5, 3.5),
+                    (3.5, 3.5),
+                    (3.5, 15.5),
+                    (5.5, 15.5),
+                ],
+                2.,
+                false,
+                Stroke,
+            );
+        }
+        Symbol::Minimize => {
+            s.rect(3., 4., 21., 20., 2.5, Stroke);
+            s.line(&[(8., 15.5), (16., 15.5)]);
+        }
         Symbol::Palette => {
             s.circle(12., 12., 9., Stroke);
             for (x, y) in [(7.5, 10.5), (10.5, 6.8), (15., 7.3), (17., 11.5)] {
@@ -1006,6 +1029,8 @@ mod tests {
         Symbol::Calendar,
         Symbol::Bell,
         Symbol::Window,
+        Symbol::Copy,
+        Symbol::Minimize,
         Symbol::Palette,
         Symbol::Dock,
         Symbol::Computer,
