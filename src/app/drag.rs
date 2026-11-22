@@ -121,7 +121,7 @@ impl Bars {
             if press.target.is_some() {
                 self.draw()?;
             }
-            self.finish_dock_gesture()?;
+            self.check_dock_pointer(false)?;
         }
         Ok(())
     }
@@ -242,7 +242,7 @@ impl Bars {
                 _ => {}
             }
         }
-        self.finish_dock_gesture()
+        self.check_dock_pointer(false)
     }
 }
 

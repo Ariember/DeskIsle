@@ -1,5 +1,6 @@
 use crate::geometry::Rect;
 use crate::metrics::{Indicator, Style};
+use crate::visibility::DockDisplayMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
@@ -31,8 +32,8 @@ pub struct DockSlot {
 pub struct Layout {
     /// Screen pixels in the target monitor's work area.
     pub bottom: Rect,
-    /// Bottom edge of the work area, including the configured gap below the Dock.
-    work_bottom: i32,
+    /// The last row of work-area pixels, including both corners.
+    work_edge: Rect,
     pub slots: Vec<DockSlot>,
     pub first: usize,
     /// Edge of each icon in pixels.
@@ -117,24 +118,33 @@ impl Layout {
             .max(1);
         Self {
             bottom,
-            work_bottom: work.y + work.height,
+            work_edge: Rect {
+                y: work.y + work.height - 1,
+                height: 1,
+                ..work
+            },
             slots,
             first,
             icon,
         }
     }
 
-    /// With immersion enabled the bottommost pixel wakes the Dock. When revealed,
-    /// the same window spans the gap so moving up from the edge can reach its icons.
-    pub fn immersive_window(&self, collapsed: bool) -> Rect {
-        let y = if collapsed {
-            self.work_bottom - 1
+    pub fn reveal_edge(&self, mode: DockDisplayMode) -> Rect {
+        if mode == DockDisplayMode::AutoHide {
+            self.work_edge
         } else {
-            self.bottom.y
-        };
+            Rect {
+                x: self.bottom.x,
+                width: self.bottom.width,
+                ..self.work_edge
+            }
+        }
+    }
+
+    /// Connect the visible Dock to the edge so the pointer can cross the gap.
+    pub fn revealed_window(&self) -> Rect {
         Rect {
-            y,
-            height: self.work_bottom - y,
+            height: self.work_edge.y + 1 - self.bottom.y,
             ..self.bottom
         }
     }
@@ -695,10 +705,22 @@ mod tests {
             height: 728,
         };
         let layout = Layout::new(work, 144, 4, 0, DockStyle::default());
-        let edge = layout.immersive_window(true);
-        let revealed = layout.immersive_window(false);
+        let edge = layout.reveal_edge(DockDisplayMode::AutoHide);
+        let smart = layout.reveal_edge(DockDisplayMode::SmartHide);
+        let revealed = layout.revealed_window();
         assert_eq!(edge.y, 767);
         assert_eq!(edge.height, 1);
+        assert_eq!((edge.x, edge.width), (work.x, work.width));
+        for x in [work.x, work.x + work.width - 1] {
+            assert!(edge.contains(x, edge.y));
+            assert!(!edge.contains(x, edge.y - 1));
+            assert!(!revealed.contains(x, edge.y));
+            assert!(!smart.contains(x, edge.y));
+        }
+        assert_eq!(
+            (smart.x, smart.width),
+            (layout.bottom.x, layout.bottom.width)
+        );
         assert_eq!(revealed.y, layout.bottom.y);
         let x = edge.x + edge.width / 2;
         assert!(revealed.contains(x, edge.y));

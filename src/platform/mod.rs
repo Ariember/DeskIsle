@@ -236,7 +236,7 @@ pub fn monitor() -> Result<Monitor> {
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
 const TRAY_NOTICE_TIMER: usize = 2;
-const DOCK_REVEAL_TIMER: usize = 3;
+const DOCK_EDGE_TIMER: usize = 3;
 const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
@@ -456,16 +456,16 @@ impl Bar {
         place(Some(HWND_NOTOPMOST), SET_WINDOW_POS_FLAGS(0))
     }
 
-    /// Arms a one-shot dwell timer on the Dock window.
-    pub fn time_dock_reveal(&self, delay_ms: u32) -> Result<()> {
-        if unsafe { SetTimer(Some(self.0), DOCK_REVEAL_TIMER, delay_ms, None) } == 0 {
+    /// Schedule a one-shot pointer check at the reveal edge.
+    pub fn time_dock_edge(&self, delay_ms: u32) -> Result<()> {
+        if unsafe { SetTimer(Some(self.0), DOCK_EDGE_TIMER, delay_ms, None) } == 0 {
             return Err(Error::from_thread());
         }
         Ok(())
     }
 
-    pub fn cancel_dock_reveal(&self) {
-        let _ = unsafe { KillTimer(Some(self.0), DOCK_REVEAL_TIMER) };
+    pub fn cancel_dock_edge_timer(&self) {
+        let _ = unsafe { KillTimer(Some(self.0), DOCK_EDGE_TIMER) };
     }
 }
 
@@ -527,7 +527,7 @@ pub enum Event {
     Clock,
     TrayNoticeExpired,
     InputLanguage,
-    DockReveal,
+    DockEdgeTimer,
     TaskbarShortcut(i32),
     DockShortcut,
     MetricsUpdate,
@@ -672,9 +672,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let _ = unsafe { KillTimer(Some(hwnd), TRAY_NOTICE_TIMER) };
             Event::TrayNoticeExpired
         }
-        WM_TIMER if wp.0 == DOCK_REVEAL_TIMER => {
-            let _ = unsafe { KillTimer(Some(hwnd), DOCK_REVEAL_TIMER) };
-            Event::DockReveal
+        WM_TIMER if wp.0 == DOCK_EDGE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DOCK_EDGE_TIMER) };
+            Event::DockEdgeTimer
         }
         WM_TIMER if wp.0 == input::TIMER => Event::InputLanguage,
         WM_TIMER | WM_TIMECHANGE => Event::Clock,

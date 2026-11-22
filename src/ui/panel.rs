@@ -345,9 +345,10 @@ impl PanelLayout {
             let starts_group = rows.is_empty()
                 || matches!(
                     spec.key,
-                    Key::Theme
+                    Key::InterfaceScale
+                        | Key::Theme
                         | Key::ConfirmPowerActions
-                        | Key::Autostart
+                        | Key::HideTaskbar
                         | Key::TemperatureUnit
                         | Key::FontFamily
                         | Key::HoverZoom
@@ -405,7 +406,7 @@ impl PanelLayout {
                         match settings.dock_display_mode() {
                             DockDisplayMode::Default => spec.help,
                             DockDisplayMode::Overlay => "允许其他窗口遮挡 Dock",
-                            DockDisplayMode::AutoHide => "移开收起，移到底边唤出",
+                            DockDisplayMode::AutoHide => "移开收起，停在主屏底边任意位置唤出",
                             DockDisplayMode::SmartHide => "与前台窗口重叠时收起",
                             DockDisplayMode::Always => "切换应用后保持置顶",
                             DockDisplayMode::Hotkey => "Ctrl+Alt+D 显示或隐藏 Dock",

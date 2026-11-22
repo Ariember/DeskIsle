@@ -339,9 +339,10 @@ pub(crate) fn run() -> Result<()> {
                 bars.dock_hotkey_shown = !bars.dock_hotkey_shown;
                 bars.sync_dock_visibility(false)?;
             }
-            Event::DockReveal if matches!(bars.dock_exposure, DockExposure::Waiting(_)) => {
+            Event::DockEdgeTimer if matches!(bars.dock_exposure, DockExposure::Waiting(_)) => {
                 bars.hover_dock_edge(true)?;
             }
+            Event::DockEdgeTimer if bars.dock_shown() => bars.check_dock_pointer(false)?,
             Event::Audio => bars.refresh_audio()?,
             Event::MetricsUpdate => match bars.draw_metrics() {
                 Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
@@ -373,7 +374,7 @@ pub(crate) fn run() -> Result<()> {
                     let target = point.and_then(|(x, y)| bars.file_target(x, y));
                     bars.set_dock_file_target(target)?;
                     if point.is_none() {
-                        bars.finish_dock_gesture()?;
+                        bars.check_dock_pointer(false)?;
                     }
                 }
             }
@@ -397,7 +398,7 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::Leave(hwnd) if hwnd == bars.bottom.0 => {
                 bars.leave_dock()?;
-                bars.hide_idle_dock()?;
+                bars.check_dock_pointer(true)?;
             }
             Event::Leave(hwnd) if hwnd == bars.top.0 => bars.set_top_hover(None)?,
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
@@ -643,9 +644,10 @@ impl Bars {
         if self.layout == layout {
             return Ok(false);
         }
+        let mode = self.settings.dock_display_mode();
         let moved = layout.bottom != self.layout.bottom
             || (self.dock_policy == DockPolicy::EdgeReveal
-                && layout.immersive_window(true) != self.layout.immersive_window(true));
+                && layout.reveal_edge(mode) != self.layout.reveal_edge(mode));
         self.layout = layout;
         if moved {
             // A press started against the previous client origin.

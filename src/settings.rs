@@ -323,6 +323,16 @@ const fn top_bar_toggle(
 
 pub const SCHEMA: &[Spec] = &[
     Spec {
+        key: Key::Autostart,
+        id: "system.autostart",
+        section: Section::General,
+        label: "开机自动启动",
+        help: "当前用户登录 Windows 后自动运行 DeskIsle",
+        control: Control::Toggle,
+        default: 0,
+        store: Store::System,
+    },
+    Spec {
         key: Key::InterfaceScale,
         id: "general.interface_scale",
         section: Section::General,
@@ -410,16 +420,6 @@ pub const SCHEMA: &[Spec] = &[
         ]),
         default: 0,
         store: Store::File,
-    },
-    Spec {
-        key: Key::Autostart,
-        id: "system.autostart",
-        section: Section::General,
-        label: "开机自动启动",
-        help: "登录 Windows 后启动 DeskIsle",
-        control: Control::Toggle,
-        default: 0,
-        store: Store::System,
     },
     Spec {
         key: Key::HideTaskbar,

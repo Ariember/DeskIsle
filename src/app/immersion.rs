@@ -1,4 +1,5 @@
 use super::Bars;
+use crate::geometry::Rect;
 use crate::platform;
 use crate::settings::Key;
 use crate::visibility::{DockContext, DockDisplayMode, DockPolicy};
@@ -32,14 +33,19 @@ impl Bars {
         self.dock_policy != DockPolicy::Hidden && !self.dock_exposure.collapsed()
     }
 
+    fn dock_window_rect(&self) -> Rect {
+        match (self.dock_policy, self.dock_exposure) {
+            (DockPolicy::EdgeReveal, DockExposure::Shown) => self.layout.revealed_window(),
+            (DockPolicy::EdgeReveal, _) => {
+                self.layout.reveal_edge(self.settings.dock_display_mode())
+            }
+            _ => self.layout.bottom,
+        }
+    }
+
     pub(super) fn position_dock(&self) -> Result<()> {
-        let rect = if self.dock_policy == DockPolicy::EdgeReveal {
-            self.layout.immersive_window(self.dock_exposure.collapsed())
-        } else {
-            self.layout.bottom
-        };
         self.bottom.position_layer(
-            rect,
+            self.dock_window_rect(),
             self.dock_policy != DockPolicy::Hidden,
             self.settings.dock_display_mode().topmost(),
         )
@@ -48,14 +54,14 @@ impl Bars {
     fn set_dock_exposure(&mut self, next: DockExposure, reposition: bool) -> Result<()> {
         let previous = self.dock_exposure;
         if let DockExposure::Waiting(_) = previous {
-            self.bottom.cancel_dock_reveal();
+            self.bottom.cancel_dock_edge_timer();
         }
         if let DockExposure::Waiting(deadline) = next {
             // A cancelled timer's message can arrive after a new dwell has begun.
             // Rearm it for the remainder of the current dwell.
             let remaining = deadline.saturating_duration_since(Instant::now());
             self.bottom
-                .time_dock_reveal(remaining.as_millis().max(1) as u32)?;
+                .time_dock_edge(remaining.as_millis().max(1) as u32)?;
         }
         self.dock_exposure = next;
         if reposition || previous.collapsed() != next.collapsed() {
@@ -110,11 +116,7 @@ impl Bars {
             return Ok(());
         }
         let point = platform::cursor()?;
-        if !self
-            .layout
-            .immersive_window(true)
-            .contains(point.x, point.y)
-        {
+        if !self.dock_window_rect().contains(point.x, point.y) {
             return self.set_dock_exposure(DockExposure::Edge, false);
         }
         let delay = Duration::from_millis(self.settings.get(Key::DockRevealDelay) as u64);
@@ -132,16 +134,26 @@ impl Bars {
         Ok(())
     }
 
-    pub(super) fn finish_dock_gesture(&mut self) -> Result<()> {
-        if self.dock_policy == DockPolicy::EdgeReveal {
-            let point = platform::cursor()?;
-            if !self
+    pub(super) fn check_dock_pointer(&mut self, window_leave: bool) -> Result<()> {
+        if self.dock_policy != DockPolicy::EdgeReveal || self.dock_press.is_some() {
+            return Ok(());
+        }
+        if self.dock_exposure.collapsed() && window_leave {
+            return self.hide_idle_dock();
+        }
+        let point = platform::cursor()?;
+        let inside = self.dock_window_rect().contains(point.x, point.y);
+        if !inside
+            && self
                 .layout
-                .immersive_window(self.dock_exposure.collapsed())
+                .reveal_edge(self.settings.dock_display_mode())
                 .contains(point.x, point.y)
-            {
-                self.hide_idle_dock()?;
-            }
+        {
+            // After a corner reveal the pointer is outside the resized HWND. Check
+            // for departure only while it stays on this uncovered part of the edge.
+            self.bottom.time_dock_edge(80)?;
+        } else if !inside || window_leave {
+            self.hide_idle_dock()?;
         }
         Ok(())
     }
