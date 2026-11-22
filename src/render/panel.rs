@@ -58,6 +58,7 @@ fn section_color(section: Section) -> Rgb {
         Section::TopBar => (94, 83, 166),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
+        Section::About => (114, 120, 130),
     }
 }
 
@@ -69,6 +70,7 @@ fn section_symbol(section: Section) -> Symbol {
         Section::TopBar => Symbol::Window,
         Section::Clock => Symbol::Clock,
         Section::Monitor => Symbol::Chip,
+        Section::About => Symbol::Info,
     }
 }
 
@@ -418,6 +420,9 @@ impl Renderer {
         let view = layout.view;
         let section = SECTIONS[layout.page];
         self.label(c, section.title(), layout.title, 15., true, c.p.ink, 1.)?;
+        if let Some(about) = &layout.about {
+            return self.paint_about_page(c, &t, layout, about);
+        }
         // Like a macOS toolbar, the hairline under the title shows once content scrolls
         // beneath it, and the footer's once content continues below.
         let first = layout.rows.first().map(|row| row.card);
@@ -473,7 +478,7 @@ impl Renderer {
         }
 
         // Footer with the page's reset button.
-        let r = layout.reset;
+        let r = layout.footer_button;
         let note = match section {
             Section::Clock => Some("界面预览 · 仅本次运行有效"),
             Section::Monitor => {
@@ -490,7 +495,7 @@ impl Renderer {
             self.label(c, text, note, 11., false, c.p.muted, 1.)?;
         }
         if let Some(button) = layout.display_settings {
-            self.button_face(c, &t, button, 6., hover(Action::DisplaySettings))?;
+            self.button_face(c, &t, button, 6., hover(panel::DISPLAY_SETTINGS))?;
             if layout.focus == Some(layout.rows.len()) {
                 c.stroke(
                     button.left,
@@ -561,6 +566,131 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    fn paint_about_page(
+        &self,
+        c: &Canvas,
+        t: &Tones,
+        layout: &PanelLayout,
+        about: &panel::AboutPage,
+    ) -> Result<()> {
+        let h = about.heading;
+        let mid = h.middle();
+        let x = h.left + 26.;
+        // The ring and island from the status bar mark.
+        c.stroke(x - 16., mid - 16., x + 16., mid + 16., 16., t.accent, 1.)?;
+        c.round(x - 5., mid - 5., x + 5., mid + 5., 5., t.accent)?;
+        self.label(
+            c,
+            "DeskIsle",
+            Area::new(h.left + 58., h.top, h.right, mid + 3.),
+            20.,
+            true,
+            c.p.ink,
+            1.,
+        )?;
+        self.label(
+            c,
+            concat!("版本 ", env!("CARGO_PKG_VERSION")),
+            Area::new(h.left + 58., mid + 2., h.right, h.bottom),
+            13.,
+            false,
+            c.p.muted,
+            1.,
+        )?;
+
+        let [first, last] = &about.links;
+        let group = Area {
+            bottom: last.row.bottom,
+            ..first.row
+        };
+        c.fill(
+            group.left,
+            group.top,
+            group.right,
+            group.bottom,
+            GROUP_RADIUS,
+            c.p.line,
+            t.group,
+        )?;
+        c.stroke(
+            group.left,
+            group.top,
+            group.right,
+            group.bottom,
+            GROUP_RADIUS,
+            c.p.line,
+            t.group_rim,
+        )?;
+        c.fill(
+            group.left + 16.,
+            last.row.top,
+            group.right - 16.,
+            last.row.top + 1. / c.scale,
+            0.,
+            c.p.line,
+            t.separator,
+        )?;
+        for (index, link) in about.links.iter().enumerate() {
+            let button = link.button;
+            let label = Area {
+                left: link.row.left + 16.,
+                right: button.left - 8.,
+                ..link.row
+            };
+            self.label(c, link.title, label, 13., false, c.p.ink, 1.)?;
+            self.button_face(c, t, button, 6., layout.hover == Some(link.action))?;
+            if layout.focus == Some(index) {
+                c.stroke(
+                    button.left,
+                    button.top,
+                    button.right,
+                    button.bottom,
+                    6.,
+                    t.accent,
+                    1.,
+                )?;
+            }
+            self.label_aligned(
+                c,
+                "打开",
+                button,
+                13.,
+                false,
+                c.p.ink,
+                1.,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?;
+        }
+        let q = layout.footer_button;
+        let accent = if layout.hover == Some(Action::Quit) {
+            mix(t.accent, BLACK, 0.1)
+        } else {
+            t.accent
+        };
+        c.round(q.left, q.top, q.right, q.bottom, 6., accent)?;
+        if layout.focus == Some(about.links.len()) {
+            c.stroke(
+                q.left - 2.,
+                q.top - 2.,
+                q.right + 2.,
+                q.bottom + 2.,
+                8.,
+                t.accent,
+                1.,
+            )?;
+        }
+        self.label_aligned(
+            c,
+            "退出程序",
+            q,
+            13.,
+            false,
+            WHITE,
+            1.,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+        )
     }
 
     fn paint_row(
@@ -1039,7 +1169,12 @@ mod render_tests {
         let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
         for dark in [false, true] {
             renderer.set_appearance(dark, &settings);
-            for section in [Section::General, Section::Dock, Section::TopBar] {
+            for section in [
+                Section::General,
+                Section::Dock,
+                Section::TopBar,
+                Section::About,
+            ] {
                 let mut state = PanelState {
                     page: SECTIONS.iter().position(|&s| s == section).unwrap(),
                     ..Default::default()

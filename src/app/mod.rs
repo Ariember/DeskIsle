@@ -504,7 +504,11 @@ pub(crate) fn run() -> Result<()> {
             | Event::PanelScroll(_)
             | Event::PanelKey(_)
             | Event::PanelDpi
-            | Event::PanelClose) => bars.panel_event(event)?,
+            | Event::PanelClose)
+                if bars.panel_event(&event)? =>
+            {
+                return Ok(());
+            }
             _ => {}
         }
     }

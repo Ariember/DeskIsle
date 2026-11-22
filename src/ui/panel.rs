@@ -80,10 +80,72 @@ pub enum Action {
     Page(usize),
     /// Restores the defaults of every setting on the current page.
     Reset,
-    DisplaySettings,
+    Open(&'static str),
+    Quit,
     OpenModes,
     DismissModes,
     Change(Key, Adjust),
+}
+
+pub const DISPLAY_SETTINGS: Action = Action::Open("ms-settings:display-advanced");
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectLink {
+    pub title: &'static str,
+    pub action: Action,
+    pub row: Area,
+    pub button: Area,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AboutPage {
+    pub heading: Area,
+    pub links: [ProjectLink; 2],
+}
+
+impl AboutPage {
+    fn new(view: Area) -> Self {
+        // Leave both link rows visible even at the minimum panel height.
+        let row_height = 44.;
+        let heading_bottom = (view.top + 92.).min(view.bottom - 2. * row_height);
+        let heading = Area {
+            bottom: heading_bottom,
+            ..view
+        };
+        let links = [
+            ("GitHub 项目主页", env!("CARGO_PKG_REPOSITORY")),
+            (
+                "版本发布",
+                concat!(env!("CARGO_PKG_REPOSITORY"), "/releases"),
+            ),
+        ];
+        let links = std::array::from_fn(|i| {
+            let (title, uri) = links[i];
+            let top = heading_bottom + i as f32 * row_height;
+            let row = Area::new(view.left, top, view.right, top + row_height);
+            let button = Area::new(
+                row.right - 88.,
+                row.middle() - CONTROL_HEIGHT / 2.,
+                row.right - CONTROL_INSET,
+                row.middle() + CONTROL_HEIGHT / 2.,
+            );
+            ProjectLink {
+                title,
+                action: Action::Open(uri),
+                row,
+                button,
+            }
+        });
+        Self { heading, links }
+    }
+
+    fn action(&self, index: usize) -> Option<Action> {
+        if index == self.links.len() {
+            Some(Action::Quit)
+        } else {
+            self.links.get(index).map(|link| link.action)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,7 +211,7 @@ pub struct PanelState {
     pub page: usize,
     /// DIPs the page content moved up.
     pub scroll: f32,
-    /// A row index, or rows.len() for the general page’s display settings button.
+    /// Index in the current page's keyboard focus order.
     pub focus: Option<usize>,
     pub hover: Option<Action>,
     /// The value shown while dragging, committed by the coordinator on release.
@@ -199,7 +261,7 @@ impl PanelState {
             });
             return None;
         }
-        let count = layout.rows.len() + usize::from(layout.display_settings.is_some());
+        let count = layout.focus_count();
         let focused = self.focus.filter(|&i| i < count);
         match nav {
             Nav::Close => Some(Action::Close),
@@ -223,8 +285,15 @@ impl PanelState {
                 None
             }
             Nav::Decrease | Nav::Increase | Nav::Activate => {
+                if let Some(about) = &layout.about {
+                    return if nav == Nav::Activate {
+                        about.action(focused?)
+                    } else {
+                        None
+                    };
+                }
                 let Some(row) = layout.rows.get(focused?) else {
-                    return (nav == Nav::Activate).then_some(Action::DisplaySettings);
+                    return (nav == Nav::Activate).then_some(DISPLAY_SETTINGS);
                 };
                 if matches!(row.part, Part::Dropdown { .. }) && nav == Nav::Activate {
                     return Some(Action::OpenModes);
@@ -269,7 +338,8 @@ pub struct PanelLayout {
     pub rows: Vec<Row>,
     pub groups: Vec<Area>,
     pub backdrop: i32,
-    pub reset: Area,
+    pub footer_button: Area,
+    pub about: Option<AboutPage>,
     pub display_settings: Option<Area>,
     pub max_scroll: f32,
     pub scroll_thumb: Option<Area>,
@@ -302,6 +372,13 @@ impl ModeList {
 }
 
 impl PanelLayout {
+    fn focus_count(&self) -> usize {
+        self.about.as_ref().map_or_else(
+            || self.rows.len() + usize::from(self.display_settings.is_some()),
+            |about| about.links.len() + 1,
+        )
+    }
+
     /// Fits the window to its monitor's work area and clamps the current page's scroll.
     pub fn new(state: &mut PanelState, settings: &Settings, dpi: u32, work: Rect) -> Self {
         let scale = dpi as f32 / 96.;
@@ -383,9 +460,6 @@ impl PanelLayout {
             Area::new(view.right + 6., y, view.right + 10., y + thumb)
         });
         let general = section == Section::General;
-        state.focus = state
-            .focus
-            .filter(|&i| i < rows.len() + usize::from(general));
         for group in &mut groups {
             group.top -= state.scroll;
             group.bottom -= state.scroll;
@@ -439,7 +513,7 @@ impl PanelLayout {
             })
         });
         let reset_top = height - FOOTER + (FOOTER - CONTROL_HEIGHT) / 2.;
-        Self {
+        let mut layout = Self {
             scale,
             width,
             height,
@@ -459,8 +533,13 @@ impl PanelLayout {
                     reset_top + CONTROL_HEIGHT,
                 )
             }),
-            reset: Area::new(
-                view.right - RESET_WIDTH,
+            about: (section == Section::About).then(|| AboutPage::new(view)),
+            footer_button: Area::new(
+                if section == Section::About {
+                    view.left
+                } else {
+                    view.right - RESET_WIDTH
+                },
                 reset_top,
                 view.right,
                 reset_top + CONTROL_HEIGHT,
@@ -470,7 +549,10 @@ impl PanelLayout {
             focus: state.focus,
             hover: state.hover,
             modes,
-        }
+        };
+        state.focus = state.focus.filter(|&i| i < layout.focus_count());
+        layout.focus = state.focus;
+        layout
     }
 
     /// The window size in physical pixels.
@@ -564,10 +646,21 @@ impl PanelLayout {
             .display_settings
             .is_some_and(|area| area.contains(x, y))
         {
-            return Some(Action::DisplaySettings);
+            return Some(DISPLAY_SETTINGS);
         }
-        if self.reset.contains(x, y) {
-            return Some(Action::Reset);
+        if self.footer_button.contains(x, y) {
+            return Some(if self.about.is_some() {
+                Action::Quit
+            } else {
+                Action::Reset
+            });
+        }
+        if let Some(about) = &self.about {
+            return about
+                .links
+                .iter()
+                .find(|link| link.button.contains(x, y))
+                .map(|link| link.action);
         }
         if !self.view.contains(x, y) {
             return None;
@@ -813,7 +906,7 @@ mod tests {
     fn every_control_hits_its_own_setting_at_each_scale() {
         let settings = Settings::default();
         for dpi in [96, 120, 144, 192] {
-            for page in 0..SECTIONS.len() {
+            for (page, section) in SECTIONS.iter().enumerate() {
                 let mut state = PanelState {
                     page,
                     ..PanelState::default()
@@ -830,8 +923,13 @@ mod tests {
                 assert!(layout.nav[0].0.top >= CAPTION);
                 // The backdrop region covers the whole sidebar and none of the content.
                 assert!(layout.nav[page].0.right < SIDEBAR && layout.view.left > SIDEBAR);
-                let (x, y) = center(layout.reset, s);
-                assert_eq!(layout.hit(x, y), Some(Action::Reset));
+                let (x, y) = center(layout.footer_button, s);
+                let footer_action = if *section == Section::About {
+                    Action::Quit
+                } else {
+                    Action::Reset
+                };
+                assert_eq!(layout.hit(x, y), Some(footer_action));
                 for index in 0..layout.rows.len() {
                     let current = PanelLayout::new(&mut state, &settings, dpi, work(4000));
                     state.key(Nav::Next, &current);
@@ -867,17 +965,56 @@ mod tests {
                 }
                 if let Some(button) = layout.display_settings {
                     let (x, y) = center(button, s);
-                    assert_eq!(layout.hit(x, y), Some(Action::DisplaySettings));
+                    assert_eq!(layout.hit(x, y), Some(DISPLAY_SETTINGS));
                     state.key(Nav::Next, &layout);
                     let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
-                    assert_eq!(
-                        state.key(Nav::Activate, &layout),
-                        Some(Action::DisplaySettings)
-                    );
+                    assert_eq!(state.key(Nav::Activate, &layout), Some(DISPLAY_SETTINGS));
                 }
                 // The window corner and the caption do nothing.
                 assert_eq!(layout.hit(1, 1), None);
             }
+        }
+    }
+
+    #[test]
+    fn about_links_and_quit_work_with_pointer_and_keyboard_on_short_panels() {
+        let settings = Settings::default();
+        for dpi in [96, 120, 144, 192] {
+            let work = work((MIN_HEIGHT * dpi as f32 / 96.) as i32);
+            let mut state = PanelState::default();
+            let layout = PanelLayout::new(&mut state, &settings, dpi, work);
+            let (page, (tab, _)) = layout
+                .nav
+                .iter()
+                .enumerate()
+                .find(|(_, (_, section))| *section == Section::About)
+                .unwrap();
+            let (x, y) = center(*tab, layout.scale);
+            assert!(tab.bottom <= layout.height);
+            assert_eq!(layout.hit(x, y), Some(Action::Page(page)));
+            state.open_page(page);
+            let layout = PanelLayout::new(&mut state, &settings, dpi, work);
+            let about = layout.about.as_ref().unwrap();
+            for (area, expected) in [
+                (
+                    about.links[0].button,
+                    Action::Open("https://github.com/Ariember/DeskIsle"),
+                ),
+                (
+                    about.links[1].button,
+                    Action::Open("https://github.com/Ariember/DeskIsle/releases"),
+                ),
+                (layout.footer_button, Action::Quit),
+            ] {
+                assert!(area.top >= layout.view.top && area.bottom <= layout.height);
+                let (x, y) = center(area, layout.scale);
+                assert_eq!(layout.hit(x, y), Some(expected));
+                state.key(Nav::Next, &layout);
+                let focused = PanelLayout::new(&mut state, &settings, dpi, work);
+                assert_eq!(state.key(Nav::Activate, &focused), Some(expected));
+                assert_eq!(state.key(Nav::Increase, &focused), None);
+            }
+            assert_eq!(state.key(Nav::Close, &layout), Some(Action::Close));
         }
     }
 

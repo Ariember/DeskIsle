@@ -1,6 +1,7 @@
 [package]
 name = "deskisle"
 version = "0.2.0"
+repository = "https://github.com/Ariember/DeskIsle"
 edition = "2024"
 publish = false
 

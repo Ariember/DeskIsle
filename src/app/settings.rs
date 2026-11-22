@@ -252,11 +252,12 @@ impl Bars {
         self.draw_panel()
     }
 
-    pub(super) fn panel_event(&mut self, event: Event) -> Result<()> {
+    /// Returns true when the user chooses to exit DeskIsle.
+    pub(super) fn panel_event(&mut self, event: &Event) -> Result<bool> {
         let Some(panel) = self.panel.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
-        let action = match event {
+        let action = match *event {
             Event::PanelPress(x, y) => {
                 panel.pressed = panel.layout.hit(x, y);
                 if let Some(key) = panel.layout.slider_at(x, y)
@@ -353,12 +354,12 @@ impl Bars {
             Some(Action::DismissModes) => {}
             Some(Action::Close) => {
                 self.close_settings();
-                return Ok(());
+                return Ok(false);
             }
-            Some(Action::DisplaySettings) => {
+            Some(Action::Quit) => return Ok(true),
+            Some(Action::Open(uri)) => {
                 let owner = panel.window.0;
-                if let Err(error) = platform::shell::execute(owner, "ms-settings:display-advanced")
-                {
+                if let Err(error) = platform::shell::execute(owner, uri) {
                     platform::report_error(Some(owner), &error);
                 }
             }
@@ -379,7 +380,8 @@ impl Bars {
             }
             None => {}
         }
-        self.relayout_panel()
+        self.relayout_panel()?;
+        Ok(false)
     }
 
     pub(super) fn toggle_taskbar(&mut self) -> Result<()> {

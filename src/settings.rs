@@ -72,6 +72,7 @@ pub enum Section {
     TopBar,
     Clock,
     Monitor,
+    About,
 }
 
 pub const SECTIONS: &[Section] = &[
@@ -80,6 +81,7 @@ pub const SECTIONS: &[Section] = &[
     Section::TopBar,
     Section::Clock,
     Section::Monitor,
+    Section::About,
 ];
 
 impl Section {
@@ -90,6 +92,7 @@ impl Section {
             Section::TopBar => "顶部栏",
             Section::Clock => "时间",
             Section::Monitor => "监控",
+            Section::About => "关于",
         }
     }
 }
