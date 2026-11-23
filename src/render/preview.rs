@@ -2,6 +2,8 @@ use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_LEADING;
 use windows::core::Result;
 
 use crate::dock::WindowInfo;
+use crate::platform::backdrop::Backdrop;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::Area;
 use crate::ui::preview::{PreviewHit, PreviewLayout};
@@ -25,6 +27,7 @@ impl Renderer {
         windows: &[WindowInfo],
         dpi: u32,
         hover: Option<PreviewHit>,
+        backdrop: Option<&Backdrop>,
     ) -> Result<Vec<u8>> {
         let s = dpi as f32 / 96.;
         let dip = |px: i32| px as f32 / s;
@@ -37,14 +40,19 @@ impl Renderer {
             layout.bounds.height,
             dpi,
             |c| {
+                let mut opacity = 1.;
+                if let Some(image) = backdrop {
+                    c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
+                    opacity = self.appearance.get(Appearance(WindowOpacity)) as f32 / 100.;
+                }
                 c.gradient(
                     0.,
                     0.,
                     w + 1.,
                     h + 1.,
                     0.,
-                    (c.p.panel_top, 1.),
-                    (c.p.panel, 1.),
+                    (c.p.panel_top, opacity),
+                    (c.p.panel, opacity),
                 )?;
                 for (index, card) in layout.cards.iter().enumerate() {
                     let card_hovered = hover.is_some_and(|hit| hit.index() == index);
@@ -151,6 +159,10 @@ impl Renderer {
                             y += ch;
                         }
                     }
+                }
+                if self.appearance.enabled(Appearance(WindowCustom)) {
+                    let border = self.appearance.get(Appearance(WindowBorder)) as f32 / 100.;
+                    c.stroke(0., 0., w, h, 8., c.p.line, border)?;
                 }
                 Ok(())
             },

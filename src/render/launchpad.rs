@@ -23,6 +23,8 @@ use windows::core::{HSTRING, Result};
 
 use super::canvas::{Canvas, Palette, Text, paint};
 use super::{Bar, DURATION, Renderer, Tween};
+use crate::platform::backdrop::Backdrop;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::ui::{icon::Symbol, launchpad::LaunchpadLayout, panel::Area};
 
 const WHITE: (u8, u8, u8) = (255, 255, 255);
@@ -53,6 +55,8 @@ impl Renderer {
         layout: &LaunchpadLayout,
         paths: &[PathBuf],
         query: &str,
+        backdrop: Option<&Backdrop>,
+        acrylic: bool,
     ) -> Result<()> {
         if self.launchpad.as_ref().map(|v| v.hwnd) != Some(hwnd) {
             let bar = Bar::new(&self.device, hwnd)?;
@@ -163,7 +167,29 @@ impl Renderer {
             layout.dpi,
             |c| {
                 let (w, h) = (layout.width as f32 / scale, layout.height as f32 / scale);
-                c.gradient(0., 0., w, h, 0., ((29, 30, 33), 0.82), ((22, 23, 25), 0.84))?;
+                let (top, bottom) = if self.appearance.enabled(Appearance(LaunchpadCustom)) {
+                    if let Some(image) = backdrop {
+                        c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
+                    }
+                    let strength = self.appearance.get(Appearance(LaunchpadBlur)) as f32 / 100.;
+                    let tint = if acrylic {
+                        0.26 + strength * 0.30
+                    } else {
+                        0.48
+                    };
+                    (tint, tint + 0.04)
+                } else {
+                    (0.82, 0.84)
+                };
+                c.gradient(
+                    0.,
+                    0.,
+                    w,
+                    h,
+                    0.,
+                    ((29, 30, 33), top),
+                    ((22, 23, 25), bottom),
+                )?;
                 let search = layout.search;
                 c.fill(
                     search.left,

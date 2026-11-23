@@ -35,6 +35,15 @@ pub const WINDOWS_CHANGED: u32 = WM_APP + 1;
 /// the shortcut itself so the Shell applies its working directory and other options.
 pub fn pin_from_path(path: PathBuf) -> PinnedApp {
     let mut pin = pinned(path);
+    if pin.launch.is_dir() {
+        pin.label = pin
+            .launch
+            .file_name()
+            .unwrap_or(pin.launch.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        return pin;
+    }
     if pin
         .launch
         .extension()
@@ -44,6 +53,28 @@ pub fn pin_from_path(path: PathBuf) -> PinnedApp {
         pin.app_id = path_id(&exe);
     }
     pin
+}
+
+pub fn dock_folder(path: &Path) -> bool {
+    crate::launchpad::valid_path(path) && path.is_dir()
+}
+
+/// Read one directory level only. A failed enumeration is reported to the Dock.
+pub fn folder_entries(folder: &Path) -> Result<Vec<PathBuf>> {
+    let read = || -> std::io::Result<Vec<PathBuf>> {
+        std::fs::read_dir(folder)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    };
+    let mut paths = read()
+        .map_err(|e| Error::new(E_FAIL, format!("无法读取文件夹 {}：{e}", folder.display())))?;
+    paths.sort_by_cached_key(|p| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+    });
+    Ok(paths)
 }
 
 fn load_shortcut(path: &Path) -> Option<IShellLinkW> {

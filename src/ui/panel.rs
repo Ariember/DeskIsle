@@ -190,6 +190,7 @@ pub enum Part {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub key: Key,
+    pub enabled: bool,
     pub label: &'static str,
     pub help: &'static str,
     /// The card behind the row, already moved by the scroll offset.
@@ -277,16 +278,17 @@ impl PanelState {
             return None;
         }
         let count = layout.focus_count();
-        let focused = self.focus.filter(|&i| i < count);
+        let focusable = |i: usize| i < count && layout.rows.get(i).is_none_or(|row| row.enabled);
+        let focused = self.focus.filter(|&i| focusable(i));
         match nav {
             Nav::Close => Some(Action::Close),
             Nav::Next | Nav::Previous if count > 0 => {
-                let next = match (focused, nav == Nav::Next) {
-                    (None, true) => 0,
-                    (None, false) => count - 1,
-                    (Some(i), true) => (i + 1) % count,
-                    (Some(i), false) => (i + count - 1) % count,
-                };
+                let next = (1..=count)
+                    .map(|step| match nav {
+                        Nav::Next => (focused.unwrap_or(count - 1) + step) % count,
+                        _ => (focused.unwrap_or(0) + count - step) % count,
+                    })
+                    .find(|&i| focusable(i))?;
                 self.focus = Some(next);
                 // Bring the focused card fully into view.
                 let card = layout.rows.get(next)?.card;
@@ -312,7 +314,13 @@ impl PanelState {
                     };
                 }
                 let Some(row) = layout.rows.get(focused?) else {
-                    return (nav == Nav::Activate).then_some(DISPLAY_SETTINGS);
+                    return (nav == Nav::Activate).then_some(
+                        if layout.display_settings.is_some() {
+                            DISPLAY_SETTINGS
+                        } else {
+                            Action::Reset
+                        },
+                    );
                 };
                 if matches!(row.part, Part::Dropdown { .. }) && nav == Nav::Activate {
                     return Some(Action::OpenModes);
@@ -393,7 +401,13 @@ impl ModeList {
 impl PanelLayout {
     fn focus_count(&self) -> usize {
         self.about.as_ref().map_or_else(
-            || self.rows.len() + usize::from(self.display_settings.is_some()),
+            || {
+                self.rows.len()
+                    + usize::from(
+                        self.display_settings.is_some()
+                            || SECTIONS[self.page] == Section::Appearance,
+                    )
+            },
             |about| about.buttons().count() + 1,
         )
     }
@@ -412,12 +426,17 @@ impl PanelLayout {
             LIGHT_X + LIGHT_HIT,
             mid + LIGHT_HIT,
         );
+        let nav_top = CAPTION + 4.;
+        let nav_stride = (NAV_ITEM + NAV_GAP).min((height - nav_top - 4.) / SECTIONS.len() as f32);
         let nav = SECTIONS
             .iter()
             .enumerate()
             .map(|(i, &section)| {
-                let top = CAPTION + 4. + i as f32 * (NAV_ITEM + NAV_GAP);
-                (Area::new(NAV_LEFT, top, NAV_RIGHT, top + NAV_ITEM), section)
+                let top = nav_top + i as f32 * nav_stride;
+                (
+                    Area::new(NAV_LEFT, top, NAV_RIGHT, top + nav_stride - NAV_GAP),
+                    section,
+                )
             })
             .collect();
         state.page = state.page.min(SECTIONS.len() - 1);
@@ -439,6 +458,7 @@ impl PanelLayout {
                 .iter()
                 .find(|s| detail_parent(s.key) == Some(spec.key));
             let starts_group = rows.is_empty()
+                || matches!(spec.key, Key::Appearance(key) if key.parent().is_none())
                 || matches!(
                     spec.key,
                     Key::InterfaceScale
@@ -453,6 +473,7 @@ impl PanelLayout {
                 top += GROUP_GAP;
             }
             let height = match spec.key {
+                Key::Appearance(_) if matches!(spec.control, Control::Slider { .. }) => 70.,
                 Key::Theme => 122.,
                 Key::TopBarBackground => 144.,
                 key if stacked_choice(key) => SLIDER_CARD,
@@ -494,6 +515,10 @@ impl PanelLayout {
                     .map_or_else(|| settings.get(spec.key), |(_, value)| value);
                 Row {
                     key: spec.key,
+                    enabled: match spec.key {
+                        Key::Appearance(key) => key.editable(settings),
+                        _ => true,
+                    },
                     label: spec.label,
                     help: if spec.key == Key::DockDisplayMode {
                         match settings.dock_display_mode() {
@@ -569,7 +594,9 @@ impl PanelLayout {
             hover: state.hover,
             modes,
         };
-        state.focus = state.focus.filter(|&i| i < layout.focus_count());
+        state.focus = state.focus.filter(|&i| {
+            i < layout.focus_count() && layout.rows.get(i).is_none_or(|row| row.enabled)
+        });
         layout.focus = state.focus;
         layout
     }
@@ -623,6 +650,9 @@ impl PanelLayout {
     }
 
     fn slider_action_dip(&self, row: &Row, x: f32) -> Option<Action> {
+        if !row.enabled {
+            return None;
+        }
         let Part::Slider {
             area,
             min,
@@ -684,6 +714,9 @@ impl PanelLayout {
             return None;
         }
         let row = self.rows.iter().find(|row| row.card.contains(x, y))?;
+        if !row.enabled {
+            return None;
+        }
         if let Some(detail) = &row.detail {
             match &detail.part {
                 Part::Switch { area, .. }
@@ -922,7 +955,14 @@ mod tests {
 
     #[test]
     fn every_control_hits_its_own_setting_at_each_scale() {
-        let settings = Settings::default();
+        let mut settings = Settings::default();
+        for spec in SCHEMA {
+            if let Key::Appearance(key) = spec.key
+                && let Some(parent) = key.parent()
+            {
+                settings.set(Key::Appearance(parent), 1);
+            }
+        }
         for dpi in [96, 120, 144, 192] {
             for (page, section) in SECTIONS.iter().enumerate() {
                 let mut state = PanelState {
@@ -992,6 +1032,52 @@ mod tests {
                 assert_eq!(layout.hit(1, 1), None);
             }
         }
+    }
+
+    #[test]
+    fn appearance_controls_follow_their_switch_for_pointer_and_keyboard() {
+        use crate::settings::AppearanceKey::{DockBlur, DockCustom, Reflection};
+        let mut settings = Settings::default();
+        let mut state = PanelState {
+            page: SECTIONS
+                .iter()
+                .position(|&s| s == Section::Appearance)
+                .unwrap(),
+            ..Default::default()
+        };
+        let layout = PanelLayout::new(&mut state, &settings, 96, work(800));
+        let blur = layout
+            .rows
+            .iter()
+            .find(|r| r.key == Key::Appearance(DockBlur))
+            .unwrap();
+        let Part::Slider { area, .. } = blur.part else {
+            panic!("expected blur slider")
+        };
+        let (x, y) = center(area, layout.scale);
+        assert_eq!(layout.hit(x, y), None);
+        state.key(Nav::Next, &layout);
+        state.key(Nav::Next, &layout);
+        assert_eq!(
+            layout.rows[state.focus.unwrap()].key,
+            Key::Appearance(Reflection)
+        );
+        state.key(Nav::Previous, &layout);
+        assert_eq!(
+            state.key(Nav::Activate, &layout),
+            Some(Action::Change(Key::Appearance(DockCustom), Adjust::Toggle))
+        );
+        settings.adjust(Key::Appearance(DockCustom), Adjust::Toggle);
+        let layout = PanelLayout::new(&mut state, &settings, 96, work(800));
+        assert_eq!(layout.slider_at(x, y), Some(Key::Appearance(DockBlur)));
+        state.key(Nav::Next, &layout);
+        assert_eq!(
+            state.key(Nav::Increase, &layout),
+            Some(Action::Change(Key::Appearance(DockBlur), Adjust::Step(1)))
+        );
+        state.focus = None;
+        state.key(Nav::Previous, &layout);
+        assert_eq!(state.key(Nav::Activate, &layout), Some(Action::Reset));
     }
 
     #[test]

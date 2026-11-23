@@ -51,11 +51,13 @@ impl DockPress {
     }
 }
 
-fn accessible_files(files: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+fn accessible_files(files: Vec<PathBuf>, dock: bool) -> (Vec<PathBuf>, usize) {
     let count = files.len();
     let files: Vec<_> = files
         .into_iter()
-        .filter(|p| crate::launchpad::supported(p) && p.is_file())
+        .filter(|p| {
+            (crate::launchpad::supported(p) && p.is_file()) || (dock && shell::dock_folder(p))
+        })
         .collect();
     let rejected = count - files.len();
     (files, rejected)
@@ -96,7 +98,7 @@ impl Bars {
         target: DockDrop,
         files: Vec<PathBuf>,
     ) -> Result<()> {
-        let (files, rejected) = accessible_files(files);
+        let (files, rejected) = accessible_files(files, matches!(target, DockDrop::Insert(_)));
         if !files.is_empty() {
             match target {
                 DockDrop::Launchpad => {
@@ -112,9 +114,14 @@ impl Bars {
             }
         }
         if rejected > 0 {
+            let allowed = if matches!(target, DockDrop::Insert(_)) {
+                "文件夹、.lnk、.exe 或 .url 文件"
+            } else {
+                ".lnk、.exe 或 .url 文件"
+            };
             let error = Error::new(
                 E_INVALIDARG,
-                format!("有 {rejected} 个项目无法添加。请拖入可访问的 .lnk、.exe 或 .url 文件。"),
+                format!("有 {rejected} 个项目无法添加。请拖入可访问的{allowed}。"),
             );
             platform::report_error(Some(owner), &error);
         }
@@ -306,8 +313,14 @@ mod tests {
     #[test]
     fn mixed_drop_keeps_accessible_programs() {
         let exe = std::env::current_exe().unwrap();
-        let (files, rejected) = accessible_files(vec![exe.clone(), PathBuf::from("relative.url")]);
-        assert_eq!(files, [exe]);
+        let dir = exe.parent().unwrap().to_path_buf();
+        let dropped = vec![exe.clone(), dir.clone(), PathBuf::from("relative.url")];
+        assert_eq!(
+            accessible_files(dropped.clone(), false),
+            (vec![exe.clone()], 2)
+        );
+        let (files, rejected) = accessible_files(dropped, true);
+        assert_eq!(files, [exe, dir]);
         assert_eq!(rejected, 1);
     }
 }

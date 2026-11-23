@@ -1,6 +1,8 @@
 mod about;
 mod canvas;
+mod label;
 mod launchpad;
+pub(crate) use label::LabelView;
 mod menu;
 mod metrics;
 mod panel;
@@ -34,7 +36,7 @@ use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
-use crate::settings::{Key, Settings, TopBarBackground};
+use crate::settings::{AppearanceKey, Key, Settings, TopBarBackground};
 use crate::ui::icon::{self, Symbol};
 use crate::ui::layout::{self, StatusHit, StatusLayout};
 use crate::ui::panel::Area;
@@ -100,12 +102,14 @@ pub struct Renderer {
     bottom_size: Option<Dimensions>,
     separator_centers: Vec<i32>,
     top_state: Option<TopState>,
+    pub(crate) wallpaper_tint: Option<(u8, u8, u8)>,
     metric_layer: Option<metrics::MetricLayer>,
     menu: Option<MenuView>,
     panel: Option<PanelView>,
     about: Option<AboutView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
+    appearance: Settings,
     top_background: TopBarBackground,
     color_tray_icons: bool,
     traditional_panel: bool,
@@ -116,6 +120,7 @@ pub struct Renderer {
 struct TopState {
     layout: StatusLayout,
     background: TopBarBackground,
+    wallpaper_tint: Option<(u8, u8, u8)>,
     frosted: bool,
     color_tray_icons: bool,
     immersive_color: Option<u32>,
@@ -165,6 +170,7 @@ struct IconLayer {
     path: Option<PathBuf>,
     label: String,
     size: i32,
+    dpi: u32,
     center: (i32, i32),
     /// Holds the icon and its running indicator, and slides between slots.
     visual: IDCompositionVisual2,
@@ -353,8 +359,11 @@ impl Tween {
 }
 
 impl IconLayer {
-    fn matches(&self, icon: &DockIcon<'_>) -> bool {
-        self.path.as_deref() == icon.path && self.label == icon.label && self.size == icon.size
+    fn matches(&self, icon: &DockIcon<'_>, dpi: u32) -> bool {
+        self.path.as_deref() == icon.path
+            && self.label == icon.label
+            && self.size == icon.size
+            && self.dpi == dpi
     }
 
     /// Shows the running indicator below the icon, inside the layer so it slides along.
@@ -425,12 +434,14 @@ impl Renderer {
                 bottom_size: None,
                 separator_centers: Vec::new(),
                 top_state: None,
+                wallpaper_tint: None,
                 metric_layer: None,
                 menu: None,
                 panel: None,
                 about: None,
                 launchpad: None,
                 palette: Palette::new(dark, settings),
+                appearance: settings.clone(),
                 top_background: settings.top_bar_background(),
                 color_tray_icons: settings.enabled(Key::ColorTrayIcons),
                 traditional_panel: settings.enabled(Key::Language),
@@ -450,15 +461,36 @@ impl Renderer {
         // Panel labels are repainted when the changed language choice is laid out.
         self.traditional_panel = settings.enabled(Key::Language);
         let palette = Palette::new(dark, settings);
-        if self.palette == palette {
-            return false;
+        let palette_changed = self.palette != palette;
+        let mut theme_changed = palette_changed;
+        let mut icons_changed = palette_changed;
+        let mut dock_changed = palette_changed;
+        for change in self.appearance.changed(settings) {
+            if let Key::Appearance(key) = change.key {
+                theme_changed = true;
+                match key.parent().unwrap_or(key) {
+                    AppearanceKey::DockSkin => {
+                        dock_changed = true;
+                        icons_changed = true;
+                    }
+                    AppearanceKey::DockCustom => dock_changed = true,
+                    AppearanceKey::Reflection | AppearanceKey::IconTheme => icons_changed = true,
+                    _ => {}
+                }
+            }
         }
+        self.appearance.clone_from(settings);
         self.palette = palette;
-        self.top_state = None;
-        self.bottom_size = None;
-        // Icon layers hold fallback tiles painted in the old colors.
-        self.icons.clear();
-        true
+        if theme_changed {
+            self.top_state = None;
+        }
+        if dock_changed {
+            self.bottom_size = None;
+        }
+        if icons_changed {
+            self.icons.clear();
+        }
+        theme_changed
     }
 
     pub fn check_device(&self) -> Result<()> {
@@ -490,14 +522,34 @@ impl Renderer {
         frosted: bool,
         immersive_color: Option<u32>,
     ) -> Result<()> {
-        let palette = self
+        use crate::settings::AppearanceKey as A;
+        let level = |key| self.appearance.get(Key::Appearance(key));
+        let custom = level(A::TopCustom) != 0;
+        let opacity = level(A::TopOpacity) as f32 / 100.;
+        let glass_mix = if frosted {
+            level(A::TopBlur) as f32 / 100.
+        } else {
+            0.
+        };
+        let tint = level(A::TopTint) as f32 / 100.;
+        let mut palette = self
             .palette
             .for_top_bar(self.top_background, immersive_color);
+        if custom && immersive_color.is_none() {
+            palette = self.palette;
+            if let Some((r, g, b)) = self.wallpaper_tint {
+                let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * tint).round() as u8;
+                let (br, bg, bb) = palette.bar;
+                let color = u32::from_le_bytes([mix(br, r), mix(bg, g), mix(bb, b), 0]);
+                palette = palette.for_top_bar(self.top_background, Some(color));
+            }
+        }
         let shadow = top_bar_shadow(self.top_background, immersive_color);
         let metrics_changed = self.update_metrics(layout, dpi, metrics, palette, shadow)?;
         let state = TopState {
             layout: layout.clone(),
             background: self.top_background,
+            wallpaper_tint: self.wallpaper_tint,
             frosted,
             color_tray_icons: self.color_tray_icons,
             immersive_color,
@@ -543,6 +595,16 @@ impl Renderer {
             |c| {
                 if immersive_color.is_some() {
                     c.round(0., 0., w, h, 0., c.p.bar)?;
+                } else if custom {
+                    c.fill(
+                        0.,
+                        0.,
+                        w,
+                        h,
+                        0.,
+                        c.p.bar,
+                        opacity * (1. - 0.65 * glass_mix * (1. - opacity)),
+                    )?;
                 } else {
                     c.top_background(Area::new(0., 0., w, h), self.top_background, frosted)?;
                 }
@@ -866,18 +928,26 @@ impl Renderer {
         lift: f32,
         resting_scale: f32,
     ) -> Result<()> {
+        let palette = match self
+            .appearance
+            .get(Key::Appearance(AppearanceKey::DockSkin))
+        {
+            1 => Palette::new(false, &self.appearance),
+            2 => Palette::new(true, &self.appearance),
+            _ => self.palette,
+        };
         let size = (width, height, dpi);
         let layout_changed = self.icons.len() != items.len()
             || self.icons.iter().zip(items).any(|(layer, icon)| {
-                !layer.matches(icon) || layer.center != (icon.center_x, icon.center_y)
+                !layer.matches(icon, dpi) || layer.center != (icon.center_x, icon.center_y)
             });
         // A resized Dock re-centers on the screen, so the old offsets do not line up with
         // the new slots. Icons then take their places at once.
         let slide = self.bottom_size == Some(size);
         let panel_changed = !slide || self.separator_centers != separators;
         if panel_changed {
-            let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-                c.dock_background(width, height, separators)
+            let surface = paint(&self.device, palette, width, height, dpi, |c| {
+                c.dock_background(width, height, separators, &self.appearance)
             })?;
             unsafe { self.bottom.root.SetContent(&surface)? };
             self.bottom_size = Some(size);
@@ -887,10 +957,10 @@ impl Renderer {
             unsafe { self.bottom.root.RemoveAllVisuals()? };
             let mut previous = std::mem::take(&mut self.icons);
             for item in items {
-                let known = previous.iter().position(|layer| layer.matches(item));
+                let known = previous.iter().position(|layer| layer.matches(item, dpi));
                 let mut layer = match known {
                     Some(i) => previous.swap_remove(i),
-                    None => self.icon(item)?,
+                    None => self.icon(item, dpi, palette)?,
                 };
                 let x = (item.center_x - item.size / 2) as f32;
                 let y = (item.center_y - item.size / 2) as f32;
@@ -912,7 +982,7 @@ impl Renderer {
         }
         let mut changed = panel_changed || layout_changed;
         for (index, (layer, item)) in self.icons.iter_mut().zip(items).enumerate() {
-            changed |= layer.place_dot(&self.device, self.palette, item, height, dpi)?;
+            changed |= layer.place_dot(&self.device, palette, item, height, dpi)?;
             let deepened = deep == Some(index);
             let goal = resting_scale
                 * if deepened {
@@ -943,19 +1013,19 @@ impl Renderer {
         Ok(())
     }
 
-    fn icon(&self, item: &DockIcon<'_>) -> Result<IconLayer> {
+    fn icon(&self, item: &DockIcon<'_>, dpi: u32, palette: Palette) -> Result<IconLayer> {
         let size = item.size as f32;
-        let surface = paint(&self.device, self.palette, item.size, item.size, 96, |c| {
+        let monochrome = self
+            .appearance
+            .enabled(Key::Appearance(AppearanceKey::IconTheme));
+        let draw = |c: &Canvas| {
             let Some(path) = item.path else {
-                c.gradient(
-                    0.,
-                    0.,
-                    size,
-                    size,
-                    size * 0.24,
-                    ((108, 139, 250), 1.),
-                    ((67, 79, 188), 1.),
-                )?;
+                let (top, bottom) = if monochrome {
+                    ((145, 145, 145), (82, 82, 82))
+                } else {
+                    ((108, 139, 250), (67, 79, 188))
+                };
+                c.gradient(0., 0., size, size, size * 0.24, (top, 1.), (bottom, 1.))?;
                 return c.symbol(
                     Symbol::Apps,
                     size * 0.5,
@@ -966,7 +1036,12 @@ impl Renderer {
                 );
             };
             if let Some(bitmap) = self.shell_icon(path)? {
-                c.bitmap(&bitmap, c.rect(0., 0., size, size))?;
+                let rect = c.rect(0., 0., size, size);
+                if monochrome {
+                    c.gray_bitmap(&bitmap, rect, false)?;
+                } else {
+                    c.bitmap(&bitmap, rect)?;
+                }
             } else {
                 // Shell can lose access to an executable after enumeration. Keep its slot identifiable.
                 c.round(0., 0., size, size, size * 0.26, c.p.edge)?;
@@ -981,7 +1056,20 @@ impl Renderer {
                 )?;
             }
             Ok(())
-        })?;
+        };
+        let reflection = canvas::Reflection::new(&self.appearance, dpi);
+        let height = item.size + reflection.map_or(0, |r| r.reserve());
+        let surface = paint(
+            &self.device,
+            palette,
+            item.size,
+            height,
+            96,
+            |c| match reflection {
+                Some(reflection) => c.reflected_icon(item.size, reflection, draw),
+                None => draw(c),
+            },
+        )?;
         unsafe {
             let image = self.device.CreateVisual()?;
             image.SetContent(&surface)?;
@@ -993,7 +1081,7 @@ impl Renderer {
             image.SetTransform(&scale)?;
             // Of the Dock icons only the launchpad accepts a dropped app.
             let shade = if item.path.is_none() {
-                let tint = paint(&self.device, self.palette, item.size, item.size, 96, |c| {
+                let tint = paint(&self.device, palette, item.size, item.size, 96, |c| {
                     c.fill(0., 0., size, size, size * 0.24, (0, 0, 0), DROP_SHADE)
                 })?;
                 let veil = self.device.CreateVisual()?;
@@ -1012,6 +1100,7 @@ impl Renderer {
                 path: item.path.map(Path::to_owned),
                 label: item.label.into(),
                 size: item.size,
+                dpi,
                 center: (0, 0),
                 visual,
                 scale,
@@ -1102,7 +1191,7 @@ mod tests {
                 let palette = Palette::new(dark, &Settings::default());
                 let paint = |lines: &[i32]| {
                     canvas::paint_pixels(&device, palette, width, height, dpi, |c| {
-                        c.dock_background(width, height, lines)
+                        c.dock_background(width, height, lines, &Settings::default())
                     })
                 };
                 let plain = paint(&[])?;
@@ -1122,6 +1211,55 @@ mod tests {
                     assert_eq!(divided[i] > plain[i], dark);
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dock_custom_opacity_ranges_from_transparent_to_opaque() -> Result<()> {
+        let dxgi: IDXGIDevice = d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
+        let device = unsafe { D2D1CreateDevice(&dxgi, None)? };
+        let mut settings = Settings::default();
+        settings.set(Key::Appearance(AppearanceKey::DockCustom), 1);
+        for (opacity, expected_alpha) in [(0, 0), (100, 255)] {
+            settings.set(Key::Appearance(AppearanceKey::DockOpacity), opacity);
+            let pixels =
+                canvas::paint_pixels(&device, Palette::new(false, &settings), 64, 64, 96, |c| {
+                    c.dock_background(64, 64, &[], &settings)
+                })?;
+            assert_eq!(pixels[(32 * 64 + 32) * 4 + 3], expected_alpha);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn icon_reflection_mirrors_the_bottom_rows_below_the_gap() -> Result<()> {
+        let dxgi: IDXGIDevice = d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
+        let device = unsafe { D2D1CreateDevice(&dxgi, None)? };
+        let mut settings = Settings::default();
+        let palette = Palette::new(false, &settings);
+        let set = |settings: &mut Settings, key, value| settings.set(Key::Appearance(key), value);
+        assert!(canvas::Reflection::new(&settings, 96).is_none());
+        set(&mut settings, AppearanceKey::Reflection, 1);
+        set(&mut settings, AppearanceKey::ReflectionOpacity, 100);
+        set(&mut settings, AppearanceKey::ReflectionDistance, 2);
+        set(&mut settings, AppearanceKey::ReflectionFade, 100);
+        for blur in [0, 100] {
+            set(&mut settings, AppearanceKey::ReflectionBlur, blur);
+            let reflection = canvas::Reflection::new(&settings, 96).unwrap();
+            let pixels = canvas::paint_pixels(&device, palette, 24, 39, 96, |canvas| {
+                canvas.reflected_icon(24, reflection, |icon| {
+                    icon.round(0., 0., 24., 12., 0., (255, 0, 0))?;
+                    icon.round(0., 12., 24., 24., 0., (0, 0, 255))
+                })
+            })?;
+            let pixel = |y: usize| &pixels[(y * 24 + 12) * 4..(y * 24 + 13) * 4];
+            assert_eq!(pixel(23), [255, 0, 0, 255]);
+            assert_eq!(pixel(25), [0, 0, 0, 0]);
+            assert!(pixel(27)[0] > pixel(27)[2]);
+            assert!(pixel(34)[2] > pixel(34)[0]);
+            assert!(pixel(27)[3] > pixel(34)[3]);
+            assert_eq!(pixel(34)[0] > 0, blur > 0);
         }
         Ok(())
     }

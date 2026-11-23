@@ -1,7 +1,10 @@
 use super::Bars;
+use crate::geometry::Rect;
+use crate::platform::backdrop::Backdrop;
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::ui::layout::{DockDrop, DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
@@ -257,6 +260,38 @@ impl Bars {
         })
     }
 
+    fn menu_backdrop(
+        &self,
+        hwnd: HWND,
+        window: Rect,
+        layout: &MenuLayout,
+        folder: bool,
+    ) -> Option<Backdrop> {
+        let (custom, blur, opacity) = if folder {
+            (FolderCustom, FolderBlur, FolderOpacity)
+        } else {
+            (MenuCustom, MenuBlur, MenuOpacity)
+        };
+        let strength = self.settings.get(Appearance(blur));
+        if !self.settings.enabled(Appearance(custom))
+            || strength == 0
+            || self.settings.get(Appearance(opacity)) == 100
+        {
+            return None;
+        }
+        let (l, t, r, b) = layout.panel();
+        let px = |v: f32| (v * layout.scale).round() as i32;
+        let rect = Rect {
+            x: window.x + px(l),
+            y: window.y + px(t),
+            width: px(r) - px(l),
+            height: px(b) - px(t),
+        };
+        // A restricted desktop may refuse capture. Its ordinary translucent tint
+        // still shows live content beneath the menu.
+        Backdrop::behind(hwnd, rect, strength, false).ok()
+    }
+
     /// Binds and paints `menu` into its window; a failed paint releases the target.
     fn paint_menu(
         &mut self,
@@ -264,12 +299,20 @@ impl Bars {
         menu: &Menu<Command>,
         layout: &MenuLayout,
         animate: bool,
+        backdrop: Option<&Backdrop>,
     ) -> Result<()> {
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
         let tray = &self.tray;
         let resolve = |index: usize| tray.icons().get(index).and_then(|icon| icon.icon());
-        let result =
-            renderer.open_menu(window.0, menu, layout, self.monitor.dpi, &resolve, animate);
+        let result = renderer.open_menu(
+            window.0,
+            menu,
+            layout,
+            self.monitor.dpi,
+            &resolve,
+            animate,
+            backdrop,
+        );
         if result.is_err() {
             renderer.close_menu();
         }
@@ -284,6 +327,7 @@ impl Bars {
         current: &Menu<Command>,
         next: &mut Menu<Command>,
         layout: &mut MenuLayout,
+        backdrop: &mut Option<Backdrop>,
     ) -> Result<bool> {
         if self.overflow_open
             && let Some(rows) = current.changed_tray_rows(next)
@@ -294,9 +338,15 @@ impl Bars {
                 return Ok(false);
             }
         }
+        let previous = layout.place(anchor, self.monitor.bounds);
         *layout = self.menu_layout(next);
-        window.place(layout.place(anchor, self.monitor.bounds));
-        self.paint_menu(window, next, layout, false)?;
+        let rect = layout.place(anchor, self.monitor.bounds);
+        window.place(rect);
+        if rect != previous || current.folder_icon_size.is_some() != next.folder_icon_size.is_some()
+        {
+            *backdrop = self.menu_backdrop(window.0, rect, layout, next.folder_icon_size.is_some());
+        }
+        self.paint_menu(window, next, layout, false, backdrop.as_ref())?;
         Ok(true)
     }
 
@@ -314,8 +364,11 @@ impl Bars {
         self.set_hover(None)?;
         self.tray.cancel_click();
         let mut layout = self.menu_layout(&mut menu);
-        let window = MenuWindow::create(layout.place(anchor, self.monitor.bounds))?;
-        if let Err(error) = self.paint_menu(&window, &menu, &layout, true) {
+        let rect = layout.place(anchor, self.monitor.bounds);
+        let window = MenuWindow::create(rect)?;
+        let mut backdrop =
+            self.menu_backdrop(window.0, rect, &layout, menu.folder_icon_size.is_some());
+        if let Err(error) = self.paint_menu(&window, &menu, &layout, true, backdrop.as_ref()) {
             drop(window);
             return self.recover(error).map(|()| None);
         }
@@ -650,7 +703,14 @@ impl Bars {
                 refresh_flyout = false;
             }
             if let Some(mut next) = rebuilt {
-                match self.refresh_menu(&window, anchor, &menu, &mut next, &mut layout) {
+                match self.refresh_menu(
+                    &window,
+                    anchor,
+                    &menu,
+                    &mut next,
+                    &mut layout,
+                    &mut backdrop,
+                ) {
                     Ok(true) => hover = None,
                     Ok(false) => {}
                     Err(error) => {

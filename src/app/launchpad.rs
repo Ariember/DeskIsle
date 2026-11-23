@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use super::Bars;
 use crate::dock::path_id;
 use crate::geometry::Rect;
+use crate::platform::backdrop::Backdrop;
 use crate::platform::launchpad::{
     LaunchpadEvent, LaunchpadKey, LaunchpadWindow, primary_button_down,
 };
 use crate::platform::{self, shell};
 use crate::render::is_device_lost;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::storage;
 use crate::ui::launchpad::{LaunchpadHit, LaunchpadLayout};
 use crate::ui::layout::DockDrop;
@@ -18,6 +20,9 @@ use windows::core::Result;
 pub(super) struct Launchpad {
     window: LaunchpadWindow,
     rect: Rect,
+    background: Option<LaunchpadBackground>,
+    snapshot: Option<Backdrop>,
+    acrylic: bool,
     /// Pixels from the top of the window that stay clear of the Dock.
     content: i32,
     dpi: u32,
@@ -30,6 +35,14 @@ pub(super) struct Launchpad {
     pressed: bool,
     /// The click that dismissed a tile's menu, which must not also close the launchpad.
     swallow_press: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LaunchpadBackground {
+    rect: Rect,
+    blur: i32,
+    wallpaper: bool,
+    dynamic: bool,
 }
 
 impl Launchpad {
@@ -118,6 +131,9 @@ impl Bars {
         self.launchpad = Some(Launchpad {
             window,
             rect,
+            background: None,
+            snapshot: None,
+            acrylic: false,
             content,
             dpi,
             paths,
@@ -164,10 +180,55 @@ impl Bars {
         self.draw_launchpad()
     }
 
+    /// A desktop settings notification can change the wallpaper or the availability
+    /// of live acrylic while the launchpad remains open.
+    pub(super) fn refresh_launchpad_desktop(&mut self) -> Result<()> {
+        if let Some(pad) = &mut self.launchpad
+            && pad.background.is_some_and(|bg| {
+                bg.wallpaper || self.settings.enabled(Appearance(LaunchpadDynamic))
+            })
+        {
+            pad.background = None;
+            self.draw_launchpad()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn paint_launchpad(&mut self) -> Result<()> {
         let dropping = self.dropping_on_launchpad();
-        if let (Some(pad), Some(renderer)) = (&self.launchpad, self.renderer.as_mut()) {
-            renderer.draw_launchpad(pad.window.0, &pad.layout, &pad.paths, &pad.query)?;
+        if let (Some(pad), Some(renderer)) = (&mut self.launchpad, self.renderer.as_mut()) {
+            let wallpaper = self.settings.enabled(Appearance(LaunchpadWallpaper));
+            let blur = self.settings.get(Appearance(LaunchpadBlur));
+            let background =
+                self.settings
+                    .enabled(Appearance(LaunchpadCustom))
+                    .then(|| LaunchpadBackground {
+                        rect: pad.rect,
+                        blur,
+                        wallpaper,
+                        dynamic: !wallpaper
+                            && self.settings.enabled(Appearance(LaunchpadDynamic))
+                            && platform::display::transparency().unwrap_or(false),
+                    });
+            if pad.background != background {
+                let dynamic = background.is_some_and(|bg| bg.dynamic && bg.blur > 0);
+                pad.acrylic = platform::set_window_backdrop(pad.window.0, dynamic, true);
+                pad.snapshot = background.and_then(|bg| {
+                    if pad.acrylic || (bg.dynamic && bg.blur == 0) {
+                        return None;
+                    }
+                    Backdrop::behind(pad.window.0, pad.rect, bg.blur, bg.wallpaper).ok()
+                });
+                pad.background = background;
+            }
+            renderer.draw_launchpad(
+                pad.window.0,
+                &pad.layout,
+                &pad.paths,
+                &pad.query,
+                pad.snapshot.as_ref(),
+                pad.acrylic,
+            )?;
             if pad.hover.is_some() {
                 renderer.hover_launchpad(&pad.layout, pad.hover)?;
             }

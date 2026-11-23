@@ -276,6 +276,10 @@ impl PreviewWindow {
         Ok(None)
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn layout(&self) -> &PreviewLayout {
         &self.layout
     }
