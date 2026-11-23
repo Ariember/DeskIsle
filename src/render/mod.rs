@@ -8,6 +8,7 @@ mod menu;
 mod metrics;
 mod panel;
 mod preview;
+mod prism;
 
 use std::{
     path::{Path, PathBuf},
@@ -616,8 +617,7 @@ impl Renderer {
                             height: layout.height as f32,
                             radius: 0.,
                             strength: top_strength,
-                            dark: self.palette.dark,
-                            dpi,
+                            rim: glass::rim::TOP,
                         },
                     )
                     .is_ok();
@@ -1083,8 +1083,7 @@ impl Renderer {
                             height: height as f32,
                             radius: radius_px,
                             strength: dock_strength,
-                            dark: palette.dark,
-                            dpi,
+                            rim: glass::rim::DOCK,
                         },
                     )
                     .is_ok();

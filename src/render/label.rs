@@ -44,8 +44,7 @@ impl Renderer {
                 height: rect.height as f32,
                 radius: LABEL_RADIUS * scale,
                 strength,
-                dark: self.palette.dark,
-                dpi,
+                rim: super::glass::rim::LABEL,
             };
             if surface.update(engine, spec).is_ok() {
                 glass_surface = Some(surface);
@@ -71,7 +70,7 @@ impl Renderer {
                     && strength > 0
                     && let Some(image) = image
                 {
-                    c.liquid_backdrop(image, area, LABEL_RADIUS, strength as f32 / 100., c.p.dark)?;
+                    c.liquid_backdrop(image, area, LABEL_RADIUS, super::glass::rim::LABEL)?;
                 }
                 let eff_opacity = if glass_active {
                     opacity * (1. - 0.50 * (strength as f32 / 100.) * (1. - opacity))

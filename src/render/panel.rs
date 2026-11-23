@@ -275,8 +275,7 @@ impl Renderer {
                             height: height as f32,
                             radius: 0.,
                             strength,
-                            dark: self.palette.dark,
-                            dpi,
+                            rim: super::glass::rim::LABEL,
                         },
                     )
                     .is_ok();

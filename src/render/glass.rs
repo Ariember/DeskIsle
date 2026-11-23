@@ -1,27 +1,23 @@
-//! Optical Liquid Glass engine: live DWM host-backdrop refraction, diffusion and
-//! vibrancy via `Windows.UI.Composition` (`isTopmost = false`, underneath DeskIsle's
-//! DirectComposition content tree), Direct2D per-pixel SDF displacement refraction for
-//! redirected windows, and 3D Fresnel specular rims with meniscus volume highlights.
+//! Liquid Glass surfaces modelled on PrismGlass Desktop's classic material. The glass
+//! is clear: it refracts the sharp desktop wallpaper through a curved bevel with RGB
+//! dispersion, diffuses the body lightly, and adds Fresnel reflection and a lit rim
+//! (`prism.rs`). Live surfaces show the result in a `Windows.UI.Composition` visual
+//! beneath DeskIsle's DirectComposition content; captured backdrops are painted the
+//! same way through Direct2D.
 
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::time::Duration;
 
-use windows::Foundation::{Numerics::Plane, PropertyValue, Size, TimeSpan};
-use windows::Graphics::{
-    DirectX::{DirectXAlphaMode, DirectXPixelFormat},
-    Effects::{
-        IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
-    },
-};
+use windows::Foundation::{Numerics::Plane, Size, TimeSpan};
+use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::System::{DispatcherQueue, DispatcherQueueController};
 use windows::UI::Composition::{
-    CompositionDrawingSurface, CompositionEffectBrush, CompositionEffectSourceParameter,
-    CompositionGraphicsDevice, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual,
-    Desktop::DesktopWindowTarget, SpriteVisual,
+    CompositionDrawingSurface, CompositionGraphicsDevice, CompositionRoundedRectangleGeometry,
+    Compositor, ContainerVisual, Desktop::DesktopWindowTarget, SpriteVisual,
 };
 use windows::Win32::{
-    Foundation::{E_INVALIDARG, E_NOTIMPL, HWND, POINT, RECT},
+    Foundation::{E_INVALIDARG, HWND, POINT, RECT},
     Graphics::{
         Direct2D::{Common::*, *},
         Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -32,18 +28,16 @@ use windows::Win32::{
         },
         CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
         DispatcherQueueOptions,
-        Graphics::Direct2D::{
-            GRAPHICS_EFFECT_PROPERTY_MAPPING, IGraphicsEffectD2D1Interop,
-            IGraphicsEffectD2D1Interop_Impl,
-        },
     },
 };
-use windows::core::{Error, GUID, HSTRING, Interface, PCWSTR, Result, h, implement};
+use windows::core::{Error, Interface, Result, h};
 
-use crate::platform::backdrop::Backdrop;
+use crate::geometry::Rect;
+use crate::platform::backdrop::{self, Backdrop};
 use crate::ui::panel::Area;
 
 use super::canvas::{Canvas, Rgb, color};
+use super::prism::{self, Card, Scene};
 
 thread_local! {
     /// Keeps the WinRT DispatcherQueue alive on the UI thread across renderer rebuilds.
@@ -68,148 +62,23 @@ fn ensure_dispatcher_queue() -> Result<()> {
     })
 }
 
-/// A lightweight D2D1 effect node implementing WinRT's `IGraphicsEffectD2D1Interop` so
-/// `Compositor::CreateEffectFactory` can compile effect graphs directly inside DWM.
-#[implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
-struct D2DEffect {
-    id: GUID,
-    sources: Vec<IGraphicsEffectSource>,
-    properties: Vec<windows::Foundation::IPropertyValue>,
-}
+/// Wallpaper beyond the glass that its bevel refracts and reflects, in pixels. The
+/// longest PrismGlass ray is the Fresnel reflection at twice the 30 px maximum bevel.
+const SCENE_MARGIN: f32 = 64.;
+/// How far a card continues past a monitor edge it touches, so only its inner edges
+/// show a bevel, as a pane tucked under the screen frame would.
+const OFFSCREEN: f32 = 48.;
 
-impl D2DEffect {
-    fn into_effect(self) -> IGraphicsEffect {
-        self.into()
-    }
-
-    fn into_source(self) -> IGraphicsEffectSource {
-        let effect: IGraphicsEffect = self.into();
-        effect
-            .cast()
-            .expect("IGraphicsEffect requires IGraphicsEffectSource")
-    }
-}
-
-impl IGraphicsEffectSource_Impl for D2DEffect_Impl {}
-
-impl IGraphicsEffect_Impl for D2DEffect_Impl {
-    fn Name(&self) -> Result<HSTRING> {
-        Ok(HSTRING::new())
-    }
-
-    fn SetName(&self, _name: &HSTRING) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl IGraphicsEffectD2D1Interop_Impl for D2DEffect_Impl {
-    fn GetEffectId(&self) -> Result<GUID> {
-        Ok(self.id)
-    }
-
-    fn GetNamedPropertyMapping(
-        &self,
-        _name: &PCWSTR,
-        _index: *mut u32,
-        _mapping: *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
-    ) -> Result<()> {
-        Err(Error::from_hresult(E_NOTIMPL))
-    }
-
-    fn GetPropertyCount(&self) -> Result<u32> {
-        Ok(self.properties.len() as u32)
-    }
-
-    fn GetProperty(&self, index: u32) -> Result<windows::Foundation::IPropertyValue> {
-        self.properties
-            .get(index as usize)
-            .cloned()
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))
-    }
-
-    fn GetSource(&self, index: u32) -> Result<IGraphicsEffectSource> {
-        self.sources
-            .get(index as usize)
-            .cloned()
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))
-    }
-
-    fn GetSourceCount(&self) -> Result<u32> {
-        Ok(self.sources.len() as u32)
-    }
-}
-
-fn prop_f32(value: f32) -> Result<windows::Foundation::IPropertyValue> {
-    PropertyValue::CreateSingle(value)?.cast()
-}
-
-fn prop_u32(value: u32) -> Result<windows::Foundation::IPropertyValue> {
-    PropertyValue::CreateUInt32(value)?.cast()
-}
-
-fn prop_bool(value: bool) -> Result<windows::Foundation::IPropertyValue> {
-    PropertyValue::CreateBoolean(value)?.cast()
-}
-
-fn prop_f32_array(values: &[f32]) -> Result<windows::Foundation::IPropertyValue> {
-    PropertyValue::CreateSingleArray(values)?.cast()
-}
-
-fn gaussian_blur(source: IGraphicsEffectSource, sigma: f32) -> Result<D2DEffect> {
-    Ok(D2DEffect {
-        id: CLSID_D2D1GaussianBlur,
-        sources: vec![source],
-        properties: vec![
-            prop_f32(sigma.clamp(0., 72.))?,
-            // D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED = 1
-            prop_u32(1)?,
-            // D2D1_BORDER_MODE_HARD = 1: prevents dark edge halos at monitor borders.
-            prop_u32(1)?,
-        ],
-    })
-}
-
-fn saturation_effect(source: IGraphicsEffectSource, saturation: f32) -> Result<D2DEffect> {
-    Ok(D2DEffect {
-        id: CLSID_D2D1Saturation,
-        sources: vec![source],
-        properties: vec![prop_f32(saturation.clamp(0., 2.))?],
-    })
-}
-
-fn color_matrix_effect(source: IGraphicsEffectSource, matrix: &[f32; 20]) -> Result<D2DEffect> {
-    Ok(D2DEffect {
-        id: CLSID_D2D1ColorMatrix,
-        sources: vec![source],
-        properties: vec![
-            prop_f32_array(matrix)?,
-            // D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED = 1
-            prop_u32(1)?,
-            prop_bool(true)?,
-        ],
-    })
-}
-
-/// Premultiplied 5x4 color matrix for the glass core. Instead of washing the backdrop
-/// toward grey, it scales luminance away from the foreground ink — darker under the
-/// white text of dark mode, lighter under the black text of light mode — while keeping
-/// hue intact, so the blurred scene stays vivid and labels keep their contrast.
-fn core_glass_matrix(dark: bool, rim_boost: bool) -> [f32; 20] {
-    let (k, lift) = match (dark, rim_boost) {
-        (true, false) => (0.60, 0.012),
-        (true, true) => (0.72, 0.040),
-        (false, false) => (0.74, 0.215),
-        (false, true) => (0.80, 0.200),
-    };
-    #[rustfmt::skip]
-    let matrix = [
-        k, 0., 0., 0.,
-        0., k, 0., 0.,
-        0., 0., k, 0.,
-        0., 0., 0., 1.,
-        lift, lift, lift, 0.,
-    ];
-    matrix
+/// PrismGlass `rimStrength` presets, named by the PrismGlass surface each mirrors.
+pub(super) mod rim {
+    /// Dock and native popups (menus).
+    pub const DOCK: f32 = 1.;
+    /// The top island.
+    pub const TOP: f32 = 0.45;
+    /// Full-window panels such as the workspace.
+    pub const PANEL: f32 = 0.6;
+    /// Dock labels and tooltips.
+    pub const LABEL: f32 = 0.32;
 }
 
 /// Physical pixel geometry and optical parameters for a live Liquid Glass surface.
@@ -220,10 +89,20 @@ pub(super) struct GlassSpec {
     pub width: f32,
     pub height: f32,
     pub radius: f32,
-    /// User blur/glass strength in `0..=100`. `0` hides the backdrop layer.
+    /// User glass strength in `0..=100`. `0` hides the glass; PrismGlass's clear
+    /// material has no blur to scale, so other values look the same.
     pub strength: i32,
-    pub dark: bool,
-    pub dpi: u32,
+    /// PrismGlass `rimStrength`; see [`rim`].
+    pub rim: f32,
+}
+
+/// What a live surface last showed: its spec, where it sat and which wallpaper.
+#[derive(Clone, Copy, PartialEq)]
+struct Shown {
+    spec: GlassSpec,
+    origin: (i32, i32),
+    monitor: Rect,
+    wallpaper: u64,
 }
 
 /// Shared UI-thread `Windows.UI.Composition` host bound to the renderer's Direct2D device.
@@ -244,10 +123,11 @@ impl GlassEngine {
         })
     }
 
+    /// `hwnd` belongs to this UI thread and outlives the returned surface.
     pub fn attach(&self, hwnd: HWND) -> Result<GlassSurface> {
         let desktop: ICompositorDesktopInterop = self.compositor.cast()?;
-        // Bind to `isTopmost = false` so the live refracted backdrop sits directly beneath
-        // DeskIsle's `CreateTargetForHwnd(hwnd, true)` DirectComposition content tree.
+        // Bind to `isTopmost = false` so the glass sits directly beneath DeskIsle's
+        // `CreateTargetForHwnd(hwnd, true)` DirectComposition content tree.
         let target = unsafe { desktop.CreateDesktopWindowTarget(hwnd, false)? };
         let root = self.compositor.CreateContainerVisual()?;
         target.SetRoot(&root)?;
@@ -259,135 +139,112 @@ impl GlassEngine {
         frame.SetClip(&clip)?;
         frame.SetIsVisible(false)?;
         root.Children()?.InsertAtTop(&frame)?;
-
         let core = self.compositor.CreateSpriteVisual()?;
-        let meniscus = self.compositor.CreateSpriteVisual()?;
-        let children = frame.Children()?;
-        children.InsertAtTop(&core)?;
-        children.InsertAtTop(&meniscus)?;
+        frame.Children()?.InsertAtTop(&core)?;
 
         Ok(GlassSurface {
+            hwnd,
             target,
             root,
             frame,
             clip_geom,
             core,
-            meniscus,
-            mask_surface: None,
-            mask_key: None,
+            surface: None,
             current: None,
         })
     }
 
-    fn core_brush(&self, sigma: f32, vibrancy: f32, dark: bool) -> Result<CompositionEffectBrush> {
-        let backdrop_param = CompositionEffectSourceParameter::Create(h!("backdrop"))?;
-        let source: IGraphicsEffectSource = backdrop_param.cast()?;
-        let blurred = gaussian_blur(source, sigma)?.into_source();
-        let saturated = saturation_effect(blurred, vibrancy)?.into_source();
-        let toned = color_matrix_effect(saturated, &core_glass_matrix(dark, false))?.into_effect();
-        let factory = self.compositor.CreateEffectFactory(&toned)?;
-        let brush = factory.CreateBrush()?;
-        let host = self.compositor.CreateHostBackdropBrush()?;
-        brush.SetSourceParameter(h!("backdrop"), &host)?;
-        Ok(brush)
-    }
-
-    /// Curved meniscus lens brush: sharp low-sigma diffusion with heightened chromatic
-    /// brilliance and subtle cool-prism lift, masked to the outer curved bevel while its
-    /// `SpriteVisual` applies inward lens magnification.
-    fn meniscus_brush(&self, rim_sigma: f32, dark: bool) -> Result<CompositionEffectBrush> {
-        let backdrop_param = CompositionEffectSourceParameter::Create(h!("backdrop"))?;
-        let source: IGraphicsEffectSource = backdrop_param.cast()?;
-        let crisp = gaussian_blur(source, rim_sigma)?.into_source();
-        let vibrant = saturation_effect(crisp, 1.7)?.into_source();
-        let lit = color_matrix_effect(vibrant, &core_glass_matrix(dark, true))?.into_effect();
-        let factory = self.compositor.CreateEffectFactory(&lit)?;
-        let brush = factory.CreateBrush()?;
-        let host = self.compositor.CreateHostBackdropBrush()?;
-        brush.SetSourceParameter(h!("backdrop"), &host)?;
-        Ok(brush)
-    }
-
-    /// Paints a smooth SDF bevel mask into `surface` (`alpha = 1` at the outer rounded
-    /// rim, feathering quadratically to `0` across `bevel_px` inward).
-    fn paint_bevel_mask(
+    /// Copies premultiplied BGRA `pixels` of `width` x `height` into `surface`.
+    fn upload(
         &self,
         surface: &CompositionDrawingSurface,
-        width: i32,
-        height: i32,
-        radius: f32,
-        bevel_px: f32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
     ) -> Result<()> {
         let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
         let rect = RECT {
             left: 0,
             top: 0,
-            right: width,
-            bottom: height,
+            right: width as i32,
+            bottom: height as i32,
         };
         unsafe {
             let mut offset = POINT::default();
             let ctx: ID2D1DeviceContext = interop.BeginDraw(Some(&rect), &mut offset)?;
-            ctx.SetDpi(96., 96.);
-            let bounds = D2D_RECT_F {
-                left: offset.x as f32,
-                top: offset.y as f32,
-                right: (offset.x + width) as f32,
-                bottom: (offset.y + height) as f32,
-            };
-            ctx.PushAxisAlignedClip(&bounds, D2D1_ANTIALIAS_MODE_ALIASED);
-            ctx.Clear(Some(&D2D1_COLOR_F::default()));
-
             let draw = (|| -> Result<()> {
-                let steps = 12usize;
-                let step_w = (bevel_px / steps as f32).max(1.) * 1.45;
-                for i in 0..steps {
-                    let t = i as f32 / steps as f32;
-                    let inset = t * bevel_px;
-                    let w = width as f32 - 2. * inset;
-                    let h = height as f32 - 2. * inset;
-                    if w <= 1. || h <= 1. {
-                        break;
-                    }
-                    // Steep meniscus falloff: strong optical bend right at the rim,
-                    // blending seamlessly into the diffused crystal core.
-                    let alpha = (1. - t).powi(2) * 0.34;
-                    let brush = ctx.CreateSolidColorBrush(&color(255, 255, 255, alpha), None)?;
-                    let r = (radius - inset).max(0.);
-                    let shape = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: offset.x as f32 + inset,
-                            top: offset.y as f32 + inset,
-                            right: offset.x as f32 + width as f32 - inset,
-                            bottom: offset.y as f32 + height as f32 - inset,
-                        },
-                        radiusX: r,
-                        radiusY: r,
-                    };
-                    ctx.DrawRoundedRectangle(&shape, &brush, step_w, None);
-                }
+                ctx.SetDpi(96., 96.);
+                ctx.Clear(Some(&D2D1_COLOR_F::default()));
+                let bitmap = premultiplied_bitmap(&ctx, width, height, pixels)?;
+                let at = D2D_RECT_F {
+                    left: offset.x as f32,
+                    top: offset.y as f32,
+                    right: (offset.x + width as i32) as f32,
+                    bottom: (offset.y + height as i32) as f32,
+                };
+                ctx.DrawBitmap(
+                    &bitmap,
+                    Some(&at),
+                    1.,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                    None,
+                );
                 Ok(())
             })();
-
-            ctx.PopAxisAlignedClip();
             let end = interop.EndDraw();
             draw.and(end)
         }
     }
 }
 
-/// Live per-HWND Liquid Glass backdrop tree. Dropping it explicitly closes the WinRT
+/// `pixels` must hold `width * height` premultiplied BGRA pixels; checked here because
+/// `CreateBitmap` trusts the pointer and stride.
+fn premultiplied_bitmap(
+    ctx: &ID2D1DeviceContext,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<ID2D1Bitmap1> {
+    if width == 0
+        || height == 0
+        || (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            != Some(pixels.len())
+    {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.,
+        dpiY: 96.,
+        ..Default::default()
+    };
+    unsafe {
+        ctx.CreateBitmap(
+            D2D_SIZE_U { width, height },
+            Some(pixels.as_ptr().cast()),
+            width * 4,
+            &props,
+        )
+    }
+}
+
+/// Live per-HWND Liquid Glass tree. Dropping it explicitly closes the WinRT
 /// composition target so the same `HWND` can immediately rebind if needed.
 pub(super) struct GlassSurface {
+    hwnd: HWND,
     target: DesktopWindowTarget,
     root: ContainerVisual,
     frame: ContainerVisual,
     clip_geom: CompositionRoundedRectangleGeometry,
     core: SpriteVisual,
-    meniscus: SpriteVisual,
-    mask_surface: Option<CompositionDrawingSurface>,
-    mask_key: Option<(i32, i32, u32, u32)>,
-    current: Option<GlassSpec>,
+    surface: Option<(CompositionDrawingSurface, u32, u32)>,
+    current: Option<Shown>,
 }
 
 impl GlassSurface {
@@ -398,103 +255,109 @@ impl GlassSurface {
         Ok(())
     }
 
+    /// Shows the glass for `spec`, rendering again only when the surface moved, changed
+    /// shape, or the wallpaper changed since the last call. The window must already be
+    /// at its final position, since the glass refracts the wallpaper beneath it.
     pub fn update(&mut self, engine: &GlassEngine, spec: GlassSpec) -> Result<()> {
         if spec.strength <= 0 || spec.width < 1. || spec.height < 1. {
             return self.hide();
         }
-        if self.current == Some(spec) {
+        let (ox, oy, monitor) = backdrop::placement(self.hwnd)?;
+        let shown = Shown {
+            spec,
+            origin: (ox, oy),
+            monitor,
+            wallpaper: backdrop::wallpaper_stamp(),
+        };
+        if self.current == Some(shown) {
             return Ok(());
         }
-        let scale = spec.dpi.max(96) as f32 / 96.;
-        let strength = spec.strength.clamp(1, 100) as f32 / 100.;
         let radius = spec
             .radius
             .min(spec.width * 0.5)
             .min(spec.height * 0.5)
             .max(0.);
+        let width = spec.width.round().max(1.) as u32;
+        let height = spec.height.round().max(1.) as u32;
+
+        // The glass rectangle in screen pixels, and the wallpaper around it.
+        let gx = ox as f32 + spec.x;
+        let gy = oy as f32 + spec.y;
+        let (gr, gb) = (gx + width as f32, gy + height as f32);
+        let (ml, mt) = (monitor.x as f32, monitor.y as f32);
+        let (mr, mb) = (ml + monitor.width as f32, mt + monitor.height as f32);
+        let scene_l = (gx - SCENE_MARGIN).max(ml).floor();
+        let scene_t = (gy - SCENE_MARGIN).max(mt).floor();
+        let scene_r = (gr + SCENE_MARGIN).min(mr).ceil();
+        let scene_b = (gb + SCENE_MARGIN).min(mb).ceil();
+        let pixels = if scene_r > scene_l && scene_b > scene_t {
+            let rect = Rect {
+                x: scene_l as i32,
+                y: scene_t as i32,
+                width: (scene_r - scene_l) as i32,
+                height: (scene_b - scene_t) as i32,
+            };
+            let wallpaper = Backdrop::wallpaper(rect)?;
+            let scene = Scene {
+                width: wallpaper.width,
+                height: wallpaper.height,
+                pixels: &wallpaper.pixels,
+                scale_x: 1.,
+                scale_y: 1.,
+                offset_x: gx - scene_l,
+                offset_y: gy - scene_t,
+            };
+            let touches = |a: f32, b: f32| (a - b).abs() <= 1.;
+            let l = if touches(gx, ml) { -OFFSCREEN } else { 0. };
+            let t = if touches(gy, mt) { -OFFSCREEN } else { 0. };
+            let r = width as f32 + if touches(gr, mr) { OFFSCREEN } else { 0. };
+            let b = height as f32 + if touches(gb, mb) { OFFSCREEN } else { 0. };
+            let mut card = Card::filling(l, t, r - l, b - t, radius, spec.rim);
+            card.bevel_half_h = height as f32 * 0.5;
+            prism::render(&scene, width, height, card)
+        } else {
+            // Off every monitor: nothing to refract and nothing visible.
+            vec![0; width as usize * height as usize * 4]
+        };
+
+        let surface = match &self.surface {
+            Some((surface, w, h)) if (*w, *h) == (width, height) => surface.clone(),
+            _ => {
+                let surface = engine.graphics.CreateDrawingSurface(
+                    Size {
+                        Width: width as f32,
+                        Height: height as f32,
+                    },
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    DirectXAlphaMode::Premultiplied,
+                )?;
+                let brush = engine.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+                self.core.SetBrush(&brush)?;
+                self.surface = Some((surface.clone(), width, height));
+                surface
+            }
+        };
+        engine.upload(&surface, width, height, &pixels)?;
 
         let mut v2 = self.clip_geom.Offset().unwrap_or_default();
         v2.X = spec.x;
         v2.Y = spec.y;
         self.clip_geom.SetOffset(v2)?;
-        v2.X = spec.width;
-        v2.Y = spec.height;
+        v2.X = width as f32;
+        v2.Y = height as f32;
         self.clip_geom.SetSize(v2)?;
         let size = v2;
         v2.X = radius;
         v2.Y = radius;
         self.clip_geom.SetCornerRadius(v2)?;
-
         let mut plane = Plane::default();
         plane.Normal.X = spec.x;
         plane.Normal.Y = spec.y;
-        plane.Normal.Z = 0.;
-        let offset = plane.Normal;
-        self.core.SetOffset(offset)?;
+        self.core.SetOffset(plane.Normal)?;
         self.core.SetSize(size)?;
-        self.meniscus.SetOffset(offset)?;
-        self.meniscus.SetSize(size)?;
-
-        // Optical parameters: silky crystal blur in the core, sharp refracted lens at the bevel.
-        // The host backdrop arrives already diffused by DWM, so a second wide blur only
-        // smears it into a flat grey sheet. Add just enough softening to hide text detail
-        // behind the bar and push saturation up so the scene reads as tinted glass.
-        let core_sigma = (0.5 + 3.5 * strength) * scale;
-        let vibrancy = 1.45 + 0.35 * strength;
-        let core_brush = engine.core_brush(core_sigma, vibrancy, spec.dark)?;
-        self.core.SetBrush(&core_brush)?;
-
-        let bevel_px = ((10.5 * scale)
-            .min(spec.width * 0.35)
-            .min(spec.height * 0.44))
-        .max(3.);
-        let refract_px = (3.5 + 6.5 * strength) * scale;
-        let rim_sigma = (0.5 + 1.0 * strength) * scale;
-
-        let w_px = spec.width.round().max(1.) as i32;
-        let h_px = spec.height.round().max(1.) as i32;
-        let mask_key = (w_px, h_px, radius.to_bits(), bevel_px.to_bits());
-        if self.mask_key != Some(mask_key) {
-            let surface = engine.graphics.CreateDrawingSurface(
-                Size {
-                    Width: w_px as f32,
-                    Height: h_px as f32,
-                },
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                DirectXAlphaMode::Premultiplied,
-            )?;
-            engine.paint_bevel_mask(&surface, w_px, h_px, radius, bevel_px)?;
-            self.mask_surface = Some(surface);
-            self.mask_key = Some(mask_key);
-        }
-
-        if let Some(surface) = &self.mask_surface {
-            // Apply convex lens magnification on the meniscus SpriteVisual itself
-            // (clipped to `frame`), since DWM forbids affine transforms on BackdropBrushes.
-            let dx = refract_px.min(spec.width * 0.18).max(0.);
-            let dy = refract_px.min(spec.height * 0.24).max(0.);
-            let sx = spec.width / (spec.width - 2. * dx).max(1.);
-            let sy = spec.height / (spec.height - 2. * dy).max(1.);
-            let mut center = Plane::default();
-            center.Normal.X = spec.width * 0.5;
-            center.Normal.Y = spec.height * 0.5;
-            center.Normal.Z = 0.;
-            self.meniscus.SetCenterPoint(center.Normal)?;
-            center.Normal.X = sx;
-            center.Normal.Y = sy;
-            center.Normal.Z = 1.;
-            self.meniscus.SetScale(center.Normal)?;
-
-            let mask_brush = engine.compositor.CreateMaskBrush()?;
-            let alpha_mask = engine.compositor.CreateSurfaceBrushWithSurface(surface)?;
-            let lens_source = engine.meniscus_brush(rim_sigma, spec.dark)?;
-            mask_brush.SetMask(&alpha_mask)?;
-            mask_brush.SetSource(&lens_source)?;
-            self.meniscus.SetBrush(&mask_brush)?;
-        }
 
         self.frame.SetIsVisible(true)?;
-        self.current = Some(spec);
+        self.current = Some(shown);
         Ok(())
     }
 
@@ -566,226 +429,61 @@ pub(super) struct LiquidShell {
 }
 
 impl Canvas {
-    /// Paints a captured `Backdrop` through a GPU optical Liquid Glass pipeline:
-    /// analytical rounded-rectangle SDF normal refraction (`CLSID_D2D1DisplacementMap`)
-    /// + edge-clamped Gaussian diffusion + vibrancy saturation + tonal glass balance.
+    /// Paints a captured `Backdrop` of `area` through the PrismGlass material, with
+    /// `rim` as its `rimStrength`. Refraction beyond the capture repeats its edge pixels.
     pub(super) fn liquid_backdrop(
         &self,
         image: &Backdrop,
         area: Area,
         radius: f32,
-        strength: f32,
-        dark: bool,
+        rim: f32,
     ) -> Result<()> {
-        let stride = image
-            .width
-            .checked_mul(4)
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-        if stride == 0
-            || image.height == 0
-            || (stride as usize).checked_mul(image.height as usize) != Some(image.pixels.len())
-        {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let w_dip = (area.right - area.left).max(1.);
-        let h_dip = (area.bottom - area.top).max(1.);
         let dest = self.rect(area.left, area.top, area.right, area.bottom);
-        let dest_w = (dest.right - dest.left).max(1.);
-        let dest_h = (dest.bottom - dest.top).max(1.);
-        let strength = strength.clamp(0., 1.);
-
-        let map_w = (dest_w.round() as u32).clamp(16, 256);
-        let map_h = (dest_h.round() as u32).clamp(16, 256);
-        let disp_pixels = sdf_refraction_map(
-            map_w,
-            map_h,
-            w_dip,
-            h_dip,
-            radius.min(w_dip * 0.5).min(h_dip * 0.5),
-            10.5_f32.min(w_dip * 0.35).min(h_dip * 0.44),
-        );
-
-        // GDI 32-bit BI_RGB DIBs leave the high byte zeroed; set full coverage before
-        // binding as a premultiplied DXGI texture in the D2D1 effect shader graph.
-        let mut opaque_pixels = image.pixels.clone();
-        for px in opaque_pixels.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
-        let map_props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.,
-            dpiY: 96.,
-            ..Default::default()
+        let left = dest.left.round();
+        let top = dest.top.round();
+        let width = (dest.right - left).round().max(1.) as u32;
+        let height = (dest.bottom - top).round().max(1.) as u32;
+        let scene = Scene {
+            width: image.width,
+            height: image.height,
+            pixels: &image.pixels,
+            scale_x: image.width as f32 / width as f32,
+            scale_y: image.height as f32 / height as f32,
+            offset_x: 0.,
+            offset_y: 0.,
         };
-
-        self.clipped_round(
-            area.left,
-            area.top,
-            area.right,
-            area.bottom,
-            radius,
-            || unsafe {
-                let src_bmp = self.ctx.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: image.width,
-                        height: image.height,
-                    },
-                    Some(opaque_pixels.as_ptr().cast()),
-                    stride,
-                    &map_props,
-                )?;
-                let map_bmp = self.ctx.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: map_w,
-                        height: map_h,
-                    },
-                    Some(disp_pixels.as_ptr().cast()),
-                    map_w * 4,
-                    &map_props,
-                )?;
-
-                // Scale both inputs into physical destination pixels before refraction & blur.
-                let scale_src = self.ctx.CreateEffect(&CLSID_D2D12DAffineTransform)?;
-                scale_src.SetInput(0, &src_bmp, true);
-                let interp = 1u32; // Linear
-                let hard = 1u32; // Hard border
-                scale_src.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &interp.to_ne_bytes(),
-                )?;
-                scale_src.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_BORDER_MODE.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &hard.to_ne_bytes(),
-                )?;
-                let src_m: [f32; 6] = [
-                    dest_w / image.width as f32,
-                    0.,
-                    0.,
-                    dest_h / image.height as f32,
-                    0.,
-                    0.,
-                ];
-                let src_m_bytes: Vec<u8> = src_m.iter().flat_map(|v| v.to_ne_bytes()).collect();
-                scale_src.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX.0 as u32,
-                    D2D1_PROPERTY_TYPE_MATRIX_3X2,
-                    &src_m_bytes,
-                )?;
-
-                let scale_map = self.ctx.CreateEffect(&CLSID_D2D12DAffineTransform)?;
-                scale_map.SetInput(0, &map_bmp, true);
-                scale_map.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &interp.to_ne_bytes(),
-                )?;
-                scale_map.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_BORDER_MODE.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &hard.to_ne_bytes(),
-                )?;
-                let map_m: [f32; 6] =
-                    [dest_w / map_w as f32, 0., 0., dest_h / map_h as f32, 0., 0.];
-                let map_m_bytes: Vec<u8> = map_m.iter().flat_map(|v| v.to_ne_bytes()).collect();
-                scale_map.SetValue(
-                    D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX.0 as u32,
-                    D2D1_PROPERTY_TYPE_MATRIX_3X2,
-                    &map_m_bytes,
-                )?;
-
-                // Blur the interior first (with hard border clamping to finite bounds),
-                // then refract along the curved meniscus normal map.
-                let blur = self.ctx.CreateEffect(&CLSID_D2D1GaussianBlur)?;
-                blur.SetInput(0, &scale_src.GetOutput()?, true);
-                let sigma = (3.5 + 16.5 * strength) * self.scale;
-                blur.SetValue(
-                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                    D2D1_PROPERTY_TYPE_FLOAT,
-                    &sigma.to_ne_bytes(),
-                )?;
-                blur.SetValue(
-                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &hard.to_ne_bytes(),
-                )?;
-
-                let displace = self.ctx.CreateEffect(&CLSID_D2D1DisplacementMap)?;
-                displace.SetInput(0, &blur.GetOutput()?, true);
-                displace.SetInput(1, &scale_map.GetOutput()?, true);
-                let disp_scale = (6. + 12. * strength) * self.scale;
-                let ch_r = D2D1_CHANNEL_SELECTOR_R.0 as u32;
-                let ch_g = D2D1_CHANNEL_SELECTOR_G.0 as u32;
-                displace.SetValue(
-                    D2D1_DISPLACEMENTMAP_PROP_SCALE.0 as u32,
-                    D2D1_PROPERTY_TYPE_FLOAT,
-                    &disp_scale.to_ne_bytes(),
-                )?;
-                displace.SetValue(
-                    D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &ch_r.to_ne_bytes(),
-                )?;
-                displace.SetValue(
-                    D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT.0 as u32,
-                    D2D1_PROPERTY_TYPE_ENUM,
-                    &ch_g.to_ne_bytes(),
-                )?;
-
-                let sat = self.ctx.CreateEffect(&CLSID_D2D1Saturation)?;
-                sat.SetInput(0, &displace.GetOutput()?, true);
-                let vibrancy = 1.45 + 0.35 * strength;
-                sat.SetValue(
-                    D2D1_SATURATION_PROP_SATURATION.0 as u32,
-                    D2D1_PROPERTY_TYPE_FLOAT,
-                    &vibrancy.to_ne_bytes(),
-                )?;
-
-                let tone = self.ctx.CreateEffect(&CLSID_D2D1ColorMatrix)?;
-                tone.SetInput(0, &sat.GetOutput()?, true);
-                let matrix_bytes: Vec<u8> = core_glass_matrix(dark, false)
-                    .iter()
-                    .flat_map(|v| v.to_ne_bytes())
-                    .collect();
-                tone.SetValue(
-                    D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
-                    D2D1_PROPERTY_TYPE_MATRIX_5X4,
-                    &matrix_bytes,
-                )?;
-
-                let output = tone.GetOutput()?;
-                let mut prev = Default::default();
-                self.ctx.GetTransform(&mut prev);
-                let mut shifted = prev;
-                shifted.M31 = dest.left;
-                shifted.M32 = dest.top;
-                self.ctx.SetTransform(&shifted);
-                let crop = D2D_RECT_F {
-                    left: 0.,
-                    top: 0.,
-                    right: dest_w,
-                    bottom: dest_h,
-                };
-                self.ctx.DrawImage(
-                    &output,
-                    None,
-                    Some(&crop),
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                );
-                self.ctx.SetTransform(&prev);
-                Ok(())
-            },
-        )
+        let card = Card::filling(
+            0.,
+            0.,
+            width as f32,
+            height as f32,
+            radius * self.scale,
+            rim,
+        );
+        let pixels = prism::render(&scene, width, height, card);
+        let bitmap = premultiplied_bitmap(&self.ctx, width, height, &pixels)?;
+        let at = D2D_RECT_F {
+            left,
+            top,
+            right: left + width as f32,
+            bottom: top + height as f32,
+        };
+        unsafe {
+            self.ctx.DrawBitmap(
+                &bitmap,
+                Some(&at),
+                1.,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+                None,
+            );
+        }
+        Ok(())
     }
 
-    /// Draws the 3D optical Liquid Glass shell: curved volume sheen, feathered meniscus
-    /// inner luminescence, prismatic cyan/violet dispersion sub-rim, and a directional
-    /// 5-stop Fresnel specular outer rim.
+    /// Draws the opaque fallback shell used without glass: a tint gradient with an inner
+    /// glow, a faint prismatic sub-rim and a directional specular rim. With glass active
+    /// it draws nothing.
     pub(super) fn liquid_glass_shell(
         &self,
         area: Area,
@@ -793,7 +491,9 @@ impl Canvas {
         spec: LiquidShell,
     ) -> Result<()> {
         let (l, t, r, b) = (area.left, area.top, area.right, area.bottom);
-        if r <= l || b <= t {
+        // PrismGlass glass is clear and lights its own rim; a wash or second rim over it
+        // would gray the refracted scene.
+        if r <= l || b <= t || spec.glass_active {
             return Ok(());
         }
         let radius = radius.min((r - l) * 0.5).min((b - t) * 0.5).max(0.);
@@ -801,40 +501,15 @@ impl Canvas {
         let rim = spec.rim.clamp(0., 1.8);
 
         if opacity > 0. {
-            if spec.glass_active && opacity < 0.96 {
-                // A thin even tint, not a milky wash: the blurred scene must stay visible.
-                // Only the top edge gets a faint sheen where light enters the glass.
-                let sheen_top = mix_rgb(
-                    spec.top_tint,
-                    (255, 255, 255),
-                    if self.p.dark { 0.10 } else { 0.45 },
-                );
-                let edge_a = (opacity * 1.10).min(1.);
-                let core_a = (opacity * 0.85).min(1.);
-                self.gradient_stops(
-                    l,
-                    t,
-                    r,
-                    b,
-                    radius,
-                    &[
-                        (0.00, (sheen_top, edge_a)),
-                        (0.22, (spec.top_tint, core_a)),
-                        (0.78, (spec.bottom_tint, core_a)),
-                        (1.00, (spec.bottom_tint, edge_a)),
-                    ],
-                )?;
-            } else {
-                self.gradient(
-                    l,
-                    t,
-                    r,
-                    b,
-                    radius,
-                    (spec.top_tint, opacity),
-                    (spec.bottom_tint, opacity),
-                )?;
-            }
+            self.gradient(
+                l,
+                t,
+                r,
+                b,
+                radius,
+                (spec.top_tint, opacity),
+                (spec.bottom_tint, opacity),
+            )?;
         }
 
         if rim <= 0.001 {
@@ -1072,70 +747,6 @@ fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     (ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
-/// Generates a BGRA displacement map encoding inward rounded-rectangle SDF normals
-/// (`R` = X displacement, `G` = Y displacement, `128` = neutral) across `bevel_dip`.
-fn sdf_refraction_map(
-    map_w: u32,
-    map_h: u32,
-    w_dip: f32,
-    h_dip: f32,
-    radius_dip: f32,
-    bevel_dip: f32,
-) -> Vec<u8> {
-    let mut pixels = vec![128u8; (map_w * map_h * 4) as usize];
-    let hx = w_dip * 0.5;
-    let hy = h_dip * 0.5;
-    let r = radius_dip.min(hx).min(hy).max(0.);
-    let bx = (hx - r).max(0.);
-    let by = (hy - r).max(0.);
-    let bevel = bevel_dip.max(0.5);
-
-    for py in 0..map_h {
-        let y = (py as f32 + 0.5) / map_h as f32 * h_dip - hy;
-        let sy = y.signum();
-        let ay = y.abs();
-        let qy = ay - by;
-        for px in 0..map_w {
-            let x = (px as f32 + 0.5) / map_w as f32 * w_dip - hx;
-            let sx = x.signum();
-            let ax = x.abs();
-            let qx = ax - bx;
-
-            let ox = qx.max(0.);
-            let oy = qy.max(0.);
-            let outside_len = (ox * ox + oy * oy).sqrt();
-            let inside_dist = qx.max(qy).min(0.);
-            let sdf = outside_len + inside_dist - r;
-
-            // Outward unit normal of the rounded rectangle SDF.
-            let (nx, ny) = if outside_len > 1e-4 {
-                (sx * ox / outside_len, sy * oy / outside_len)
-            } else if qx > qy {
-                (sx, 0.)
-            } else {
-                (0., sy)
-            };
-
-            let depth = (-sdf).max(0.);
-            let (dx, dy) = if depth < bevel {
-                let slope = (1. - depth / bevel).powf(2.2);
-                // Sample inward (-normal) so the curved glass rim magnifies background light.
-                (-nx * slope, -ny * slope)
-            } else {
-                (0., 0.)
-            };
-
-            let idx = ((py * map_w + px) * 4) as usize;
-            // BGRA byte layout: B=128, G=dy, R=dx, A=255.
-            pixels[idx] = 128;
-            pixels[idx + 1] = (128. + dy * 127.).round().clamp(1., 254.) as u8;
-            pixels[idx + 2] = (128. + dx * 127.).round().clamp(1., 254.) as u8;
-            pixels[idx + 3] = 255;
-        }
-    }
-    pixels
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,25 +755,7 @@ mod tests {
     use windows::Win32::Graphics::{Direct3D::D3D_DRIVER_TYPE_WARP, Dxgi::IDXGIDevice};
 
     #[test]
-    fn sdf_refraction_pulls_inward_along_all_four_bevels_and_stays_neutral_at_center() {
-        let map = sdf_refraction_map(64, 32, 128., 64., 24., 12.);
-        let sample = |x: u32, y: u32| {
-            let i = ((y * 64 + x) * 4) as usize;
-            // (dx_byte, dy_byte)
-            (map[i + 2], map[i + 1])
-        };
-        // Center is flat glass: zero refraction displacement.
-        assert_eq!(sample(32, 16), (128, 128));
-        // Top rim refracts downward (+Y); bottom rim refracts upward (-Y).
-        assert!(sample(32, 0).1 > 180);
-        assert!(sample(32, 31).1 < 76);
-        // Left cap refracts rightward (+X); right cap refracts leftward (-X).
-        assert!(sample(0, 16).0 > 180);
-        assert!(sample(63, 16).0 < 76);
-    }
-
-    #[test]
-    fn liquid_backdrop_and_shell_clip_to_capsule_and_light_fresnel_rim() -> Result<()> {
+    fn liquid_backdrop_clips_to_rounded_bounds_and_lights_its_rim() -> Result<()> {
         let dxgi: IDXGIDevice = super::super::d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
         let device = unsafe { D2D1CreateDevice(&dxgi, None)? };
         // Colorful 4x2 BGR0 backdrop.
@@ -1178,7 +771,7 @@ mod tests {
         let palette = Palette::new(true, &Settings::default());
         let pixels = paint_pixels(&device, palette, 96, 48, 96, |c| {
             let area = Area::new(4., 4., 92., 44.);
-            c.liquid_backdrop(&backdrop, area, 20., 0.65, true)?;
+            c.liquid_backdrop(&backdrop, area, 20., rim::DOCK)?;
             c.liquid_glass_shell(
                 area,
                 20.,
@@ -1208,8 +801,8 @@ mod tests {
             at(26, 24),
             at(70, 24)
         );
-        // Top Fresnel specular rim is brighter than the interior just beneath it.
-        let rim_luma: u32 = at(48, 4)[..3].iter().map(|&v| u32::from(v)).sum();
+        // The lit top rim is brighter than the interior just beneath it.
+        let rim_luma: u32 = at(48, 5)[..3].iter().map(|&v| u32::from(v)).sum();
         let body_luma: u32 = at(48, 14)[..3].iter().map(|&v| u32::from(v)).sum();
         assert!(rim_luma > body_luma);
         Ok(())
@@ -1280,8 +873,7 @@ mod tests {
                     height: 48.,
                     radius: 24.,
                     strength: 65,
-                    dark: true,
-                    dpi: 96,
+                    rim: rim::DOCK,
                 },
             )?;
             surface.animate_open(&engine, 320, 48, 0.12)?;
@@ -1298,8 +890,7 @@ mod tests {
                 height: 180.,
                 radius: 16.,
                 strength: 50,
-                dark: false,
-                dpi: 144,
+                rim: rim::PANEL,
             },
         )
     }

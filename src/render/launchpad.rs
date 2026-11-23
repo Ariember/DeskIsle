@@ -183,8 +183,7 @@ impl Renderer {
                             height: layout.height as f32,
                             radius: 0.,
                             strength,
-                            dark: true,
-                            dpi: layout.dpi,
+                            rim: super::glass::rim::PANEL,
                         },
                     )
                     .is_ok();
@@ -202,7 +201,12 @@ impl Renderer {
                 let (w, h) = (layout.width as f32 / scale, layout.height as f32 / scale);
                 let blur_f = strength as f32 / 100.;
                 let (top, bottom) = if let Some(image) = backdrop {
-                    c.liquid_backdrop(image, Area::new(0., 0., w, h), 0., blur_f, true)?;
+                    c.liquid_backdrop(
+                        image,
+                        Area::new(0., 0., w, h),
+                        0.,
+                        super::glass::rim::PANEL,
+                    )?;
                     (0.28, 0.34)
                 } else if live_glass || acrylic {
                     let tint = 0.22 + (1. - blur_f) * 0.20;

@@ -110,8 +110,7 @@ impl Renderer {
                             height: height as f32,
                             radius: 8. * scale,
                             strength: backdrop,
-                            dark: self.palette.dark,
-                            dpi,
+                            rim: super::glass::rim::PANEL,
                         },
                     )
                     .is_ok();

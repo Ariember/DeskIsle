@@ -1,0 +1,363 @@
+//! CPU port of PrismGlass Desktop's classic Liquid Glass material (`glass-renderer.js`,
+//! preset "I", the default `styleEnabled = 0` path) for a resting surface: no pointer,
+//! hover, press or Astro effects. Coordinates are physical pixels, like the original.
+//!
+//! PrismGlass Desktop: MIT, Copyright (c) 2026 liburce0412-alt and PrismGlass
+//! contributors. Its circular thickness/bevel and Snell/Fresnel model is adapted from
+//! webgl-apple-liquid-glass: MIT, Copyright (c) 2026 Oliver Nemo.
+
+/// A BGRA image the glass refracts. Alpha is ignored, as GDI leaves it undefined.
+pub(super) struct Scene<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: &'a [u8],
+    /// Scene pixels per output pixel, for samples taken at a reduced size.
+    pub scale_x: f32,
+    pub scale_y: f32,
+    /// Output pixel `(0, 0)` lies at this position in output-pixel units of the scene.
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+impl Scene<'_> {
+    fn valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && (self.width as usize)
+                .checked_mul(self.height as usize)
+                .and_then(|n| n.checked_mul(4))
+                == Some(self.pixels.len())
+    }
+
+    fn texel(&self, x: i32, y: i32) -> [f32; 3] {
+        let x = x.clamp(0, self.width as i32 - 1) as usize;
+        let y = y.clamp(0, self.height as i32 - 1) as usize;
+        let i = (y * self.width as usize + x) * 4;
+        let p = &self.pixels[i..i + 3];
+        [
+            f32::from(p[2]) / 255.,
+            f32::from(p[1]) / 255.,
+            f32::from(p[0]) / 255.,
+        ]
+    }
+
+    /// Bilinear, edge-clamped sample at output-pixel position `(x, y)`, matching WebGL's
+    /// `LINEAR` filter with `CLAMP_TO_EDGE`.
+    fn sample(&self, x: f32, y: f32) -> [f32; 3] {
+        let u = (x + self.offset_x) * self.scale_x - 0.5;
+        let v = (y + self.offset_y) * self.scale_y - 0.5;
+        let (x0, y0) = (u.floor(), v.floor());
+        let (fx, fy) = (u - x0, v - y0);
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let a = self.texel(x0, y0);
+        let b = self.texel(x0 + 1, y0);
+        let c = self.texel(x0, y0 + 1);
+        let d = self.texel(x0 + 1, y0 + 1);
+        std::array::from_fn(|k| {
+            let top = a[k] + (b[k] - a[k]) * fx;
+            let bottom = c[k] + (d[k] - c[k]) * fx;
+            top + (bottom - top) * fy
+        })
+    }
+}
+
+/// One glass card in output pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Card {
+    pub center_x: f32,
+    pub center_y: f32,
+    pub half_w: f32,
+    pub half_h: f32,
+    pub radius: f32,
+    /// Half height the bevel width derives from; differs from `half_h` only when the
+    /// card extends past a screen edge.
+    pub bevel_half_h: f32,
+    /// PrismGlass `rimStrength`: Dock 1, top island 0.45, labels 0.32.
+    pub rim: f32,
+    /// PrismGlass `opaqueSurface`: antialiased edges blend with the unrefracted scene.
+    pub opaque: bool,
+}
+
+impl Card {
+    /// A card whose visible glass fills `width` x `height` at `(x, y)` exactly. The
+    /// shader insets every card by 2 px, so the native-popup convention grows it by 2.
+    pub fn filling(x: f32, y: f32, width: f32, height: f32, radius: f32, rim: f32) -> Self {
+        Self {
+            center_x: x + width * 0.5,
+            center_y: y + height * 0.5,
+            half_w: width * 0.5 + 2.,
+            half_h: height * 0.5 + 2.,
+            radius,
+            bevel_half_h: height * 0.5,
+            rim,
+            opaque: false,
+        }
+    }
+}
+
+const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t)
+}
+
+fn mix(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0., 1.);
+    t * t * (3. - 2. * t)
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let l = dot3(v, v).sqrt();
+    if l > 0. { v.map(|c| c / l) } else { v }
+}
+
+/// GLSL `refract(I, N, eta)` for `I = (0, 0, -1)`.
+fn refract_down(n: [f32; 3], eta: f32) -> [f32; 3] {
+    let i = [0., 0., -1.];
+    let d = dot3(n, i);
+    let k = 1. - eta * eta * (1. - d * d);
+    if k < 0. {
+        return [0.; 3];
+    }
+    let s = eta * d + k.sqrt();
+    std::array::from_fn(|c| eta * i[c] - s * n[c])
+}
+
+/// Signed distance to a rounded rectangle with half extents `b`.
+fn sd(px: f32, py: f32, bx: f32, by: f32, r: f32) -> f32 {
+    let r = r.clamp(0., bx.min(by).max(0.));
+    let qx = px.abs() - bx + r;
+    let qy = py.abs() - by + r;
+    let ox = qx.max(0.);
+    let oy = qy.max(0.);
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.) - r
+}
+
+/// Renders `card` over `scene` into a premultiplied BGRA image of `width` x `height`.
+pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<u8> {
+    let mut out = vec![0u8; width as usize * height as usize * 4];
+    if !scene.valid() || width == 0 || height == 0 {
+        return out;
+    }
+    let rows = height as usize;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 8)
+        .min(rows);
+    let band = rows.div_ceil(threads);
+    let ambient = scene.sample(card.center_x, card.center_y);
+    std::thread::scope(|s| {
+        for (index, chunk) in out.chunks_mut(band * width as usize * 4).enumerate() {
+            s.spawn(move || {
+                for (row, line) in chunk.chunks_exact_mut(width as usize * 4).enumerate() {
+                    let y = (index * band + row) as u32;
+                    for (x, px) in line.chunks_exact_mut(4).enumerate() {
+                        let [r, g, b, a] =
+                            shade(scene, card, ambient, x as f32 + 0.5, y as f32 + 0.5);
+                        let byte = |v: f32| (v.clamp(0., 1.) * 255. + 0.5) as u8;
+                        px.copy_from_slice(&[byte(b), byte(g), byte(r), byte(a)]);
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The fragment shader for one pixel centre `(px, py)`; returns premultiplied RGBA.
+fn shade(scene: &Scene, card: Card, ambient: [f32; 3], px: f32, py: f32) -> [f32; 4] {
+    let (dx, dy) = (px - card.center_x, py - card.center_y);
+    let bx = (card.half_w - 2.).max(0.01);
+    let by = (card.half_h - 2.).max(0.01);
+    let r = card.radius;
+    let dist = sd(dx, dy, bx, by, r);
+    if dist > 8. {
+        return [0.; 4];
+    }
+    let mut coverage = 1. - smoothstep(-0.8, 0.8, dist);
+    let original = scene.sample(px, py);
+    let mut result = [0.; 3];
+    if dist < 1. {
+        let e = 0.7;
+        let gx = sd(dx + e, dy, bx, by, r) - sd(dx - e, dy, bx, by, r) + 0.0001;
+        let gy = sd(dx, dy + e, bx, by, r) - sd(dx, dy - e, bx, by, r) + 0.0001;
+        let gl = (gx * gx + gy * gy).sqrt().max(1e-12);
+        let (gx, gy) = (gx / gl, gy / gl);
+
+        let depth = (-dist).max(0.);
+        let bevel = (card.bevel_half_h * 0.46).clamp(10., 30.);
+        let rim = (-depth / bevel).exp();
+        let t = (depth / bevel).clamp(0., 1.);
+        let arc = (1. - (1. - t) * (1. - t)).max(0.).sqrt();
+        let slope = 0.72 * (1. - t) / arc.max(0.16);
+        let normal = normalize3([-gx * slope, -gy * slope, 1.]);
+
+        let optical_path = bevel * (0.8 + 1.15 * arc);
+        let bend = |eta: f32| {
+            let ray = refract_down(normal, eta);
+            let z = (-ray[2]).max(0.3);
+            (
+                ray[0] / z * optical_path + dx * 0.008,
+                ray[1] / z * optical_path + dy * 0.008,
+            )
+        };
+        let strength = mix(0.78, 1., card.rim);
+        let (rx, ry) = bend(1. / (1.46 - 0.065));
+        let (gx_, gy_) = bend(1. / 1.46);
+        let (bx_, by_) = bend(1. / (1.46 + 0.065));
+        let (ax, ay) = (px + gx_ * strength, py + gy_ * strength);
+        let mut c = [
+            scene.sample(px + rx * strength, py + ry * strength)[0],
+            scene.sample(ax, ay)[1],
+            scene.sample(px + bx_ * strength, py + by_ * strength)[2],
+        ];
+
+        // The body diffuses background detail; the bevel keeps a sharper image.
+        let f = mix(2.2, 0.65, rim);
+        let mut diffusion = scene.sample(ax, ay).map(|v| v * 4.);
+        for (ox, oy, w) in [
+            (f, 0., 2.),
+            (-f, 0., 2.),
+            (0., f, 2.),
+            (0., -f, 2.),
+            (f, f, 1.),
+            (-f, -f, 1.),
+            (f, -f, 1.),
+            (-f, f, 1.),
+        ] {
+            let s = scene.sample(ax + ox, ay + oy);
+            for k in 0..3 {
+                diffusion[k] += s[k] * w;
+            }
+        }
+        c = mix3(c, diffusion.map(|v| v / 16.), mix(0.5, 0.18, rim));
+
+        let luminance = dot3(c, LUMA);
+        c = mix3([luminance; 3], c, 1.16);
+        let bright = smoothstep(0.35, 0.88, luminance);
+        let dark = 1. - smoothstep(0.04, 0.3, luminance);
+        // Neutral backgrounds pick up a little surrounding color instead of a gray veil.
+        let chroma = c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        let ambient_luma = dot3(ambient, LUMA).max(0.12);
+        let tinted = ambient.map(|v| v * luminance / ambient_luma);
+        c = mix3(c, tinted, (1. - smoothstep(0.05, 0.22, chroma)) * 0.08);
+        let clear = mix(1., 0.86, bright);
+        c = c.map(|v| v * clear);
+        for (k, lift) in [0.012, 0.018, 0.027].into_iter().enumerate() {
+            c[k] += lift * dark;
+        }
+        let fresnel = 0.04 + 0.96 * (1. - normal[2]).powi(5);
+        let reflection = scene.sample(px + gx * bevel * 2., py + gy * bevel * 2.);
+        let mirror = [0.28, 0.32, 0.36];
+        let reflected: [f32; 3] = std::array::from_fn(|k| reflection[k] * 0.65 + mirror[k]);
+        c = mix3(c, reflected, fresnel * 0.38 * rim);
+
+        let (lx, ly) = (-0.65f32, -0.85f32);
+        let ll = (lx * lx + ly * ly).sqrt();
+        let light = (gx * lx / ll + gy * ly / ll).max(0.).powi(4);
+        let specular = dot3(normal, normalize3([0.4, 0.6, 1.])).max(0.).powi(32);
+        let band = (-((depth - 0.9) / 0.48).powi(2)).exp();
+        let lift = band * (0.10 + 0.44 * light) * (1. - bright * 0.35) * mix(0.5, 1., card.rim)
+            + specular * rim * 0.16
+            - rim * (1. - light) * 0.045;
+        result = c.map(|v| v + lift);
+    }
+    if card.opaque {
+        result = mix3(original, result, coverage);
+        coverage = 1.;
+    }
+    // WebGL clamps the color on write; the premultiplied output keeps that order.
+    let result = result.map(|v| v.clamp(0., 1.) * coverage);
+    [result[0], result[1], result[2], coverage]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checker(w: u32, h: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // Blue on the left half, red on the right half.
+                if x < w / 2 {
+                    pixels.extend_from_slice(&[230, 90, 30, 0]);
+                } else {
+                    pixels.extend_from_slice(&[30, 70, 230, 0]);
+                }
+                let _ = y;
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn glass_fills_its_shape_keeps_scene_colors_and_lights_the_top_rim() {
+        let (w, h) = (160u32, 60u32);
+        let pixels = checker(w, h);
+        let scene = Scene {
+            width: w,
+            height: h,
+            pixels: &pixels,
+            scale_x: 1.,
+            scale_y: 1.,
+            offset_x: 0.,
+            offset_y: 0.,
+        };
+        let card = Card::filling(0., 0., w as f32, h as f32, 18., 1.);
+        let out = render(&scene, w, h, card);
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        // Rounded corners stay clear; the body is fully covered.
+        assert_eq!(at(0, 0)[3], 0);
+        assert_eq!(at(80, 30)[3], 255);
+        // Clear glass transmits the hues beneath instead of graying them.
+        let left = at(30, 30);
+        let right = at(130, 30);
+        assert!(left[0] > left[2], "left={left:?}");
+        assert!(right[2] > right[0], "right={right:?}");
+        // The lit top-left rim is brighter than the body just inside it.
+        let luma = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+        assert!(luma(at(40, 1)) > luma(at(40, 20)));
+    }
+
+    #[test]
+    fn bevel_refracts_scene_from_beyond_the_edge() {
+        // A bright band just outside the left edge shows up in the bevel through
+        // refraction, while the flat center shows the dark scene almost unchanged.
+        let (w, h) = (120u32, 80u32);
+        let (sw, pad) = (w + 80, 40u32);
+        let mut pixels = vec![40u8; (sw * h * 4) as usize];
+        for y in 0..h {
+            for x in pad - 18..pad - 6 {
+                let i = ((y * sw + x) * 4) as usize;
+                pixels[i..i + 3].copy_from_slice(&[250, 250, 250]);
+            }
+        }
+        let scene = Scene {
+            width: sw,
+            height: h,
+            pixels: &pixels,
+            scale_x: 1.,
+            scale_y: 1.,
+            offset_x: pad as f32,
+            offset_y: 0.,
+        };
+        let card = Card::filling(0., 0., w as f32, h as f32, 20., 1.);
+        let out = render(&scene, w, h, card);
+        let red = |x: u32| out[((40 * w + x) * 4 + 2) as usize];
+        let brightest = (1..24).map(red).max().unwrap();
+        assert!(brightest > 120, "bevel did not refract the band");
+        assert!(red(60) < 80, "center={}", red(60));
+    }
+}

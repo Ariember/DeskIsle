@@ -167,8 +167,7 @@ impl Renderer {
                 height: (bottom - top) * layout.scale,
                 radius: MENU_RADIUS * layout.scale,
                 strength: blur_strength,
-                dark: self.palette.dark,
-                dpi,
+                rim: super::glass::rim::DOCK,
             };
             if surface.update(engine, spec).is_ok() {
                 if animate {
@@ -199,13 +198,7 @@ impl Renderer {
                 && blur_strength > 0
                 && let Some(image) = backdrop
             {
-                c.liquid_backdrop(
-                    image,
-                    area,
-                    MENU_RADIUS,
-                    blur_strength as f32 / 100.,
-                    c.p.dark,
-                )?;
+                c.liquid_backdrop(image, area, MENU_RADIUS, super::glass::rim::DOCK)?;
             }
             c.liquid_glass_shell(
                 area,

@@ -17,6 +17,7 @@ pub mod system_worker;
 pub mod taskbar;
 pub mod tray;
 pub mod update;
+pub mod wallpaper;
 
 use crate::geometry::Rect;
 use std::cell::{Cell, RefCell};

@@ -66,8 +66,7 @@ impl Renderer {
                             image,
                             Area::new(0., 0., w, h),
                             8.,
-                            blur_strength,
-                            c.p.dark,
+                            super::glass::rim::DOCK,
                         )?;
                     } else {
                         c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
