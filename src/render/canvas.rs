@@ -654,49 +654,25 @@ impl Canvas {
                 )
             }
             TopBarBackground::Frosted if frosted => {
-                let stops = if self.p.dark {
-                    [
-                        (0.00, ((92, 112, 144), 0.24)),
-                        (0.22, ((30, 36, 48), 0.16)),
-                        (0.76, ((16, 20, 28), 0.12)),
-                        (1.00, ((76, 98, 132), 0.22)),
-                    ]
+                // The glass core already darkens or lightens the backdrop behind the ink;
+                // this adds only a faint neutral veil so text holds up over busy spots,
+                // then a hairline sky glint on top and a soft specular edge at the bottom.
+                let (veil, veil_a) = if self.p.dark {
+                    ((0, 0, 0), 0.10)
                 } else {
-                    [
-                        (0.00, ((255, 255, 255), 0.36)),
-                        (0.22, ((246, 250, 255), 0.20)),
-                        (0.76, ((236, 244, 252), 0.15)),
-                        (1.00, ((255, 255, 255), 0.30)),
-                    ]
+                    ((255, 255, 255), 0.14)
                 };
-                self.gradient_stops(l, t, r, b, 0., &stops)?;
-                // Overhead sky glint + upward meniscus inner glow + crisp Fresnel bottom rim.
-                self.fill(l, t, r, (t + hairline).min(b), 0., (255, 255, 255), 0.28)?;
-                let meniscus_top = (b - 3.6).max(t);
-                let glow_a = if self.p.dark { 0.16 } else { 0.24 };
-                self.gradient_stops(
+                self.fill(l, t, r, b, 0., veil, veil_a)?;
+                self.fill(
                     l,
-                    meniscus_top,
+                    t,
                     r,
-                    b,
+                    (t + hairline).min(b),
                     0.,
-                    &[
-                        (0.00, ((220, 240, 255), 0.00)),
-                        (0.65, ((225, 242, 255), glow_a * 0.45)),
-                        (1.00, ((255, 255, 255), glow_a)),
-                    ],
+                    (255, 255, 255),
+                    if self.p.dark { 0.10 } else { 0.30 },
                 )?;
-                if b - t > 2. * hairline {
-                    self.fill(
-                        l,
-                        b - 2. * hairline,
-                        r,
-                        b - hairline,
-                        0.,
-                        (156, 228, 255),
-                        if self.p.dark { 0.20 } else { 0.16 },
-                    )?;
-                }
+                let edge_a = if self.p.dark { 0.22 } else { 0.40 };
                 self.gradient_stroke(
                     Area::new(l, b - hairline * 0.5, r, b - hairline * 0.5),
                     0.,
@@ -704,22 +680,10 @@ impl Canvas {
                     (l, b),
                     (r, b),
                     &[
-                        (
-                            0.00,
-                            ((255, 255, 255), if self.p.dark { 0.46 } else { 0.66 }),
-                        ),
-                        (
-                            0.28,
-                            ((255, 255, 255), if self.p.dark { 0.68 } else { 0.88 }),
-                        ),
-                        (
-                            0.72,
-                            ((245, 252, 255), if self.p.dark { 0.64 } else { 0.84 }),
-                        ),
-                        (
-                            1.00,
-                            ((255, 255, 255), if self.p.dark { 0.44 } else { 0.64 }),
-                        ),
+                        (0.00, ((255, 255, 255), edge_a * 0.6)),
+                        (0.30, ((255, 255, 255), edge_a)),
+                        (0.70, ((255, 255, 255), edge_a)),
+                        (1.00, ((255, 255, 255), edge_a * 0.6)),
                     ],
                 )
             }
@@ -736,7 +700,7 @@ impl Canvas {
         if self.p.light_ground() {
             ((255, 255, 255), 0.55)
         } else {
-            ((0, 0, 0), 0.38)
+            ((0, 0, 0), 0.45)
         }
     }
 

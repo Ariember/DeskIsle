@@ -48,6 +48,7 @@ use super::canvas::{Canvas, Rgb, color};
 thread_local! {
     /// Keeps the WinRT DispatcherQueue alive on the UI thread across renderer rebuilds.
     static DISPATCHER_QUEUE: RefCell<Option<DispatcherQueueController>> = const { RefCell::new(None) };
+
 }
 
 fn ensure_dispatcher_queue() -> Result<()> {
@@ -189,67 +190,26 @@ fn color_matrix_effect(source: IGraphicsEffectSource, matrix: &[f32; 20]) -> Res
     })
 }
 
-/// Premultiplied 5x4 color matrix for the crystal core: preserves rich color saturation
-/// while gently compressing blinding white or pitch-black backgrounds into a comfortable
-/// luminous glass range so foreground labels and icons stay legible on any window.
+/// Premultiplied 5x4 color matrix for the glass core. Instead of washing the backdrop
+/// toward grey, it scales luminance away from the foreground ink — darker under the
+/// white text of dark mode, lighter under the black text of light mode — while keeping
+/// hue intact, so the blurred scene stays vivid and labels keep their contrast.
 fn core_glass_matrix(dark: bool, rim_boost: bool) -> [f32; 20] {
-    if dark {
-        let (k, lift_r, lift_g, lift_b) = if rim_boost {
-            (0.76, 0.065, 0.082, 0.112)
-        } else {
-            (0.64, 0.042, 0.050, 0.068)
-        };
-        [
-            k,
-            0.,
-            0.,
-            0., //
-            0.,
-            k,
-            0.,
-            0., //
-            0.,
-            0.,
-            k * 1.03,
-            0., //
-            0.,
-            0.,
-            0.,
-            1., //
-            lift_r,
-            lift_g,
-            lift_b,
-            0.,
-        ]
-    } else {
-        let (k, lift_r, lift_g, lift_b) = if rim_boost {
-            (0.78, 0.195, 0.210, 0.232)
-        } else {
-            (0.68, 0.235, 0.245, 0.262)
-        };
-        [
-            k,
-            0.,
-            0.,
-            0., //
-            0.,
-            k,
-            0.,
-            0., //
-            0.,
-            0.,
-            k * 1.02,
-            0., //
-            0.,
-            0.,
-            0.,
-            1., //
-            lift_r,
-            lift_g,
-            lift_b,
-            0.,
-        ]
-    }
+    let (k, lift) = match (dark, rim_boost) {
+        (true, false) => (0.60, 0.012),
+        (true, true) => (0.72, 0.040),
+        (false, false) => (0.74, 0.215),
+        (false, true) => (0.80, 0.200),
+    };
+    #[rustfmt::skip]
+    let matrix = [
+        k, 0., 0., 0.,
+        0., k, 0., 0.,
+        0., 0., k, 0.,
+        0., 0., 0., 1.,
+        lift, lift, lift, 0.,
+    ];
+    matrix
 }
 
 /// Physical pixel geometry and optical parameters for a live Liquid Glass surface.
@@ -339,7 +299,7 @@ impl GlassEngine {
         let backdrop_param = CompositionEffectSourceParameter::Create(h!("backdrop"))?;
         let source: IGraphicsEffectSource = backdrop_param.cast()?;
         let crisp = gaussian_blur(source, rim_sigma)?.into_source();
-        let vibrant = saturation_effect(crisp, 1.46)?.into_source();
+        let vibrant = saturation_effect(crisp, 1.7)?.into_source();
         let lit = color_matrix_effect(vibrant, &core_glass_matrix(dark, true))?.into_effect();
         let factory = self.compositor.CreateEffectFactory(&lit)?;
         let brush = factory.CreateBrush()?;
@@ -476,8 +436,11 @@ impl GlassSurface {
         self.meniscus.SetSize(size)?;
 
         // Optical parameters: silky crystal blur in the core, sharp refracted lens at the bevel.
-        let core_sigma = (5. + 21. * strength) * scale;
-        let vibrancy = 1.18 + 0.24 * strength;
+        // The host backdrop arrives already diffused by DWM, so a second wide blur only
+        // smears it into a flat grey sheet. Add just enough softening to hide text detail
+        // behind the bar and push saturation up so the scene reads as tinted glass.
+        let core_sigma = (0.5 + 3.5 * strength) * scale;
+        let vibrancy = 1.45 + 0.35 * strength;
         let core_brush = engine.core_brush(core_sigma, vibrancy, spec.dark)?;
         self.core.SetBrush(&core_brush)?;
 
@@ -486,7 +449,7 @@ impl GlassSurface {
             .min(spec.height * 0.44))
         .max(3.);
         let refract_px = (3.5 + 6.5 * strength) * scale;
-        let rim_sigma = (1.4 + 2.2 * strength) * scale;
+        let rim_sigma = (0.5 + 1.0 * strength) * scale;
 
         let w_px = spec.width.round().max(1.) as i32;
         let h_px = spec.height.round().max(1.) as i32;
@@ -775,7 +738,7 @@ impl Canvas {
 
                 let sat = self.ctx.CreateEffect(&CLSID_D2D1Saturation)?;
                 sat.SetInput(0, &displace.GetOutput()?, true);
-                let vibrancy = 1.18 + 0.22 * strength;
+                let vibrancy = 1.45 + 0.35 * strength;
                 sat.SetValue(
                     D2D1_SATURATION_PROP_SATURATION.0 as u32,
                     D2D1_PROPERTY_TYPE_FLOAT,
@@ -839,16 +802,15 @@ impl Canvas {
 
         if opacity > 0. {
             if spec.glass_active && opacity < 0.96 {
-                let (sheen_top, caustic_bottom) = if self.p.dark {
-                    ((96, 114, 145), (72, 92, 126))
-                } else {
-                    ((255, 255, 255), (242, 249, 255))
-                };
-                let top_a = (opacity * 1.18 + 0.06 * rim.min(1.)).min(1.);
-                let upper_a = (opacity * 0.90).min(1.);
-                let core_a = (opacity * 0.72).min(1.);
-                let lower_a = (opacity * 0.84).min(1.);
-                let bot_a = (opacity * 1.06 + 0.04 * rim.min(1.)).min(1.);
+                // A thin even tint, not a milky wash: the blurred scene must stay visible.
+                // Only the top edge gets a faint sheen where light enters the glass.
+                let sheen_top = mix_rgb(
+                    spec.top_tint,
+                    (255, 255, 255),
+                    if self.p.dark { 0.10 } else { 0.45 },
+                );
+                let edge_a = (opacity * 1.10).min(1.);
+                let core_a = (opacity * 0.85).min(1.);
                 self.gradient_stops(
                     l,
                     t,
@@ -856,11 +818,10 @@ impl Canvas {
                     b,
                     radius,
                     &[
-                        (0.00, (sheen_top, top_a)),
-                        (0.18, (spec.top_tint, upper_a)),
-                        (0.56, (spec.bottom_tint, core_a)),
-                        (0.86, (spec.bottom_tint, lower_a)),
-                        (1.00, (caustic_bottom, bot_a)),
+                        (0.00, (sheen_top, edge_a)),
+                        (0.22, (spec.top_tint, core_a)),
+                        (0.78, (spec.bottom_tint, core_a)),
+                        (1.00, (spec.bottom_tint, edge_a)),
                     ],
                 )?;
             } else {
@@ -883,11 +844,9 @@ impl Canvas {
         // Inner curved meniscus volume luminescence + prismatic sub-rim.
         self.clipped_round(l, t, r, b, radius, || {
             let glow_scale = if self.p.dark { 0.82 } else { 1.0 } * rim;
-            for (inset, width, top_a, mid_a, bot_a) in [
-                (0.9, 1.4, 0.24, 0.05, 0.17),
-                (2.2, 2.0, 0.13, 0.025, 0.09),
-                (4.0, 2.8, 0.065, 0.01, 0.045),
-            ] {
+            for (inset, width, top_a, mid_a, bot_a) in
+                [(0.9, 1.2, 0.20, 0.03, 0.12), (2.2, 1.8, 0.08, 0.01, 0.05)]
+            {
                 if r - l > 2. * inset && b - t > 2. * inset {
                     self.gradient_stroke(
                         Area::new(l + inset, t + inset, r - inset, b - inset),
