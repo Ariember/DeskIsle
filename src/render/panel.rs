@@ -80,17 +80,28 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     (channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
 }
 
-/// A small desktop with a colorful wallpaper so the amount of tint is visible.
+/// A small desktop with a colorful wallpaper so each top-bar style's transparency and
+/// contrast are immediately recognizable.
 fn top_bar_preview(c: &Canvas, a: Area, style: TopBarBackground) -> Result<()> {
     let (l, t, r, b) = (a.left, a.top, a.right, a.bottom);
     let w = r - l;
-    c.clipped(c.rect(l, t, r, b), || {
-        c.gradient(l, t, r, b, 0., ((106, 161, 196), 1.), ((182, 205, 216), 1.))?;
+    let bar_h = 18.;
+    let mid = t + bar_h / 2.;
+    let palette = c.p.for_top_bar(style, None);
+    let shadow = super::top_bar_shadow(style, None);
+    let (sr, sa) = if palette.light_ground() {
+        ((255, 255, 255), 0.55)
+    } else {
+        ((0, 0, 0), 0.38)
+    };
+    let dy = 0.7;
+    c.clipped_round(l, t, r, b, 7., || {
+        c.gradient(l, t, r, b, 0., ((118, 152, 186), 1.), ((184, 206, 222), 1.))?;
         for (x, y, start, end) in [
-            (0.30, 6., (171, 129, 230), (72, 55, 128)),
-            (0.17, 17., (232, 152, 216), (132, 54, 134)),
-            (0.02, 28., (255, 181, 153), (197, 79, 119)),
-            (-0.18, 39., (255, 214, 144), (231, 114, 90)),
+            (0.30, 5., (156, 114, 232), (52, 68, 158)),
+            (0.17, 15., (224, 134, 212), (132, 54, 134)),
+            (0.02, 26., (255, 174, 146), (197, 79, 119)),
+            (-0.18, 37., (255, 212, 138), (231, 114, 90)),
         ] {
             let band = |spread: f32, alpha| {
                 c.gradient(
@@ -121,10 +132,17 @@ fn top_bar_preview(c: &Canvas, a: Area, style: TopBarBackground) -> Result<()> {
                 band(0., 1.)?;
             }
         }
-        c.top_background(Area::new(l, t, r, t + 15.), style, true)?;
-        c.ring(l + 9., t + 7.5, 3.2, 1.3, c.p.accent)?;
-        c.symbol(Symbol::Search, r - 23., t + 7.5, 9., c.p.ink, 1.)?;
-        c.symbol(Symbol::Controls, r - 9., t + 7.5, 10., c.p.ink, 1.)
+        c.top_background(Area::new(l, t, r, t + bar_h), style, true)?;
+        if shadow {
+            c.ring_alpha(l + 12., mid + dy, 3.6, 1.5, sr, sa)?;
+            c.symbol(Symbol::Volume(3), r - 36., mid + dy, 9.5, sr, sa)?;
+            c.symbol(Symbol::Search, r - 22.5, mid + dy, 9., sr, sa)?;
+            c.symbol(Symbol::Controls, r - 9.5, mid + dy, 10., sr, sa)?;
+        }
+        c.ring(l + 12., mid, 3.6, 1.5, palette.accent)?;
+        c.symbol(Symbol::Volume(3), r - 36., mid, 9.5, palette.ink, 1.)?;
+        c.symbol(Symbol::Search, r - 22.5, mid, 9., palette.ink, 1.)?;
+        c.symbol(Symbol::Controls, r - 9.5, mid, 10., palette.ink, 1.)
     })
 }
 
@@ -1005,21 +1023,34 @@ impl Renderer {
                     }
                     let selected = i == *selected;
                     let rim = if selected { t.accent } else { c.p.line };
-                    c.stroke(
-                        preview.left - 1.,
-                        top - 1.,
-                        preview.right + 1.,
-                        preview.bottom + 1.,
-                        if key == Key::TopBarBackground { 1. } else { 6. },
-                        rim,
-                        if selected {
-                            1.
-                        } else if hover(Adjust::Pick(i)) {
-                            0.5
-                        } else {
-                            0.18
-                        },
-                    )?;
+                    if key == Key::TopBarBackground && selected {
+                        c.stroke_dip(
+                            preview.left - 1.5,
+                            top - 1.5,
+                            preview.right + 1.5,
+                            preview.bottom + 1.5,
+                            8.5,
+                            2.,
+                            rim,
+                            1.,
+                        )?;
+                    } else {
+                        c.stroke(
+                            preview.left - 1.,
+                            top - 1.,
+                            preview.right + 1.,
+                            preview.bottom + 1.,
+                            if key == Key::TopBarBackground { 8. } else { 6. },
+                            rim,
+                            if selected {
+                                1.
+                            } else if hover(Adjust::Pick(i)) {
+                                0.5
+                            } else {
+                                0.18
+                            },
+                        )?;
+                    }
                     let caption = Area {
                         top: preview.bottom + 3.,
                         ..*area

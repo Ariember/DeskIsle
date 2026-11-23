@@ -657,7 +657,7 @@ pub const SCHEMA: &[Spec] = &[
         control: Control::Choice(&[
             Choice {
                 id: "tinted",
-                label: "半透明",
+                label: "渐变遮罩",
             },
             Choice {
                 id: "frosted",
