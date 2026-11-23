@@ -15,7 +15,7 @@ use windows::Win32::{
     Foundation::{D2DERR_RECREATE_TARGET, E_UNEXPECTED, HMODULE, HWND},
     Graphics::{
         Direct2D::{D2D1CreateDevice, ID2D1Device},
-        Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
+        Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
         Direct3D11::*,
         DirectComposition::*,
         DirectWrite::*,
@@ -52,6 +52,24 @@ pub(crate) fn is_device_lost(error: &Error) -> bool {
     )
 }
 
+fn d3d_device(driver: D3D_DRIVER_TYPE) -> Result<ID3D11Device> {
+    let mut device = None;
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            driver,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )?;
+    }
+    device.ok_or_else(|| Error::from(E_UNEXPECTED))
+}
+
 pub struct DockIcon<'a> {
     /// None draws the built-in launchpad.
     pub path: Option<&'a Path>,
@@ -80,6 +98,7 @@ pub struct Renderer {
     imaging: IWICImagingFactory,
     icons: Vec<IconLayer>,
     bottom_size: Option<Dimensions>,
+    separator_centers: Vec<i32>,
     top_state: Option<TopState>,
     metric_layer: Option<metrics::MetricLayer>,
     menu: Option<MenuView>,
@@ -375,23 +394,8 @@ impl Renderer {
     /// Both HWNDs belong to this UI thread and outlive the renderer.
     pub fn new(top: HWND, bottom: HWND, dark: bool, settings: &Settings) -> Result<Self> {
         unsafe {
-            let create = |driver| -> Result<ID3D11Device> {
-                let mut device = None;
-                D3D11CreateDevice(
-                    None,
-                    driver,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    None,
-                )?;
-                device.ok_or_else(|| Error::from(E_UNEXPECTED))
-            };
-            let d3d = match create(D3D_DRIVER_TYPE_HARDWARE) {
-                Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED => create(D3D_DRIVER_TYPE_WARP)?,
+            let d3d = match d3d_device(D3D_DRIVER_TYPE_HARDWARE) {
+                Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED => d3d_device(D3D_DRIVER_TYPE_WARP)?,
                 result => result?,
             };
             let dxgi: IDXGIDevice = d3d.cast()?;
@@ -406,6 +410,7 @@ impl Renderer {
                 imaging: CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?,
                 icons: Vec::new(),
                 bottom_size: None,
+                separator_centers: Vec::new(),
                 top_state: None,
                 metric_layer: None,
                 menu: None,
@@ -738,6 +743,7 @@ impl Renderer {
         height: i32,
         dpi: u32,
         items: &[DockIcon<'_>],
+        separators: &[i32],
         hover: Option<usize>,
         deep: Option<usize>,
         lift: f32,
@@ -751,17 +757,14 @@ impl Renderer {
         // A resized Dock re-centers on the screen, so the old offsets do not line up with
         // the new slots. Icons then take their places at once.
         let slide = self.bottom_size == Some(size);
-        let panel_changed = !slide;
+        let panel_changed = !slide || self.separator_centers != separators;
         if panel_changed {
-            let s = dpi as f32 / 96.;
-            let w = width as f32 / s;
-            let h = height as f32 / s;
             let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-                c.bar_glass(Area::new(0., 0., w, h), 18.)?;
-                c.stroke(0., 0., w, h, 18., c.p.line, 0.16)
+                c.dock_background(width, height, separators)
             })?;
             unsafe { self.bottom.root.SetContent(&surface)? };
             self.bottom_size = Some(size);
+            separators.clone_into(&mut self.separator_centers);
         }
         if layout_changed {
             unsafe { self.bottom.root.RemoveAllVisuals()? };
@@ -968,7 +971,42 @@ fn faint(pixels: &[u8], light_ground: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::faint;
+    use super::*;
+
+    #[test]
+    fn dock_separators_draw_thin_inset_lines_in_both_themes() -> Result<()> {
+        let dxgi: IDXGIDevice = d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
+        let device = unsafe { D2D1CreateDevice(&dxgi, None)? };
+        for dpi in [96, 144, 192] {
+            let (width, height) = (180 * dpi as i32 / 96, 64 * dpi as i32 / 96);
+            let centers = [width / 3, 2 * width / 3];
+            for dark in [false, true] {
+                let palette = Palette::new(dark, &Settings::default());
+                let paint = |lines: &[i32]| {
+                    canvas::paint_pixels(&device, palette, width, height, dpi, |c| {
+                        c.dock_background(width, height, lines)
+                    })
+                };
+                let plain = paint(&[])?;
+                let divided = paint(&centers)?;
+                let changed = |x, y| {
+                    let i = ((y * width + x) * 4) as usize;
+                    plain[i..i + 4] != divided[i..i + 4]
+                };
+                let mid = height / 2;
+                let columns = (0..width).filter(|&x| changed(x, mid)).count();
+                assert_eq!(columns, centers.len() * if dpi == 96 { 1 } else { 2 });
+                for center in centers {
+                    assert!(changed(center, mid));
+                    assert!(!changed(center, height / 10));
+                    assert!(!changed(center, height - height / 10));
+                    let i = ((mid * width + center) * 4) as usize;
+                    assert_eq!(divided[i] > plain[i], dark);
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Premultiplied BGRA pixels: `count` of gray `level` at coverage `alpha`.
     fn gray(level: u8, alpha: u8, count: usize) -> Vec<u8> {

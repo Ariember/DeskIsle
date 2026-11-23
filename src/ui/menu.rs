@@ -714,6 +714,8 @@ pub enum Command {
     LaunchpadRemove(PathBuf),
     Pin(PathBuf),
     Unpin(String),
+    AddSeparator(usize),
+    RemoveSeparator(usize),
     /// Minimizes the listed windows of an application to the taskbar.
     Minimize(String, Vec<isize>),
     CloseWindow(String, isize),
@@ -793,6 +795,7 @@ pub fn app_menu(
     app: &AppGroup,
     foreground: Option<isize>,
     tray_menus: &[(usize, &str)],
+    separator_at: Option<usize>,
 ) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     app_header(&mut menu, app, !tray_menus.is_empty());
@@ -860,6 +863,17 @@ pub fn app_menu(
             "固定到 Dock",
             Icon::Symbol(Symbol::Pin),
             Some(Command::Pin(path.into())),
+        );
+    }
+    if let Some(at) = separator_at {
+        menu.item(
+            if app.pinned() {
+                "在右侧添加分割符"
+            } else {
+                "在固定区末尾添加分割符"
+            },
+            Icon::Symbol(Symbol::Plus),
+            Some(Command::AddSeparator(at)),
         );
     }
     if let Some(window) = app.current_window(foreground) {
@@ -997,7 +1011,7 @@ pub fn launchpad_menu(path: &std::path::Path) -> Menu<Command> {
 
 /// Empty space on either bar and a right click on the status bar mark: every
 /// application, a few system tools, and quitting DeskIsle.
-pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
+pub fn bar_menu(apps: &[AppGroup], separator_at: Option<usize>) -> Menu<Command> {
     let mut menu = Menu::fixed(DROPDOWN_WIDTH);
     let running = apps.iter().filter(|a| !a.windows.is_empty()).count();
     menu.header(
@@ -1005,6 +1019,13 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
         format!("{running} 个应用正在运行"),
         Icon::Symbol(Symbol::Apps),
     );
+    if let Some(at) = separator_at {
+        menu.item(
+            "添加分割符",
+            Icon::Symbol(Symbol::Plus),
+            Some(Command::AddSeparator(at)),
+        );
+    }
     menu.separator();
     for app in apps.iter().take(LIST_LIMIT) {
         let icon = app
@@ -1054,6 +1075,16 @@ pub fn bar_menu(apps: &[AppGroup]) -> Menu<Command> {
         Some(Command::Quit),
     )
     .danger = true;
+    menu
+}
+
+pub fn separator_menu(index: usize) -> Menu<Command> {
+    let mut menu = Menu::fixed(MARK_MENU_WIDTH);
+    menu.item(
+        "移除分割符",
+        Icon::Symbol(Symbol::Minus),
+        Some(Command::RemoveSeparator(index)),
+    );
     menu
 }
 
@@ -1305,13 +1336,13 @@ mod tests {
     }
 
     fn apps() -> Vec<AppGroup> {
-        use crate::dock::{PinnedApp, WindowInfo, group_apps};
-        let pins = [PinnedApp {
+        use crate::dock::{Pin, PinnedApp, WindowInfo, group_apps};
+        let pins = [Pin::App(PinnedApp {
             app_id: "editor".into(),
             label: "Editor".into(),
             icon_path: "editor.exe".into(),
             launch: "editor.exe".into(),
-        }];
+        })];
         let window = |id, app: &str| WindowInfo {
             id,
             app_id: app.into(),
@@ -1332,7 +1363,8 @@ mod tests {
     fn each_icon_offers_actions_for_its_own_state() {
         let apps = apps();
         // A pinned application without windows opens or unpins; nothing to close.
-        let idle = commands(&app_menu(&apps[0], Some(8), &[]));
+        let idle = commands(&app_menu(&apps[0], Some(8), &[], Some(1)));
+        assert!(idle.contains(&Command::AddSeparator(1)));
         assert!(idle.contains(&Command::Select("editor".into())));
         assert!(idle.contains(&Command::Unpin("editor".into())));
         assert!(!idle.iter().any(|c| matches!(
@@ -1341,7 +1373,8 @@ mod tests {
         )));
 
         // A running, unpinned application lists its windows and can be pinned or closed.
-        let running = commands(&app_menu(&apps[1], Some(8), &[]));
+        let running = commands(&app_menu(&apps[1], Some(8), &[], Some(1)));
+        assert!(running.contains(&Command::AddSeparator(1)));
         assert_eq!(
             running
                 .iter()
@@ -1365,7 +1398,7 @@ mod tests {
             assert!(running.contains(&command), "{command:?}");
         }
         assert!(!idle.iter().any(|c| matches!(c, Command::Minimize(..))));
-        let tray = commands(&app_menu(&apps[1], None, &[(4, "Viewer")]));
+        let tray = commands(&app_menu(&apps[1], None, &[(4, "Viewer")], None));
         assert!(tray.contains(&Command::CloseWindow("viewer".into(), 7)));
         assert!(tray.contains(&Command::TrayMenu(4)));
         assert!(
@@ -1376,7 +1409,7 @@ mod tests {
         assert!(!running.iter().any(|c| matches!(c, Command::Unpin(_))));
 
         // The foreground window is marked.
-        let menu = app_menu(&apps[1], Some(8), &[]);
+        let menu = app_menu(&apps[1], Some(8), &[], None);
         assert!(menu.entries.iter().any(|e| matches!(
             e,
             Entry::Item(Item { icon: Icon::Window { active: true }, label, .. }) if label == "viewer 8"
@@ -1389,9 +1422,9 @@ mod tests {
             _ => panic!("menus start with the application header"),
         };
         assert_eq!(subtitle(&menu), "前台");
-        let mut idle = app_menu(&apps[0], Some(8), &[]);
+        let mut idle = app_menu(&apps[0], Some(8), &[], None);
         assert_eq!(subtitle(&idle), "未运行");
-        let background = app_menu(&apps[0], None, &[(2, "Editor")]);
+        let background = app_menu(&apps[0], None, &[(2, "Editor")], None);
         assert_eq!(subtitle(&background), "后台运行");
         assert!(commands(&background).contains(&Command::TrayMenu(2)));
         assert!(
@@ -1416,10 +1449,13 @@ mod tests {
     #[test]
     fn blank_bar_and_tray_menus_differ_from_icon_menus() {
         let apps = apps();
-        let bar = commands(&bar_menu(&apps));
+        let bar = commands(&bar_menu(&apps, None));
         assert_eq!(bar.last(), Some(&Command::Quit));
         assert!(bar.contains(&Command::Select("viewer".into())));
-        assert!(!commands(&app_menu(&apps[1], None, &[])).contains(&Command::Quit));
+        assert!(!commands(&app_menu(&apps[1], None, &[], None)).contains(&Command::Quit));
+        assert!(!bar.iter().any(|c| matches!(c, Command::AddSeparator(_))));
+        assert!(commands(&bar_menu(&apps, Some(2))).contains(&Command::AddSeparator(2)));
+        assert_eq!(commands(&separator_menu(1)), [Command::RemoveSeparator(1)]);
 
         let icons = [
             TrayEntry {

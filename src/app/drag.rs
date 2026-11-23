@@ -1,15 +1,20 @@
 use std::path::PathBuf;
 
 use super::Bars;
-use crate::dock::{AppGroup, PinnedApp, insert_pins, move_pin, moved_pin_index, pinned};
+use crate::dock::{AppGroup, Pin, insert_pins, move_pin, moved_pin_index, pinned};
 use crate::platform::{self, shell};
-use crate::ui::layout::{DockDrop, DockHit};
+use crate::ui::layout::{DockDrop, DockHit, DockPreview, Layout};
 use windows::Win32::Foundation::{E_INVALIDARG, HWND};
 use windows::core::{Error, Result};
 
+enum PressedItem {
+    Launchpad,
+    App(String),
+    Separator(usize),
+}
+
 pub(super) struct DockPress {
-    /// None identifies the launchpad button. App indices may change during a press.
-    app_id: Option<String>,
+    item: PressedItem,
     origin: (i32, i32),
     threshold: (i32, i32),
     dragging: bool,
@@ -17,9 +22,26 @@ pub(super) struct DockPress {
 }
 
 impl DockPress {
-    fn source(&self, apps: &[AppGroup]) -> Option<usize> {
-        let id = self.app_id.as_ref()?;
-        apps.iter().position(|app| &app.app_id == id)
+    fn hit(&self, apps: &[AppGroup]) -> Option<DockHit> {
+        match &self.item {
+            PressedItem::Launchpad => Some(DockHit::Launchpad),
+            PressedItem::Separator(index) => Some(DockHit::Separator(*index)),
+            // Window groups can change between press and release.
+            PressedItem::App(id) => apps
+                .iter()
+                .position(|app| &app.app_id == id)
+                .map(DockHit::App),
+        }
+    }
+
+    fn source(&self, layout: &Layout, apps: &[AppGroup]) -> Option<usize> {
+        let hit = self.hit(apps)?;
+        if let DockHit::App(i) = hit
+            && apps[i].executable().is_none()
+        {
+            return None;
+        }
+        layout.order.iter().position(|&item| item == hit)
     }
 
     fn moved(&mut self, x: i32, y: i32) -> bool {
@@ -59,7 +81,7 @@ impl Bars {
         Ok(())
     }
 
-    fn apply_drop_pins(&mut self, pins: Vec<PinnedApp>) -> Result<()> {
+    fn apply_drop_pins(&mut self, pins: Vec<Pin>) -> Result<()> {
         match self.save_pins(pins) {
             Ok(true) => self.refresh()?,
             Ok(false) => {}
@@ -100,14 +122,15 @@ impl Bars {
     }
 
     pub(super) fn press_dock(&mut self, x: i32, y: i32) {
-        let app_id = match self.layout.hit(x, y) {
-            Some(DockHit::Launchpad) => None,
-            Some(DockHit::App(i)) => Some(self.apps[i].app_id.clone()),
+        let item = match self.layout.hit(x, y) {
+            Some(DockHit::Launchpad) => PressedItem::Launchpad,
+            Some(DockHit::App(i)) => PressedItem::App(self.apps[i].app_id.clone()),
+            Some(DockHit::Separator(index)) => PressedItem::Separator(index),
             None => return,
         };
         self.bottom.capture();
         self.dock_press = Some(DockPress {
-            app_id,
+            item,
             origin: (x, y),
             threshold: platform::drag_threshold(self.monitor.dpi),
             dragging: false,
@@ -140,13 +163,19 @@ impl Bars {
     }
 
     fn drag_target(&self, source: usize, x: i32, y: i32) -> Option<DockDrop> {
-        self.layout.drop_target(x, y, Some(source)).or_else(|| {
+        let target = self.layout.drop_target(x, y, Some(source)).or_else(|| {
             let dock = self.layout.bottom;
             self.launchpad
                 .as_ref()
                 .filter(|pad| pad.contains_screen_point(dock.x + x, dock.y + y))
                 .map(|_| DockDrop::Launchpad)
-        })
+        })?;
+        if target == DockDrop::Launchpad
+            && matches!(self.layout.order[source], DockHit::Separator(_))
+        {
+            return None;
+        }
+        Some(target)
     }
 
     pub(super) fn move_dock_pointer(&mut self, x: i32, y: i32) -> Result<()> {
@@ -159,9 +188,7 @@ impl Bars {
         if !press.moved(x, y) {
             return Ok(());
         }
-        let source = press
-            .source(&self.apps)
-            .filter(|&i| self.apps[i].executable().is_some());
+        let source = press.source(&self.layout, &self.apps);
         let previous = press.target;
         let target = source.and_then(|i| self.drag_target(i, x, y));
         if target != previous {
@@ -182,9 +209,12 @@ impl Bars {
     }
 
     /// Preview the order without changing the window groups used for hit testing.
-    pub(super) fn dock_preview(&self) -> (Option<Vec<usize>>, Option<DockHit>) {
-        if self.dock_file_target.is_some() {
-            return (None, None);
+    pub(super) fn dock_preview(&self) -> (Option<DockPreview>, Option<DockHit>) {
+        if let Some(target) = self.dock_file_target {
+            return match target {
+                DockDrop::Insert(at) => (Some(self.layout.insertion_preview(at)), None),
+                DockDrop::Launchpad => (None, None),
+            };
         }
         let Some(press) = &self.dock_press else {
             return (None, self.hover);
@@ -192,14 +222,14 @@ impl Bars {
         match press.target {
             Some(DockDrop::Launchpad) => (None, Some(DockHit::Launchpad)),
             Some(DockDrop::Insert(at)) => {
-                let Some(from) = press.source(&self.apps) else {
+                let Some(from) = press.source(&self.layout, &self.apps) else {
                     return (None, None);
                 };
                 let to = moved_pin_index(self.pins.len(), from, at);
-                let mut order: Vec<_> = (0..self.apps.len()).collect();
-                order.remove(from);
-                order.insert(to, from);
-                (Some(order), Some(DockHit::App(to)))
+                (
+                    Some(self.layout.reorder_preview(from, to)),
+                    Some(self.layout.order[from]),
+                )
             }
             None => (None, None),
         }
@@ -211,39 +241,44 @@ impl Bars {
         };
         self.bottom.release();
         if press.moved(x, y) {
-            if let Some(source) = press.source(&self.apps)
+            if let Some(source) = press.source(&self.layout, &self.apps)
                 && let Some(target) = self.drag_target(source, x, y)
-                && let Some(path) = self.apps[source].executable().map(|p| p.to_owned())
             {
-                match target {
-                    DockDrop::Launchpad => self.import_files(self.bottom.0, target, vec![path])?,
-                    DockDrop::Insert(at) => {
+                let path = match self.layout.order[source] {
+                    DockHit::App(i) => self.apps[i].executable().map(PathBuf::from),
+                    _ => None,
+                };
+                match (target, path) {
+                    (DockDrop::Launchpad, Some(path)) => {
+                        self.import_files(self.bottom.0, target, vec![path])?
+                    }
+                    (DockDrop::Insert(at), path) => {
                         let mut pins = self.pins.clone();
-                        let app = self
-                            .pins
-                            .get(source)
-                            .cloned()
-                            .unwrap_or_else(|| pinned(path));
-                        move_pin(&mut pins, at, app);
+                        if source < pins.len() {
+                            move_pin(&mut pins, source, at);
+                        } else if let Some(path) = path {
+                            insert_pins(&mut pins, at, [pinned(path)]);
+                        }
                         self.apply_drop_pins(pins)?;
                     }
+                    _ => {}
                 }
             }
             // Clear the preview even when the drop was cancelled or its save failed.
             if press.target.is_some() {
                 self.draw()?;
             }
-        } else {
-            match self.layout.hit(x, y) {
-                Some(DockHit::Launchpad) if press.app_id.is_none() => {
+        } else if let Some(hit) = self.layout.hit(x, y)
+            && Some(hit) == press.hit(&self.apps)
+        {
+            match hit {
+                DockHit::Launchpad => {
                     if let Err(error) = self.open_launchpad() {
                         platform::report_error(Some(self.bottom.0), &error);
                     }
                 }
-                Some(DockHit::App(i)) if Some(&self.apps[i].app_id) == press.app_id.as_ref() => {
-                    self.select(i)?;
-                }
-                _ => {}
+                DockHit::App(i) => self.select(i)?,
+                DockHit::Separator(_) => {}
             }
         }
         self.check_dock_pointer(false)
@@ -257,7 +292,7 @@ mod tests {
     #[test]
     fn returning_to_origin_after_drag_does_not_click() {
         let mut press = DockPress {
-            app_id: Some("editor".into()),
+            item: PressedItem::App("editor".into()),
             origin: (20, 40),
             threshold: (4, 6),
             dragging: false,

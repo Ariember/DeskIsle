@@ -9,6 +9,21 @@ pub struct PinnedApp {
     pub launch: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pin {
+    App(PinnedApp),
+    Separator,
+}
+
+impl Pin {
+    pub fn app(&self) -> Option<&PinnedApp> {
+        match self {
+            Self::App(app) => Some(app),
+            Self::Separator => None,
+        }
+    }
+}
+
 pub fn pinned(exe: PathBuf) -> PinnedApp {
     let name = exe
         .file_name()
@@ -33,19 +48,16 @@ pub fn pinned(exe: PathBuf) -> PinnedApp {
 }
 
 /// Pins the executable at `path`, keeping the Dock order otherwise.
-pub fn pin(pins: &mut Vec<PinnedApp>, path: &Path) {
+pub fn pin(pins: &mut Vec<Pin>, path: &Path) {
     insert_pins(pins, pins.len(), [pinned(path.into())]);
 }
 
 /// New pins keep their drop order. Running apps follow the pinned portion of the Dock.
-pub fn insert_pins(
-    pins: &mut Vec<PinnedApp>,
-    index: usize,
-    apps: impl IntoIterator<Item = PinnedApp>,
-) {
+pub fn insert_pins(pins: &mut Vec<Pin>, index: usize, apps: impl IntoIterator<Item = PinnedApp>) {
     let at = index.min(pins.len());
-    let mut known_apps: BTreeSet<_> = pins.iter().map(|pin| pin.app_id.clone()).collect();
-    let mut known_paths: BTreeSet<_> = pins.iter().map(|pin| path_id(&pin.launch)).collect();
+    let pinned_apps = pins.iter().filter_map(Pin::app);
+    let mut known_apps: BTreeSet<_> = pinned_apps.clone().map(|app| app.app_id.clone()).collect();
+    let mut known_paths: BTreeSet<_> = pinned_apps.map(|app| path_id(&app.launch)).collect();
     let new_apps = apps.into_iter().filter(|app| {
         // A shortcut can be retargeted while the Dock is running.
         let path = path_id(&app.launch);
@@ -54,20 +66,19 @@ pub fn insert_pins(
         }
         known_paths.insert(path)
     });
-    pins.splice(at..at, new_apps);
+    pins.splice(at..at, new_apps.map(Pin::App));
 }
 
-/// The insertion boundary is measured before the dragged app leaves its original slot.
+/// The insertion boundary is measured before the dragged item leaves its original slot.
 pub fn moved_pin_index(pin_count: usize, source: usize, insertion: usize) -> usize {
     let at = insertion.min(pin_count);
     at - usize::from(source < at)
 }
 
-pub fn move_pin(pins: &mut Vec<PinnedApp>, index: usize, app: PinnedApp) {
-    let from = pins.iter().position(|pin| pin.app_id == app.app_id);
-    let at = moved_pin_index(pins.len(), from.unwrap_or(pins.len()), index);
-    let app = from.map_or(app, |from| pins.remove(from));
-    pins.insert(at, app);
+pub fn move_pin(pins: &mut Vec<Pin>, from: usize, insertion: usize) {
+    let to = moved_pin_index(pins.len(), from, insertion);
+    let pin = pins.remove(from);
+    pins.insert(to, pin);
 }
 
 pub fn path_id(path: &Path) -> String {
@@ -130,7 +141,7 @@ impl AppGroup {
     }
 }
 
-pub fn group_apps(pins: &[PinnedApp], windows: &[WindowInfo], foreground: isize) -> Vec<AppGroup> {
+pub fn group_apps(pins: &[Pin], windows: &[WindowInfo], foreground: isize) -> Vec<AppGroup> {
     // Stable application order keeps the target under the pointer when the Z order changes.
     let mut running: BTreeMap<&str, Vec<WindowInfo>> = BTreeMap::new();
     for window in windows {
@@ -140,7 +151,7 @@ pub fn group_apps(pins: &[PinnedApp], windows: &[WindowInfo], foreground: isize)
             .push(window.clone());
     }
     let mut groups = Vec::new();
-    for pin in pins {
+    for pin in pins.iter().filter_map(Pin::app) {
         let windows = running.remove(pin.app_id.as_str()).unwrap_or_default();
         groups.push(AppGroup {
             app_id: pin.app_id.clone(),
@@ -182,56 +193,63 @@ mod tests {
     #[test]
     fn drop_inserts_new_apps_once_in_source_order() {
         let app = |p: &str| pinned(p.into());
-        let mut pins = vec![app("a.exe"), app("b.exe")];
+        let pin = |p: &str| Pin::App(app(p));
+        let mut pins = vec![pin("a.exe"), Pin::Separator, pin("b.exe")];
         insert_pins(
             &mut pins,
-            1,
+            2,
             ["A.EXE", "editor.lnk", "viewer.exe", "Editor.LNK"].map(app),
         );
-        assert_eq!(
-            pins,
-            ["a.exe", "editor.lnk", "viewer.exe", "b.exe"].map(app)
-        );
+        let expected = [
+            pin("a.exe"),
+            Pin::Separator,
+            pin("editor.lnk"),
+            pin("viewer.exe"),
+            pin("b.exe"),
+        ];
+        assert_eq!(pins, expected);
         let mut retargeted = app("EDITOR.LNK");
         retargeted.app_id = "new-editor.exe".into();
         insert_pins(&mut pins, 0, [retargeted]);
-        assert_eq!(
-            pins,
-            ["a.exe", "editor.lnk", "viewer.exe", "b.exe"].map(app)
-        );
+        assert_eq!(pins, expected);
     }
 
     #[test]
     fn moving_across_adjacent_slots_and_pinning_a_running_app() {
-        let app = |p: &str| pinned(p.into());
-        let mut pins = ["editor.lnk", "b.exe", "c.exe"].map(app).to_vec();
-        // The shortcut and its running group have the same identity.
-        pins[0].app_id = "editor.exe".into();
-        move_pin(&mut pins, 2, app("editor.exe"));
-        assert_eq!(pins[1].launch, Path::new("editor.lnk"));
-        move_pin(&mut pins, 0, app("editor.exe"));
-        assert_eq!(pins[0].launch, Path::new("editor.lnk"));
-        move_pin(&mut pins, 7, app("running.exe"));
-        assert_eq!(
-            pins.iter().map(|p| p.launch.as_path()).collect::<Vec<_>>(),
-            ["editor.lnk", "b.exe", "c.exe", "running.exe"].map(Path::new),
-        );
+        let mut editor = pinned("editor.lnk".into());
+        editor.app_id = "editor.exe".into();
+        let editor = Pin::App(editor);
+        let b = Pin::App(pinned("b.exe".into()));
+        let mut pins = vec![editor.clone(), Pin::Separator, b.clone()];
+        move_pin(&mut pins, 0, 2);
+        assert_eq!(pins, [Pin::Separator, editor.clone(), b.clone()]);
+        move_pin(&mut pins, 0, 3);
+        assert_eq!(pins, [editor.clone(), b.clone(), Pin::Separator]);
+        move_pin(&mut pins, 2, 1);
+        let running = pinned("running.exe".into());
+        insert_pins(&mut pins, 7, [running.clone()]);
+        assert_eq!(pins, [editor, Pin::Separator, b, Pin::App(running)]);
     }
 
     #[test]
     fn launch_switch_and_choose_follow_the_observed_windows() {
-        let pins = [PinnedApp {
-            app_id: "editor".into(),
-            label: "Editor".into(),
-            icon_path: "editor.exe".into(),
-            launch: "editor.exe".into(),
-        }];
+        let pins = [
+            Pin::Separator,
+            Pin::App(PinnedApp {
+                app_id: "editor".into(),
+                label: "Editor".into(),
+                icon_path: "editor.exe".into(),
+                launch: "editor.exe".into(),
+            }),
+            Pin::Separator,
+        ];
         let windows = [
             window(3, "viewer"),
             window(1, "editor"),
             window(2, "editor"),
         ];
         let groups = group_apps(&pins, &windows[..1], 3);
+        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].action(), Action::Launch(Path::new("editor.exe")));
         assert!(groups[1].active);
         let groups = group_apps(&pins, &windows[..2], 1);

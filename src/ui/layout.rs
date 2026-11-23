@@ -1,3 +1,4 @@
+use crate::dock::Pin;
 use crate::geometry::Rect;
 use crate::metrics::{Indicator, Style};
 use crate::visibility::DockDisplayMode;
@@ -11,21 +12,51 @@ pub struct Slot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockHit {
     Launchpad,
+    /// Index in the application groups.
     App(usize),
+    /// Index in the saved pin order.
+    Separator(usize),
+}
+
+impl DockHit {
+    fn width(self, app: i32, separator: i32) -> i32 {
+        match self {
+            Self::Separator(_) => separator,
+            _ => app,
+        }
+    }
+}
+
+/// Application groups follow pin order, then include the remaining running apps.
+pub fn dock_order(pins: &[Pin], app_count: usize) -> impl Iterator<Item = DockHit> {
+    let mut pins = pins.iter().enumerate();
+    let mut apps = (0..app_count).map(DockHit::App);
+    std::iter::from_fn(move || match pins.next() {
+        Some((index, Pin::Separator)) => Some(DockHit::Separator(index)),
+        _ => apps.next(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockDrop {
     Launchpad,
-    /// Insert at this boundary in the full list of apps, including scrolled-out apps.
+    /// Boundary in the full Dock order, including separators and scrolled-out items.
     Insert(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DockSlot {
     pub target: DockHit,
+    /// Position after the launchpad, counting both apps and separators.
+    pub index: usize,
     /// Client pixels relative to the bottom bar.
     pub rect: Rect,
+}
+
+pub struct DockPreview {
+    pub slots: Vec<DockSlot>,
+    pub scale: f32,
+    gap: Option<Rect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +66,10 @@ pub struct Layout {
     /// The last row of work-area pixels, including both corners.
     work_edge: Rect,
     pub slots: Vec<DockSlot>,
+    pub order: Vec<DockHit>,
     pub first: usize,
+    app_width: i32,
+    separator_width: i32,
     /// Edge of each icon in pixels.
     pub icon: i32,
 }
@@ -65,21 +99,63 @@ fn scaled(dpi: u32) -> impl Fn(i32) -> i32 {
 
 impl Layout {
     /// `work` is a nonempty work area and `dpi` its effective DPI.
-    pub fn new(work: Rect, dpi: u32, apps: usize, first: usize, style: DockStyle) -> Self {
+    pub fn new(
+        work: Rect,
+        dpi: u32,
+        order: impl IntoIterator<Item = DockHit>,
+        first: usize,
+        style: DockStyle,
+    ) -> Self {
+        let order: Vec<_> = order.into_iter().collect();
         let px = scaled(dpi);
         let inset_x = px(8).min((work.width - 1) / 2);
         let available = work.width - 2 * inset_x;
         let padding = px(6).min((available - 1) / 2);
-        let slot_width = px(style.icon + style.spacing)
-            .min(available - 2 * padding)
-            .max(1);
-        let capacity = ((available - 2 * padding) / slot_width) as usize;
-        let count = apps + 1;
-        let visible = count.min(capacity);
-        let first = first.min(count - visible);
-
-        let width = (visible as i32 * slot_width + 2 * padding).max(1);
+        let room = available - 2 * padding;
+        let app_width = px(style.icon + style.spacing).clamp(1, room);
+        let separator_width = px(16).clamp(1, app_width);
+        let targets = std::iter::once(DockHit::Launchpad).chain(order.iter().copied());
+        // Keep the launchpad in front if there is also room for an app. On smaller
+        // displays it scrolls with the row so every target stays reachable.
+        let fixed = usize::from(room / app_width >= 2);
+        let scrolling = order.len() + 1 - fixed;
+        let mut remaining = room - fixed as i32 * app_width;
+        let tail = targets
+            .clone()
+            .rev()
+            .take(scrolling)
+            .take_while(|target| {
+                remaining -= target.width(app_width, separator_width);
+                remaining >= 0
+            })
+            .count();
+        let first = first.min(scrolling - tail);
         let height = work.height.min(px(style.icon + 30));
+        let inset_y = px(4).min((height - 1) / 2);
+        let mut x = padding;
+        let slots = targets
+            .enumerate()
+            .filter(|(i, _)| *i < fixed || *i >= fixed + first)
+            .map_while(|(i, target)| {
+                let width = target.width(app_width, separator_width);
+                if x + width > padding + room {
+                    return None;
+                }
+                let rect = Rect {
+                    x,
+                    y: inset_y,
+                    width,
+                    height: height - 2 * inset_y,
+                };
+                x += width;
+                Some(DockSlot {
+                    target,
+                    index: i.saturating_sub(1),
+                    rect,
+                })
+            })
+            .collect();
+        let width = x + padding;
         let inset = px(style.gap).min(work.height - height);
         let bottom = Rect {
             x: work.x + (work.width - width) / 2,
@@ -87,33 +163,8 @@ impl Layout {
             width,
             height,
         };
-        let inset_y = px(4).min((bottom.height - 1) / 2);
-        let slots = (0..visible)
-            .map(|offset| {
-                // Keep the launchpad in front while apps scroll. On a one-slot display
-                // it scrolls with the apps so every target stays reachable.
-                let index = if offset == 0 && capacity > 1 {
-                    0
-                } else {
-                    first + offset
-                };
-                let target = match index {
-                    0 => DockHit::Launchpad,
-                    i => DockHit::App(i - 1),
-                };
-                DockSlot {
-                    target,
-                    rect: Rect {
-                        x: padding + offset as i32 * slot_width,
-                        y: inset_y,
-                        width: slot_width,
-                        height: bottom.height - 2 * inset_y,
-                    },
-                }
-            })
-            .collect();
         let icon = px(style.icon)
-            .min(slot_width)
+            .min(app_width)
             .min(bottom.height - 2 * inset_y)
             .max(1);
         Self {
@@ -124,7 +175,10 @@ impl Layout {
                 ..work
             },
             slots,
+            order,
             first,
+            app_width,
+            separator_width,
             icon,
         }
     }
@@ -150,51 +204,73 @@ impl Layout {
     }
 
     pub fn hit(&self, x: i32, y: i32) -> Option<DockHit> {
-        self.slots
-            .iter()
-            .find(|s| s.rect.contains(x, y))
-            .map(|s| s.target)
+        self.slot_at(x, y).map(|s| s.target)
     }
 
-    fn insertion_gap(&self, at: usize) -> usize {
-        self.slots
-            .iter()
-            .position(|slot| matches!(slot.target, DockHit::App(index) if index >= at))
-            .unwrap_or(self.slots.len())
+    pub fn slot_at(&self, x: i32, y: i32) -> Option<&DockSlot> {
+        self.slots.iter().find(|s| s.rect.contains(x, y))
     }
 
-    /// Divide the current row into equal slots, including one for the incoming app.
-    /// Keeping the HWND in place also keeps OLE's drag-enter/leave boundaries stable.
-    fn insertion_rect(&self, position: usize) -> Rect {
+    /// Fit a preview into the current HWND, preserving the narrower separator slots.
+    fn fit_preview(&self, mut slots: Vec<DockSlot>, gap_at: Option<usize>) -> DockPreview {
         let first = self.slots[0].rect;
-        let count = self.slots.len() as i64;
-        let width = count * i64::from(first.width);
-        let edge = |i: usize| first.x + (i as i64 * width / (count + 1)) as i32;
-        let x = edge(position);
-        Rect {
-            x,
-            width: edge(position + 1) - x,
-            ..first
+        let room = i64::from(self.bottom.width - 2 * first.x);
+        let width = |hit: DockHit| i64::from(hit.width(self.app_width, self.separator_width));
+        let pitch = i64::from(self.app_width);
+        let total = slots.iter().map(|slot| width(slot.target)).sum::<i64>()
+            + if gap_at.is_some() { pitch } else { 0 };
+        let edge = |offset: i64| first.x + (offset * room / total) as i32;
+        let mut offset = 0;
+        let mut next = |w| {
+            let x = edge(offset);
+            offset += w;
+            Rect {
+                x,
+                width: edge(offset) - x,
+                ..first
+            }
+        };
+        let mut gap = None;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if gap_at == Some(i) {
+                gap = Some(next(pitch));
+            }
+            slot.rect = next(width(slot.target));
+        }
+        if gap_at == Some(slots.len()) {
+            gap = Some(next(pitch));
+        }
+        let pitch = (pitch * room / total) as i32;
+        let size = if gap.is_some() {
+            pitch - pitch / 10
+        } else {
+            pitch
+        };
+        DockPreview {
+            slots,
+            gap,
+            scale: size.clamp(1, self.icon) as f32 / self.icon as f32,
         }
     }
 
-    fn insertion_slots(&self, gap: usize) -> impl Iterator<Item = DockSlot> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .map(move |(i, slot)| DockSlot {
-                rect: self.insertion_rect(i + usize::from(i >= gap)),
-                target: slot.target,
-            })
+    pub fn insertion_preview(&self, at: usize) -> DockPreview {
+        let gap = self
+            .slots
+            .partition_point(|s| s.target == DockHit::Launchpad || s.index < at);
+        self.fit_preview(self.slots.clone(), Some(gap))
     }
 
-    /// Visible icon positions and their resting scale while an external app is inserted.
-    pub fn insertion_preview(&self, at: usize) -> (Vec<DockSlot>, f32) {
-        let slots = self.insertion_slots(self.insertion_gap(at)).collect();
-        let pitch = self.insertion_rect(0).width;
-        // Leave some space between icons even in a short Dock with large icons.
-        let size = (pitch - pitch / 10).clamp(1, self.icon);
-        (slots, size as f32 / self.icon as f32)
+    pub fn reorder_preview(&self, from: usize, to: usize) -> DockPreview {
+        let mut order = self.order.clone();
+        let item = order.remove(from);
+        order.insert(to, item);
+        let mut slots = self.slots.clone();
+        for slot in &mut slots {
+            if slot.target != DockHit::Launchpad {
+                slot.target = order[slot.index];
+            }
+        }
+        self.fit_preview(slots, None)
     }
 
     /// Hit the incoming file's visible gap and limit insertion to the pinned apps.
@@ -209,12 +285,14 @@ impl Layout {
             return None;
         }
         let target = if let Some(DockDrop::Insert(at)) = current {
-            let gap = self.insertion_gap(at);
-            let space = self.insertion_rect(gap);
-            if (space.x..space.x + space.width).contains(&x) {
+            let preview = self.insertion_preview(at);
+            if preview
+                .gap
+                .is_some_and(|r| (r.x..r.x + r.width).contains(&x))
+            {
                 DockDrop::Insert(at)
             } else {
-                Self::drop_among(self.insertion_slots(gap), x, y, None)
+                Self::drop_among(preview.slots.into_iter(), x, y, None)
             }
         } else {
             Self::drop_among(self.slots.iter().copied(), x, y, None)
@@ -225,7 +303,7 @@ impl Layout {
         })
     }
 
-    /// `source` is the current group index of an app being moved within the Dock.
+    /// `source` is the item's current position in the full Dock order.
     pub fn drop_target(&self, x: i32, y: i32, source: Option<usize>) -> Option<DockDrop> {
         if !(0..self.bottom.width).contains(&x) || !(0..self.bottom.height).contains(&y) {
             return None;
@@ -241,21 +319,21 @@ impl Layout {
     ) -> DockDrop {
         let mut boundary = 0;
         for slot in slots {
-            if slot.rect.contains(x, y) {
-                match (slot.target, source) {
-                    (DockHit::Launchpad, _) => return DockDrop::Launchpad,
-                    (DockHit::App(index), Some(from)) => {
-                        return DockDrop::Insert(index + usize::from(from < index));
-                    }
-                    _ => {}
+            if slot.target == DockHit::Launchpad {
+                if slot.rect.contains(x, y) {
+                    return DockDrop::Launchpad;
                 }
+                continue;
             }
-            if let DockHit::App(index) = slot.target {
-                if x < slot.rect.x + slot.rect.width / 2 {
-                    return DockDrop::Insert(index);
-                }
-                boundary = index + 1;
+            if let Some(from) = source
+                && slot.rect.contains(x, y)
+            {
+                return DockDrop::Insert(slot.index + usize::from(from < slot.index));
             }
+            if x < slot.rect.x + slot.rect.width / 2 {
+                return DockDrop::Insert(slot.index);
+            }
+            boundary = slot.index + 1;
         }
         DockDrop::Insert(boundary)
     }
@@ -514,7 +592,7 @@ mod tests {
             height: 1032,
         };
         for dpi in [96, 120, 144, 192] {
-            let layout = Layout::new(work, dpi, 4, 0, DockStyle::default());
+            let layout = Layout::new(work, dpi, dock_order(&[], 4), 0, DockStyle::default());
             let rect = layout.bottom;
             assert!((2 * (rect.x - work.x) + rect.width - work.width).abs() <= 1);
             assert_eq!(
@@ -540,18 +618,30 @@ mod tests {
             width: 240,
             height: 600,
         };
-        let layout = Layout::new(work, 144, 16, usize::MAX, DockStyle::default());
+        let layout = Layout::new(
+            work,
+            144,
+            dock_order(&[], 16),
+            usize::MAX,
+            DockStyle::default(),
+        );
         let last = layout.slots.last().unwrap().rect;
         assert!(layout.bottom.width <= work.width);
         assert!(layout.first > 0);
         assert_eq!(layout.hit(last.x, last.y), Some(DockHit::App(15)));
         let first = layout.slots[0].rect;
         assert_eq!(layout.hit(first.x, first.y), Some(DockHit::Launchpad));
-        let layout = Layout::new(work, 144, 1, layout.first, DockStyle::default());
+        let layout = Layout::new(
+            work,
+            144,
+            dock_order(&[], 1),
+            layout.first,
+            DockStyle::default(),
+        );
         assert_eq!(layout.first, 0);
         let app = layout.slots[1].rect;
         assert_eq!(layout.hit(app.x, app.y), Some(DockHit::App(0)));
-        let empty = Layout::new(work, 144, 0, 0, DockStyle::default());
+        let empty = Layout::new(work, 144, dock_order(&[], 0), 0, DockStyle::default());
         assert_eq!(empty.slots.len(), 1);
         assert_eq!(empty.hit(first.x, first.y), Some(DockHit::Launchpad));
 
@@ -561,7 +651,7 @@ mod tests {
             (1, DockHit::App(0)),
             (2, DockHit::App(1)),
         ] {
-            let layout = Layout::new(narrow, 144, 2, first, DockStyle::default());
+            let layout = Layout::new(narrow, 144, dock_order(&[], 2), first, DockStyle::default());
             let slot = layout.slots[0].rect;
             assert_eq!(layout.hit(slot.x, slot.y), Some(target));
         }
@@ -576,7 +666,7 @@ mod tests {
             height: 600,
         };
         for dpi in [96, 144] {
-            let layout = Layout::new(work, dpi, 16, 5, DockStyle::default());
+            let layout = Layout::new(work, dpi, dock_order(&[], 16), 5, DockStyle::default());
             let launcher = layout.slots[0].rect;
             let app = layout.slots[1].rect;
             let center = app.x + app.width / 2;
@@ -606,11 +696,71 @@ mod tests {
             );
             assert_eq!(layout.drop_target(center, -1, Some(6)), None);
         }
-        let empty = Layout::new(work, 96, 0, 0, DockStyle::default());
+        let empty = Layout::new(work, 96, dock_order(&[], 0), 0, DockStyle::default());
         assert_eq!(
             empty.drop_target(empty.bottom.width - 1, 0, None),
             Some(DockDrop::Insert(0))
         );
+    }
+
+    #[test]
+    fn separators_have_narrow_slots_and_keep_apps_on_the_chosen_side() {
+        use crate::dock::pinned;
+        use DockHit::{App, Launchpad, Separator};
+        let pins = [
+            Pin::App(pinned("editor.lnk".into())),
+            Pin::Separator,
+            Pin::App(pinned("viewer.exe".into())),
+            Pin::Separator,
+        ];
+        let work = Rect {
+            x: -1200,
+            y: 0,
+            width: 1200,
+            height: 800,
+        };
+        for dpi in [96, 144, 192] {
+            let layout = Layout::new(work, dpi, dock_order(&pins, 3), 0, DockStyle::default());
+            let targets = |slots: &[DockSlot]| slots.iter().map(|s| s.target).collect::<Vec<_>>();
+            assert_eq!(
+                targets(&layout.slots),
+                [
+                    Launchpad,
+                    App(0),
+                    Separator(1),
+                    App(1),
+                    Separator(3),
+                    App(2)
+                ]
+            );
+            let line = layout.slots[2].rect;
+            assert!(line.width < layout.slots[1].rect.width);
+            let mid = line.x + line.width / 2;
+            let y = line.y + line.height / 2;
+            assert_eq!(layout.hit(line.x - 1, y), Some(App(0)));
+            assert_eq!(layout.hit(mid, y), Some(Separator(1)));
+            assert_eq!(layout.hit(line.x + line.width, y), Some(App(1)));
+            for (x, at) in [(mid - 1, 1), (mid, 2)] {
+                let target = Some(DockDrop::Insert(at));
+                assert_eq!(layout.file_drop_target(x, y, None, pins.len()), target);
+                assert_eq!(layout.file_drop_target(x, y, target, pins.len()), target);
+            }
+            let preview = layout.reorder_preview(1, 2);
+            assert_eq!(
+                targets(&preview.slots),
+                [
+                    Launchpad,
+                    App(0),
+                    App(1),
+                    Separator(1),
+                    Separator(3),
+                    App(2)
+                ]
+            );
+            assert_eq!(preview.slots[3].rect.width, line.width);
+            assert_eq!(preview.slots[2].rect.x, line.x);
+            assert_eq!(layout.hit(mid, y), Some(Separator(1)));
+        }
     }
 
     #[test]
@@ -625,18 +775,18 @@ mod tests {
             let layout = Layout::new(
                 work,
                 144,
-                apps,
+                dock_order(&[], apps),
                 first,
                 DockStyle {
                     icon: 56,
                     ..DockStyle::default()
                 },
             );
-            let (slots, scale) = layout.insertion_preview(at);
-            let icon = layout.icon as f32 * scale;
+            let preview = layout.insertion_preview(at);
+            let icon = layout.icon as f32 * preview.scale;
             let mut left = layout.slots[0].rect.x;
             let mut right = layout.bottom.width - left;
-            for (slot, original) in slots.iter().zip(&layout.slots) {
+            for (slot, original) in preview.slots.iter().zip(&layout.slots) {
                 assert_eq!(slot.target, original.target);
                 assert!(icon <= slot.rect.width as f32);
                 if matches!(slot.target, DockHit::App(i) if i >= at) {
@@ -668,7 +818,24 @@ mod tests {
 
     #[test]
     fn stationary_drop_pointer_keeps_its_target_when_icons_make_room() {
-        for (width, apps, first) in [(60, 2, 1), (800, 0, 0), (800, 3, 0), (340, 16, 5)] {
+        for (width, order, first) in [
+            (60, dock_order(&[], 2).collect(), 1),
+            (800, dock_order(&[], 0).collect(), 0),
+            (800, dock_order(&[], 3).collect(), 0),
+            (340, dock_order(&[], 16).collect(), 5),
+            (
+                220,
+                vec![
+                    DockHit::App(0),
+                    DockHit::Separator(1),
+                    DockHit::App(1),
+                    DockHit::Separator(3),
+                    DockHit::App(2),
+                    DockHit::App(3),
+                ],
+                1,
+            ),
+        ] {
             let work = Rect {
                 x: 0,
                 y: 0,
@@ -676,8 +843,8 @@ mod tests {
                 height: 600,
             };
             for dpi in [96, 144] {
-                let layout = Layout::new(work, dpi, apps, first, DockStyle::default());
-                for pins in [0, apps / 2, apps] {
+                let layout = Layout::new(work, dpi, order.clone(), first, DockStyle::default());
+                for pins in [0, order.len() / 2, order.len()] {
                     for previous in
                         std::iter::once(None).chain((0..=pins).map(|at| Some(DockDrop::Insert(at))))
                     {
@@ -713,7 +880,7 @@ mod tests {
             spacing: 8,
             gap: 0,
         };
-        let layout = Layout::new(work, 144, 3, 0, style);
+        let layout = Layout::new(work, 144, dock_order(&[], 3), 0, style);
         assert_eq!(layout.icon, 72);
         assert_eq!(layout.slots[0].rect.width, 84);
         assert_eq!(layout.bottom.height, 117);
@@ -733,7 +900,7 @@ mod tests {
             width: 1024,
             height: 728,
         };
-        let layout = Layout::new(work, 144, 4, 0, DockStyle::default());
+        let layout = Layout::new(work, 144, dock_order(&[], 4), 0, DockStyle::default());
         let edge = layout.reveal_edge(DockDisplayMode::AutoHide);
         let smart = layout.reveal_edge(DockDisplayMode::SmartHide);
         let revealed = layout.revealed_window();

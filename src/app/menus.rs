@@ -2,7 +2,7 @@ use super::Bars;
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
-use crate::ui::layout::{DockHit, StatusHit, SystemItem};
+use crate::ui::layout::{DockDrop, DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
 };
@@ -26,7 +26,7 @@ impl Bars {
                 StatusHit::Clock => self.clock_menu(),
                 StatusHit::Title => match self.apps.iter().position(|app| app.active) {
                     Some(index) => {
-                        let menu = self.app_menu(index);
+                        let menu = self.app_menu(index, None);
                         let anchor =
                             self.top_anchor(self.status.title.x + px(self.monitor.dpi, 60));
                         self.show_menu(menu, anchor)
@@ -41,21 +41,32 @@ impl Bars {
         if owner != self.bottom.0 {
             return Ok(false);
         }
-        match self.layout.hit(x, y) {
-            Some(DockHit::App(index)) => {
-                let menu = self.app_menu(index);
-                let anchor = self.icon_anchor(index);
-                self.show_menu(menu, anchor)
+        let menu = match self.layout.slot_at(x, y) {
+            Some(slot) => match slot.target {
+                DockHit::App(index) => {
+                    let at = (slot.index + 1).min(self.pins.len());
+                    let menu = self.app_menu(index, Some(at));
+                    return self.show_menu(menu, self.icon_anchor(index));
+                }
+                DockHit::Separator(index) => menu::separator_menu(index),
+                DockHit::Launchpad => menu::bar_menu(&self.apps, Some(0)),
+            },
+            None => {
+                let at = match self.file_target(x, y) {
+                    Some(DockDrop::Insert(at)) => at,
+                    _ => self.pins.len(),
+                };
+                menu::bar_menu(&self.apps, Some(at))
             }
-            Some(DockHit::Launchpad) | None => self.bar_menu(),
-        }
+        };
+        self.show_menu(menu, self.cursor_anchor()?)
     }
 
-    fn app_menu(&mut self, index: usize) -> Menu<Command> {
+    fn app_menu(&mut self, index: usize, separator_at: Option<usize>) -> Menu<Command> {
         let app = &self.apps[index];
         let window = app.current_window(self.foreground).map(|w| w.id);
         let tray_menus = self.tray.app_menus(&app.app_id, window);
-        let mut menu = menu::app_menu(app, self.foreground, &tray_menus);
+        let mut menu = menu::app_menu(app, self.foreground, &tray_menus, separator_at);
         let limit = self.settings.get(crate::settings::Key::RecentFiles) as u32;
         if limit > 0 {
             let available = self.monitor.work.height;
@@ -72,7 +83,7 @@ impl Bars {
     }
 
     pub(super) fn bar_menu(&mut self) -> Result<bool> {
-        let menu = menu::bar_menu(&self.apps);
+        let menu = menu::bar_menu(&self.apps, None);
         let anchor = self.cursor_anchor()?;
         self.show_menu(menu, anchor)
     }

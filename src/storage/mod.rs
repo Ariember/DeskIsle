@@ -1,12 +1,15 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, HRESULT, Result};
 
-use crate::dock::PinnedApp;
+use crate::dock::{Pin, PinnedApp};
 use crate::settings::{Key, Settings, spec};
 
 const PINS_FILE: &str = "pins.txt";
+// A vertical bar cannot occur in a Windows filename.
+const SEPARATOR: &str = "|";
 
 const LAUNCHPAD_FILE: &str = "launchpad.txt";
 
@@ -34,20 +37,20 @@ fn read_launchpad(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn save_launchpad(entries: &[PathBuf]) -> Result<()> {
-    write_paths(
+    write_list(
         &settings_path(LAUNCHPAD_FILE)?,
-        entries.iter().map(PathBuf::as_path),
+        entries.iter().map(|path| path.to_string_lossy()),
     )
 }
 
-fn write_paths<'a>(path: &Path, entries: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+fn write_list<'a>(path: &Path, lines: impl IntoIterator<Item = Cow<'a, str>>) -> Result<()> {
     let dir = path
         .parent()
         .expect("the list file is in the settings directory");
     std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
     let mut text = String::new();
-    for entry in entries {
-        text.push_str(&entry.to_string_lossy());
+    for line in lines {
+        text.push_str(&line);
         text.push('\n');
     }
     // DeskIsle has a single writer per session. Replace the list only after the full
@@ -60,22 +63,38 @@ fn write_paths<'a>(path: &Path, entries: impl IntoIterator<Item = &'a Path>) -> 
     result.map_err(|e| io_error(path, e))
 }
 
-/// The pinned applications the user saved, or `None` before the first change.
-pub fn load_pins(make_pin: impl Fn(PathBuf) -> PinnedApp) -> Result<Option<Vec<PinnedApp>>> {
-    Ok(read_setting(PINS_FILE)?.map(|lines| {
+/// The saved Dock order, or `None` before the first change.
+pub fn load_pins(make_pin: impl Fn(PathBuf) -> PinnedApp) -> Result<Option<Vec<Pin>>> {
+    read_pins(&settings_path(PINS_FILE)?, make_pin)
+}
+
+fn read_pins(path: &Path, make_pin: impl Fn(PathBuf) -> PinnedApp) -> Result<Option<Vec<Pin>>> {
+    Ok(read_lines(path)?.map(|lines| {
         let mut known = BTreeSet::new();
         lines
             .into_iter()
-            .map(|line| make_pin(line.into()))
-            .filter(|pin| known.insert(pin.app_id.clone()))
+            .filter_map(|line| {
+                if line == SEPARATOR {
+                    return Some(Pin::Separator);
+                }
+                let app = make_pin(line.into());
+                known.insert(app.app_id.clone()).then_some(Pin::App(app))
+            })
             .collect()
     }))
 }
 
-pub fn save_pins(pins: &[PinnedApp]) -> Result<()> {
-    write_paths(
-        &settings_path(PINS_FILE)?,
-        pins.iter().map(|pin| pin.launch.as_path()),
+pub fn save_pins(pins: &[Pin]) -> Result<()> {
+    write_pins(&settings_path(PINS_FILE)?, pins)
+}
+
+fn write_pins(path: &Path, pins: &[Pin]) -> Result<()> {
+    write_list(
+        path,
+        pins.iter().map(|pin| match pin {
+            Pin::App(app) => app.launch.to_string_lossy(),
+            Pin::Separator => Cow::Borrowed(SEPARATOR),
+        }),
     )
 }
 
@@ -232,6 +251,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pins_and_repeated_separators_round_trip_in_order() {
+        let dir = std::env::temp_dir().join(format!("deskisle-pins-test-{}", std::process::id()));
+        let file = dir.join(PINS_FILE);
+        let editor = r"C:\应用\编辑器.lnk";
+        let viewer = r"C:\Apps\Viewer.EXE";
+        let read = || read_pins(&file, crate::dock::pinned).unwrap();
+        assert_eq!(read(), None);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, format!("{editor}\r\n{viewer}\r\n{viewer}\r\n")).unwrap();
+        let apps = [editor, viewer].map(|path| Pin::App(crate::dock::pinned(path.into())));
+        assert_eq!(read().unwrap(), apps);
+        let [editor, viewer] = apps;
+        let pins = [editor, Pin::Separator, viewer, Pin::Separator];
+        write_pins(&file, &pins).unwrap();
+        assert_eq!(read().unwrap(), pins);
+        write_pins(&file, &[]).unwrap();
+        assert_eq!(read(), Some(Vec::new()));
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn independent_launchpad_round_trips_shortcuts_and_an_empty_list() {
         let dir = std::env::temp_dir().join(format!("deskisle-list-test-{}", std::process::id()));
         let file = dir.join(LAUNCHPAD_FILE);
@@ -240,9 +281,9 @@ mod tests {
             PathBuf::from(r"C:\Apps\Edit.EXE"),
         ];
         assert!(read_launchpad(&file).unwrap().is_empty());
-        write_paths(&file, entries.iter().map(PathBuf::as_path)).unwrap();
+        write_list(&file, entries.iter().map(|path| path.to_string_lossy())).unwrap();
         assert_eq!(read_launchpad(&file).unwrap(), entries);
-        write_paths(&file, []).unwrap();
+        write_list(&file, []).unwrap();
         assert!(read_launchpad(&file).unwrap().is_empty());
         assert!(!dir.join(PINS_FILE).exists());
         std::fs::remove_file(file).unwrap();

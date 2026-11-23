@@ -39,7 +39,19 @@ impl Bars {
             }
             Command::Unpin(id) => {
                 let mut pins = self.pins.clone();
-                pins.retain(|pin| pin.app_id != id);
+                pins.retain(|pin| pin.app().is_none_or(|app| app.app_id != id));
+                self.save_pins(pins).map(drop)
+            }
+            Command::AddSeparator(at) => {
+                let mut pins = self.pins.clone();
+                pins.insert(at, dock::Pin::Separator);
+                self.save_pins(pins).map(drop)
+            }
+            Command::RemoveSeparator(index) => {
+                let mut pins = self.pins.clone();
+                if pins.get(index) == Some(&dock::Pin::Separator) {
+                    pins.remove(index);
+                }
                 self.save_pins(pins).map(drop)
             }
             Command::Minimize(id, windows) => shell::minimize_windows(&id, &windows),
@@ -161,7 +173,7 @@ impl Bars {
         Ok(())
     }
 
-    pub(super) fn save_pins(&mut self, pins: Vec<dock::PinnedApp>) -> Result<bool> {
+    pub(super) fn save_pins(&mut self, pins: Vec<dock::Pin>) -> Result<bool> {
         if pins == self.pins {
             return Ok(false);
         }

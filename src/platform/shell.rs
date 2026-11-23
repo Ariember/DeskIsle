@@ -23,7 +23,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, HSTRING, Interface, Owned, PCWSTR, PWSTR, Result, w};
 
-use crate::dock::{PinnedApp, WindowInfo, path_id, pinned};
+use crate::dock::{Pin, PinnedApp, WindowInfo, path_id, pinned};
 use crate::geometry::Rect;
 
 mod recent;
@@ -252,7 +252,7 @@ unsafe extern "system" fn window_event(
 const MAX_PATH_UNITS: usize = 32768;
 
 /// Explorer and Task Manager, which the Dock keeps until the user changes its pins.
-pub fn default_pins() -> Result<Vec<PinnedApp>> {
+pub fn default_pins() -> Result<Vec<Pin>> {
     let mut path = vec![0; MAX_PATH_UNITS];
     let mut pins = Vec::new();
     for filename in ["explorer.exe", "Taskmgr.exe"] {
@@ -270,7 +270,7 @@ pub fn default_pins() -> Result<Vec<PinnedApp>> {
             return Err(ERROR_INSUFFICIENT_BUFFER.into());
         }
         let exe = PathBuf::from(OsString::from_wide(&path[..len])).join(filename);
-        pins.push(pinned(exe));
+        pins.push(Pin::App(pinned(exe)));
     }
     Ok(pins)
 }

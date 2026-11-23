@@ -12,7 +12,7 @@ mod tray_drag;
 
 use std::collections::BTreeSet;
 
-use crate::dock::{AppGroup, PinnedApp, group_apps};
+use crate::dock::{AppGroup, Pin, group_apps};
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
 use crate::platform::system_worker::SystemWorker;
@@ -24,7 +24,7 @@ use crate::settings::{Key, Settings};
 use crate::storage;
 use crate::system::Media;
 use crate::ui::layout::{
-    DockDrop, DockHit, DockStyle, Layout, StatusHit, StatusLayout, SystemItem,
+    DockDrop, DockHit, DockStyle, Layout, StatusHit, StatusLayout, SystemItem, dock_order,
 };
 use crate::ui::system::SystemStatus;
 use crate::visibility::{DockDisplayMode, DockPolicy};
@@ -55,7 +55,7 @@ struct Bars {
     dock_shortcut: Option<platform::Shortcut>,
     top: Bar,
     bottom: Bar,
-    pins: Vec<PinnedApp>,
+    pins: Vec<Pin>,
     apps: Vec<AppGroup>,
     foreground: Option<isize>,
     maximized_window: Option<isize>,
@@ -107,7 +107,7 @@ struct Bars {
     native_taskbar: NativeTaskbar,
 }
 
-fn applications(pins: &[PinnedApp]) -> Result<(Vec<AppGroup>, Option<isize>)> {
+fn applications(pins: &[Pin]) -> Result<(Vec<AppGroup>, Option<isize>)> {
     let (windows, foreground) = shell::enumerate()?;
     Ok((
         group_apps(pins, &windows, foreground.unwrap_or_default()),
@@ -119,7 +119,7 @@ fn status_height(settings: &Settings, dpi: u32) -> i32 {
     (settings.get(Key::TopBarHeight) * dpi as i32 + 48) / 96
 }
 
-fn load_pins() -> Result<Vec<PinnedApp>> {
+fn load_pins() -> Result<Vec<Pin>> {
     match storage::load_pins(shell::pin_from_path) {
         Ok(Some(pins)) => Ok(pins),
         Ok(None) => shell::default_pins(),
@@ -194,7 +194,7 @@ pub(crate) fn run() -> Result<()> {
     let layout = Layout::new(
         native_taskbar.dock_work_area(&monitor)?,
         monitor.dpi,
-        apps.len(),
+        dock_order(&pins, apps.len()),
         0,
         style,
     );
@@ -641,7 +641,7 @@ impl Bars {
         let layout = Layout::new(
             self.native_taskbar.dock_work_area(&self.monitor)?,
             self.monitor.dpi,
-            self.apps.len(),
+            dock_order(&self.pins, self.apps.len()),
             first,
             self.dock_style(),
         );
@@ -825,7 +825,14 @@ impl Bars {
         let (apps, foreground) = applications(&self.pins)?;
         let foreground_changed = self.foreground != foreground;
         self.foreground = foreground;
-        if self.apps != apps {
+        if self.apps != apps
+            || !self
+                .layout
+                .order
+                .iter()
+                .copied()
+                .eq(dock_order(&self.pins, apps.len()))
+        {
             let preview_app = self.preview_pointer_app();
             self.apps = apps;
             if !self.relayout(self.layout.first)? {
@@ -893,7 +900,7 @@ impl Bars {
     }
 
     fn draw_frame(&mut self) -> Result<()> {
-        let (preview_order, dock_hover) = self.dock_preview();
+        let (preview, dock_hover) = self.dock_preview();
         let dropping = self.dropping_on_launchpad();
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
         renderer.check_device()?;
@@ -948,48 +955,50 @@ impl Bars {
             self.top_glass,
             self.top_window_color,
         )?;
-        let insertion = match self.dock_file_target {
-            Some(DockDrop::Insert(at)) => Some(self.layout.insertion_preview(at)),
-            _ => None,
-        };
-        let (slots, scale) = insertion
+        let (slots, scale) = preview
             .as_ref()
-            .map_or((&self.layout.slots, 1.), |(slots, scale)| (slots, *scale));
-        let icons = slots
-            .iter()
-            .map(|slot| {
-                let (path, label, running, active) = match slot.target {
-                    DockHit::Launchpad => (None, "启动台", false, false),
-                    DockHit::App(index) => {
-                        let index = preview_order.as_ref().map_or(index, |order| order[index]);
-                        let app = &self.apps[index];
-                        (
-                            Some(app.icon_path.as_path()),
-                            app.label.as_str(),
-                            !app.windows.is_empty(),
-                            app.active,
-                        )
-                    }
-                };
-                let r = slot.rect;
-                DockIcon {
-                    path,
-                    label,
-                    center_x: r.x + r.width / 2,
-                    center_y: r.y + r.height / 2,
-                    size: self.layout.icon,
-                    running,
-                    active,
+            .map_or((&self.layout.slots, 1.), |preview| {
+                (&preview.slots, preview.scale)
+            });
+        let mut icons = Vec::with_capacity(slots.len());
+        let mut separators = Vec::new();
+        let mut hover = None;
+        let mut deep = None;
+        for slot in slots {
+            let r = slot.rect;
+            let center_x = r.x + r.width / 2;
+            let (path, label, running, active) = match slot.target {
+                DockHit::Separator(_) => {
+                    separators.push(center_x);
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>();
-        let hover = slots
-            .iter()
-            .position(|slot| Some(slot.target) == dock_hover);
-        let deep = slots
-            .iter()
-            .position(|slot| slot.target == DockHit::Launchpad)
-            .filter(|_| dropping);
+                DockHit::Launchpad => {
+                    deep = dropping.then_some(icons.len());
+                    (None, "启动台", false, false)
+                }
+                DockHit::App(index) => {
+                    let app = &self.apps[index];
+                    (
+                        Some(app.icon_path.as_path()),
+                        app.label.as_str(),
+                        !app.windows.is_empty(),
+                        app.active,
+                    )
+                }
+            };
+            if Some(slot.target) == dock_hover {
+                hover = Some(icons.len());
+            }
+            icons.push(DockIcon {
+                path,
+                label,
+                center_x,
+                center_y: r.y + r.height / 2,
+                size: self.layout.icon,
+                running,
+                active,
+            });
+        }
         let bottom = self.layout.bottom;
         let lift = self.settings.hover_scale();
         renderer.draw_dock(
@@ -997,6 +1006,7 @@ impl Bars {
             bottom.height,
             dpi,
             &icons,
+            &separators,
             hover,
             deep,
             lift,

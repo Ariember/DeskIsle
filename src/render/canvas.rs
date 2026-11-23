@@ -475,6 +475,33 @@ impl Canvas {
         )
     }
 
+    pub(super) fn dock_background(
+        &self,
+        width: i32,
+        height: i32,
+        separators: &[i32],
+    ) -> Result<()> {
+        let s = self.scale;
+        let (w, h) = (width as f32 / s, height as f32 / s);
+        self.bar_glass(Area::new(0., 0., w, h), 18.)?;
+        // Align the one-DIP rule to whole pixels, including at fractional DPI.
+        let thickness = s.round().max(1.) as i32;
+        let inset = (height as f32 * 0.18).round() / s;
+        for &center in separators {
+            let left = (center - thickness / 2) as f32 / s;
+            self.fill(
+                left,
+                inset,
+                left + thickness as f32 / s,
+                h - inset,
+                0.,
+                self.p.line,
+                0.30,
+            )?;
+        }
+        self.stroke(0., 0., w, h, 18., self.p.line, 0.16)
+    }
+
     /// Shared by the live top bar and the three miniatures in settings.
     pub(super) fn top_background(
         &self,
