@@ -138,8 +138,8 @@ struct MarkLayer {
     core: IDCompositionScaleTransform,
     core_size: Tween,
     open: bool,
-    /// The bar height in pixels, DPI and palette the ring was painted for.
-    key: (i32, u32, Palette),
+    /// The bar height in pixels, DPI, palette and shadow state the ring was painted for.
+    key: (i32, u32, Palette, bool),
 }
 
 struct IconLayer {
@@ -171,6 +171,19 @@ const DROP_SHADE: f32 = 0.32;
 /// Dock's bottom edge.
 const DOT_BOX: (f32, f32) = (20., 8.);
 const DOT_TOP: f32 = 10.5;
+/// Vertical offset in DIPs for the soft shadow behind translucent top-bar text and icons.
+pub(super) const TOP_SHADOW_Y: f32 = 0.85;
+
+/// Translucent desktop top-bar styles draw a subtle drop shadow so text and icons stay
+/// crisp over varied wallpaper tones.
+pub(super) fn top_bar_shadow(style: TopBarBackground, immersive_color: Option<u32>) -> bool {
+    immersive_color.is_none()
+        && matches!(
+            style,
+            TopBarBackground::Tinted | TopBarBackground::Transparent
+        )
+}
+
 /// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
 const PILL_RADIUS: f32 = 7.;
 /// Size of the icons on the status bar, in DIPs. The battery is drawn larger with the
@@ -472,8 +485,11 @@ impl Renderer {
         frosted: bool,
         immersive_color: Option<u32>,
     ) -> Result<()> {
-        let palette = self.palette.for_top_bar(immersive_color);
-        let metrics_changed = self.update_metrics(layout, dpi, metrics, palette)?;
+        let palette = self
+            .palette
+            .for_top_bar(self.top_background, immersive_color);
+        let shadow = top_bar_shadow(self.top_background, immersive_color);
+        let metrics_changed = self.update_metrics(layout, dpi, metrics, palette, shadow)?;
         let state = TopState {
             layout: layout.clone(),
             background: self.top_background,
@@ -504,6 +520,11 @@ impl Renderer {
         let hover_slot = hover
             .and_then(|hit| layout.target(hit))
             .filter(|&slot| Some(slot) != open_slot);
+        let (hover_alpha, open_alpha) = if palette.light_ground() {
+            (0.08, 0.15)
+        } else {
+            (0.14, 0.24)
+        };
         let backing = |c: &Canvas, slot: Rect, alpha: f32| {
             let (l, r) = (dip(slot.x) + 2., dip(slot.x + slot.width) - 2.);
             c.fill(l, 4., r, h - 4., PILL_RADIUS, c.p.line, alpha)
@@ -520,8 +541,22 @@ impl Renderer {
                 } else {
                     c.top_background(Area::new(0., 0., w, h), self.top_background, frosted)?;
                 }
-                c.fill(0., h - dip(1), w, h, 0., c.p.line, 0.12)?;
+                let (shadow_rgb, shadow_alpha) = c.top_shadow();
                 let t = layout.title;
+                if shadow {
+                    c.draw_text(
+                        &self.write,
+                        title,
+                        c.rect(dip(t.x), TOP_SHADOW_Y, dip(t.x + t.width), h + TOP_SHADOW_Y),
+                        Text {
+                            size: 13.,
+                            bold: true,
+                            ..Text::default()
+                        },
+                        shadow_rgb,
+                        shadow_alpha,
+                    )?;
+                }
                 c.text(
                     &self.write,
                     title,
@@ -531,10 +566,10 @@ impl Renderer {
                     c.p.ink,
                 )?;
                 if let Some(slot) = hover_slot {
-                    backing(c, slot, 0.08)?;
+                    backing(c, slot, hover_alpha)?;
                 }
                 if let Some(slot) = open_slot {
-                    backing(c, slot, 0.15)?;
+                    backing(c, slot, open_alpha)?;
                 }
                 let icon_size = (BAR_ICON * s).round();
                 for (slot, image) in layout.tray.iter().zip(icons) {
@@ -570,63 +605,122 @@ impl Renderer {
                 if let Some(r) = layout.overflow {
                     let x = (dip(r.x) + dip(r.x + r.width)) / 2.;
                     let expanded = open == Some(StatusHit::Overflow);
+                    if shadow && !expanded {
+                        c.symbol(
+                            Symbol::List { expanded: false },
+                            x,
+                            h / 2. + TOP_SHADOW_Y,
+                            BAR_ICON,
+                            shadow_rgb,
+                            shadow_alpha,
+                        )?;
+                    }
                     c.symbol(Symbol::List { expanded }, x, h / 2., BAR_ICON, c.p.ink, 1.)?;
                 }
                 for (&(_, r), mark) in layout.system.iter().zip(marks) {
                     let (l, right) = (dip(r.x), dip(r.x + r.width));
                     let (x, y) = ((l + right) / 2., h / 2.);
                     match *mark {
-                        Mark::Text(text) => c.draw_text(
-                            &self.write,
-                            text,
-                            c.rect(l, 0., right, h),
-                            Text {
+                        Mark::Text(text) => {
+                            let style = Text {
                                 size: 13.,
                                 align: DWRITE_TEXT_ALIGNMENT_CENTER,
                                 ..Text::default()
-                            },
-                            c.p.ink,
-                            1.,
-                        )?,
+                            };
+                            if shadow {
+                                c.draw_text(
+                                    &self.write,
+                                    text,
+                                    c.rect(l, TOP_SHADOW_Y, right, h + TOP_SHADOW_Y),
+                                    style,
+                                    shadow_rgb,
+                                    shadow_alpha,
+                                )?;
+                            }
+                            c.draw_text(
+                                &self.write,
+                                text,
+                                c.rect(l, 0., right, h),
+                                style,
+                                c.p.ink,
+                                1.,
+                            )?
+                        }
                         Mark::Icon { symbol, dim } => {
                             let alpha = if dim { DIM } else { 1. };
+                            if shadow {
+                                c.symbol(
+                                    symbol,
+                                    x,
+                                    y + TOP_SHADOW_Y,
+                                    BAR_ICON,
+                                    shadow_rgb,
+                                    shadow_alpha * alpha,
+                                )?;
+                            }
                             c.symbol(symbol, x, y, BAR_ICON, c.p.ink, alpha)?;
                         }
                         Mark::Battery(symbol) => {
                             let weight = icon::weight(BAR_ICON);
+                            if shadow {
+                                c.symbol_weighted(
+                                    symbol,
+                                    x,
+                                    y + TOP_SHADOW_Y,
+                                    BATTERY_ICON,
+                                    weight,
+                                    shadow_rgb,
+                                    shadow_alpha,
+                                )?;
+                            }
                             c.symbol_weighted(symbol, x, y, BATTERY_ICON, weight, c.p.ink, 1.)?;
                         }
                     }
                 }
                 let r = layout.clock;
                 if let Some(slot) = layout.close {
-                    c.symbol(
-                        Symbol::Close,
-                        dip(slot.x) + dip(slot.width) / 2.,
-                        h / 2.,
-                        BAR_ICON,
-                        c.p.ink,
-                        1.,
-                    )?;
+                    let cx = dip(slot.x) + dip(slot.width) / 2.;
+                    if shadow {
+                        c.symbol(
+                            Symbol::Close,
+                            cx,
+                            h / 2. + TOP_SHADOW_Y,
+                            BAR_ICON,
+                            shadow_rgb,
+                            shadow_alpha,
+                        )?;
+                    }
+                    c.symbol(Symbol::Close, cx, h / 2., BAR_ICON, c.p.ink, 1.)?;
                 }
                 // The slot is the time's width plus a gap, so centering leaves half the
                 // gap on each side.
+                let clock_style = Text {
+                    size: layout::CLOCK_TEXT,
+                    bold: true,
+                    align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                };
+                if shadow {
+                    c.draw_text(
+                        &self.write,
+                        time,
+                        c.rect(dip(r.x), TOP_SHADOW_Y, dip(r.x + r.width), h + TOP_SHADOW_Y),
+                        clock_style,
+                        shadow_rgb,
+                        shadow_alpha,
+                    )?;
+                }
                 c.draw_text(
                     &self.write,
                     time,
                     c.rect(dip(r.x), 0., dip(r.x + r.width), h),
-                    Text {
-                        size: layout::CLOCK_TEXT,
-                        bold: true,
-                        align: DWRITE_TEXT_ALIGNMENT_CENTER,
-                    },
+                    clock_style,
                     c.p.ink,
                     1.,
                 )
             },
         )?;
         unsafe { self.top.root.SetContent(&surface)? };
-        self.place_mark(layout.height, dpi, palette)?;
+        self.place_mark(layout.height, dpi, palette, shadow)?;
         unsafe { self.device.Commit()? };
         self.top_state = Some(state);
         Ok(())
@@ -635,8 +729,8 @@ impl Renderer {
     /// Paints the DeskIsle mark, a ring as round as the controls beside it, onto its own
     /// layer above the bar. The layer is kept while the bar's height, DPI and palette are;
     /// a repainted layer keeps showing the core if the system menu is still open.
-    fn place_mark(&mut self, height: i32, dpi: u32, palette: Palette) -> Result<()> {
-        let key = (height, dpi, palette);
+    fn place_mark(&mut self, height: i32, dpi: u32, palette: Palette, shadow: bool) -> Result<()> {
+        let key = (height, dpi, palette, shadow);
         if self.mark.as_ref().is_some_and(|mark| mark.key == key) {
             return Ok(());
         }
@@ -649,10 +743,33 @@ impl Renderer {
         let (x, y) = (cx - left, cy - top);
         let edge = (MARK_BOX * s).ceil() as i32 + 1;
         let ring_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
+            if shadow {
+                let (sr, sa) = c.top_shadow();
+                c.ring_alpha(
+                    x / s,
+                    y / s + TOP_SHADOW_Y,
+                    MARK_RADIUS,
+                    MARK_STROKE,
+                    sr,
+                    sa,
+                )?;
+            }
             c.ring(x / s, y / s, MARK_RADIUS, MARK_STROKE, c.p.accent)
         })?;
         let core_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
             let (x, y, r) = (x / s, y / s, MARK_CORE);
+            if shadow {
+                let (sr, sa) = c.top_shadow();
+                c.fill(
+                    x - r,
+                    y - r + TOP_SHADOW_Y,
+                    x + r,
+                    y + r + TOP_SHADOW_Y,
+                    r,
+                    sr,
+                    sa,
+                )?;
+            }
             c.round(x - r, y - r, x + r, y + r, r, c.p.accent)
         })?;
         let core_goal = if open { 1. } else { 0. };

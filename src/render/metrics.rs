@@ -17,6 +17,7 @@ pub(super) struct MetricLayer {
     size: Dimensions,
     left: i32,
     palette: Palette,
+    shadow: bool,
     readings: Vec<Indicator>,
 }
 
@@ -31,8 +32,9 @@ impl Renderer {
             .top_state
             .as_ref()
             .and_then(|state| state.immersive_color);
-        let palette = self.palette.for_top_bar(caption);
-        if self.update_metrics(layout, dpi, metrics, palette)? {
+        let palette = self.palette.for_top_bar(self.top_background, caption);
+        let shadow = super::top_bar_shadow(self.top_background, caption);
+        if self.update_metrics(layout, dpi, metrics, palette, shadow)? {
             unsafe { self.device.Commit()? };
         }
         Ok(())
@@ -44,6 +46,7 @@ impl Renderer {
         dpi: u32,
         readings: &[Indicator],
         palette: Palette,
+        shadow: bool,
     ) -> Result<bool> {
         let slots = &layout.metrics;
         let (Some(first), Some(last)) = (slots.first(), slots.last()) else {
@@ -56,7 +59,7 @@ impl Renderer {
         let readings = &readings[..slots.len()];
         let size = (last.x + last.width - first.x, layout.height, dpi);
         if let Some(layer) = &mut self.metric_layer
-            && (layer.size, layer.palette) == (size, palette)
+            && (layer.size, layer.palette, layer.shadow) == (size, palette, shadow)
             && layer.readings == readings
         {
             if first.x == layer.left {
@@ -70,7 +73,15 @@ impl Renderer {
             for (r, indicator) in slots.iter().zip(readings) {
                 let l = (r.x - first.x) as f32 / c.scale;
                 let right = (r.x + r.width - first.x) as f32 / c.scale;
-                paint_indicator(c, &self.write, indicator, l, right, size.1 as f32 / c.scale)?;
+                paint_indicator(
+                    c,
+                    &self.write,
+                    indicator,
+                    l,
+                    right,
+                    size.1 as f32 / c.scale,
+                    shadow,
+                )?;
             }
             Ok(())
         })?;
@@ -89,6 +100,7 @@ impl Renderer {
                 size,
                 left: first.x,
                 palette,
+                shadow,
                 readings: readings.to_owned(),
             });
         }
@@ -103,6 +115,7 @@ fn paint_indicator(
     left: f32,
     right: f32,
     height: f32,
+    shadow: bool,
 ) -> Result<()> {
     let symbol = match indicator.metric {
         Metric::Cpu => Symbol::Chip,
@@ -116,25 +129,48 @@ fn paint_indicator(
     } else {
         c.p.ink
     };
+    let (shadow_rgb, shadow_alpha) = c.top_shadow();
+    let dy = super::TOP_SHADOW_Y;
     let cy = height / 2.;
     // The slot pads its content by half a gap on each side: the symbol starts the
     // content and the readout ends it.
     let (icon, pad) = (layout::BAR_ICON as f32, layout::BAR_GAP as f32 / 2.);
     let start = left + pad + icon;
     let end = right - pad;
+    if shadow {
+        c.symbol(
+            symbol,
+            start - icon / 2.,
+            cy + dy,
+            icon,
+            shadow_rgb,
+            shadow_alpha,
+        )?;
+    }
     c.symbol(symbol, start - icon / 2., cy, icon, ink, 1.)?;
     // Readings align to the end; the spacing before the readout absorbs small
     // differences between the reserved and the drawn text.
     let text = |value: &str, color| {
+        let style = Text {
+            size: layout::METRIC_TEXT,
+            align: DWRITE_TEXT_ALIGNMENT_TRAILING,
+            ..Text::default()
+        };
+        if shadow {
+            c.draw_text(
+                write,
+                value,
+                c.rect(start + 1., dy, end, height + dy),
+                style,
+                shadow_rgb,
+                shadow_alpha,
+            )?;
+        }
         c.draw_text(
             write,
             value,
             c.rect(start + 1., 0., end, height),
-            Text {
-                size: layout::METRIC_TEXT,
-                align: DWRITE_TEXT_ALIGNMENT_TRAILING,
-                ..Text::default()
-            },
+            style,
             color,
             1.,
         )
@@ -145,17 +181,48 @@ fn paint_indicator(
     let cx = (start + layout::METRIC_SPACING as f32 + end) / 2.;
     match indicator.style {
         Style::Value => text(&indicator.format_value(value), ink),
-        Style::Bars => c.symbol(Symbol::MeterBars(value), cx, cy, 18., ink, 1.),
-        Style::Ring => c.symbol_weighted(Symbol::MeterRing(value), cx, cy, 18., 2., ink, 1.),
-        Style::Graph => c.draw_shapes(
-            icon::history_trace(&indicator.history),
-            cx,
-            cy,
-            27.,
-            1.5,
-            ink,
-            1.,
-        ),
+        Style::Bars => {
+            if shadow {
+                c.symbol(
+                    Symbol::MeterBars(value),
+                    cx,
+                    cy + dy,
+                    18.,
+                    shadow_rgb,
+                    shadow_alpha,
+                )?;
+            }
+            c.symbol(Symbol::MeterBars(value), cx, cy, 18., ink, 1.)
+        }
+        Style::Ring => {
+            if shadow {
+                c.symbol_weighted(
+                    Symbol::MeterRing(value),
+                    cx,
+                    cy + dy,
+                    18.,
+                    2.,
+                    shadow_rgb,
+                    shadow_alpha,
+                )?;
+            }
+            c.symbol_weighted(Symbol::MeterRing(value), cx, cy, 18., 2., ink, 1.)
+        }
+        Style::Graph => {
+            let trace = icon::history_trace(&indicator.history);
+            if shadow {
+                c.draw_shapes(
+                    trace.clone(),
+                    cx,
+                    cy + dy,
+                    27.,
+                    1.5,
+                    shadow_rgb,
+                    shadow_alpha,
+                )?;
+            }
+            c.draw_shapes(trace, cx, cy, 27., 1.5, ink, 1.)
+        }
     }
 }
 

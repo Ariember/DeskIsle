@@ -73,9 +73,24 @@ impl Palette {
         299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) < 127_500
     }
 
-    /// Match the foreground of an opaque window-caption color (a Win32 COLORREF).
-    pub(super) fn for_top_bar(self, caption: Option<u32>) -> Self {
-        let Some(color) = caption else { return self };
+    /// Match the foreground of an opaque window-caption color (a Win32 COLORREF), or the
+    /// dark translucent scrim used by the gradient-mask top bar style.
+    pub(super) fn for_top_bar(self, style: TopBarBackground, caption: Option<u32>) -> Self {
+        let Some(color) = caption else {
+            return if style == TopBarBackground::Tinted {
+                Self {
+                    bar: (18, 20, 24),
+                    ink: (255, 255, 255),
+                    muted: (224, 228, 236),
+                    line: (255, 255, 255),
+                    accent: (255, 255, 255),
+                    danger: (255, 138, 128),
+                    ..self
+                }
+            } else {
+                self
+            };
+        };
         let [r, g, b, _] = color.to_le_bytes();
         let linear = |v: u8| {
             let v = f32::from(v) / 255.;
@@ -381,8 +396,46 @@ impl Canvas {
         Ok(())
     }
 
+    /// A stroke `width` DIPs thick centered along the rectangle's edges.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stroke_dip(
+        &self,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+        radius: f32,
+        width: f32,
+        color: Rgb,
+        a: f32,
+    ) -> Result<()> {
+        let shape = self.shape(l, t, r, b, radius);
+        unsafe {
+            self.ctx.DrawRoundedRectangle(
+                &shape,
+                &self.brush_alpha(color, a)?,
+                width * self.scale,
+                None,
+            )
+        };
+        Ok(())
+    }
+
     /// A circle outline `width` DIPs thick, centered on `x`, `y`.
     pub(super) fn ring(&self, x: f32, y: f32, radius: f32, width: f32, color: Rgb) -> Result<()> {
+        self.ring_alpha(x, y, radius, width, color, 1.)
+    }
+
+    /// A circle outline `width` DIPs thick with explicit opacity, centered on `x`, `y`.
+    pub(super) fn ring_alpha(
+        &self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        width: f32,
+        color: Rgb,
+        a: f32,
+    ) -> Result<()> {
         let mut ellipse = D2D1_ELLIPSE {
             radiusX: radius * self.scale,
             radiusY: radius * self.scale,
@@ -390,7 +443,7 @@ impl Canvas {
         };
         ellipse.point.X = self.origin.x as f32 + x * self.scale;
         ellipse.point.Y = self.origin.y as f32 + y * self.scale;
-        let brush = self.brush_alpha(color, 1.)?;
+        let brush = self.brush_alpha(color, a)?;
         unsafe {
             self.ctx
                 .DrawEllipse(&ellipse, &brush, width * self.scale, None)
@@ -410,17 +463,33 @@ impl Canvas {
         top: (Rgb, f32),
         bottom: (Rgb, f32),
     ) -> Result<()> {
+        self.gradient_stops(l, t, r, b, radius, &[(0., top), (1., bottom)])
+    }
+
+    /// Fills a rounded rectangle with a multi-stop vertical gradient.
+    pub(super) fn gradient_stops(
+        &self,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+        radius: f32,
+        stops: &[(f32, (Rgb, f32))],
+    ) -> Result<()> {
         let shape = self.shape(l, t, r, b, radius);
-        let stop = |((r, g, b), a): (Rgb, f32), position| D2D1_GRADIENT_STOP {
-            position,
-            color: color(r, g, b, a),
-        };
+        let stops: Vec<_> = stops
+            .iter()
+            .map(|&(position, ((r, g, b), a))| D2D1_GRADIENT_STOP {
+                position,
+                color: color(r, g, b, a),
+            })
+            .collect();
         unsafe {
             // The device context overload takes extra color-space arguments; the render
             // target one interpolates in gamma 2.2 like the rest of the UI.
             let target: &ID2D1RenderTarget = &self.ctx;
-            let stops = target.CreateGradientStopCollection(
-                &[stop(top, 0.), stop(bottom, 1.)],
+            let collection = target.CreateGradientStopCollection(
+                &stops,
                 D2D1_GAMMA_2_2,
                 D2D1_EXTEND_MODE_CLAMP,
             )?;
@@ -429,7 +498,9 @@ impl Canvas {
             line.startPoint.Y = shape.rect.top;
             line.endPoint.X = shape.rect.left;
             line.endPoint.Y = shape.rect.bottom;
-            let brush = self.ctx.CreateLinearGradientBrush(&line, None, &stops)?;
+            let brush = self
+                .ctx
+                .CreateLinearGradientBrush(&line, None, &collection)?;
             self.ctx.FillRoundedRectangle(&shape, &brush);
         }
         Ok(())
@@ -483,11 +554,57 @@ impl Canvas {
         frosted: bool,
     ) -> Result<()> {
         let (l, t, r, b) = (area.left, area.top, area.right, area.bottom);
+        let hairline = 1. / self.scale;
         match style {
-            TopBarBackground::Frosted if frosted => self.fill(l, t, r, b, 0., self.p.bar, 0.23),
-            TopBarBackground::Frosted => self.round(l, t, r, b, 0., self.p.bar),
+            TopBarBackground::Tinted => {
+                // Smooth ease-out dark scrim fading seamlessly to transparent at the bottom.
+                let scrim = (8, 10, 14);
+                self.gradient_stops(
+                    l,
+                    t,
+                    r,
+                    b,
+                    0.,
+                    &[
+                        (0.00, (scrim, 0.58)),
+                        (0.28, (scrim, 0.46)),
+                        (0.58, (scrim, 0.26)),
+                        (0.82, (scrim, 0.09)),
+                        (1.00, (scrim, 0.00)),
+                    ],
+                )
+            }
+            TopBarBackground::Frosted if frosted => {
+                let (top, bottom, edge) = if self.p.dark {
+                    (
+                        ((36, 38, 44), 0.34),
+                        ((16, 18, 22), 0.20),
+                        ((255, 255, 255), 0.10),
+                    )
+                } else {
+                    (
+                        ((255, 255, 255), 0.28),
+                        ((242, 245, 250), 0.16),
+                        ((0, 0, 0), 0.10),
+                    )
+                };
+                self.gradient(l, t, r, b, 0., top, bottom)?;
+                self.fill(l, b - hairline, r, b, 0., edge.0, edge.1)
+            }
+            TopBarBackground::Frosted => {
+                self.gradient(l, t, r, b, 0., (self.p.panel_top, 1.), (self.p.bar, 1.))?;
+                self.fill(l, b - hairline, r, b, 0., self.p.line, 0.12)
+            }
             TopBarBackground::Transparent => Ok(()),
-            TopBarBackground::Tinted => self.bar_glass(area, 0.),
+        }
+    }
+
+    /// Subtle drop shadow tint for foreground text and icons over translucent top bars.
+    pub(super) fn top_shadow(&self) -> (Rgb, f32) {
+        if self.p.light_ground() {
+            ((255, 255, 255), 0.55)
+        } else {
+            ((0, 0, 0), 0.38)
         }
     }
 
@@ -504,6 +621,41 @@ impl Canvas {
         let result = draw();
         unsafe { self.ctx.PopAxisAlignedClip() };
         result
+    }
+
+    /// Runs `draw` clipped to a rounded rectangle using an antialiased geometry mask.
+    pub(super) fn clipped_round(
+        &self,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+        radius: f32,
+        draw: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let shape = self.shape(l, t, r, b, radius);
+        unsafe {
+            let factory = self.ctx.GetFactory()?;
+            let mask: ID2D1Geometry = factory.CreateRoundedRectangleGeometry(&shape)?.into();
+            let mut transform = D2D1_LAYER_PARAMETERS1::default().maskTransform;
+            transform.M11 = 1.;
+            transform.M22 = 1.;
+            let mut params = D2D1_LAYER_PARAMETERS1 {
+                contentBounds: shape.rect,
+                geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: transform,
+                opacity: 1.,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+            };
+            self.ctx.PushLayer(&params, None);
+            let result = draw();
+            self.ctx.PopLayer();
+            std::mem::ManuallyDrop::drop(&mut params.geometricMask);
+            std::mem::ManuallyDrop::drop(&mut params.opacityBrush);
+            result
+        }
     }
 
     pub(super) fn bitmap(&self, bitmap: &IWICBitmapSource, rect: D2D_RECT_F) -> Result<()> {
@@ -871,5 +1023,28 @@ pub(super) fn text_format(
             &ellipsis,
         )?;
         Ok(format)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gradient_mask_top_bar_uses_light_foreground_in_both_themes() {
+        let settings = Settings::default();
+        for dark in [false, true] {
+            let base = Palette::new(dark, &settings);
+            let mask = base.for_top_bar(TopBarBackground::Tinted, None);
+            assert!(!mask.light_ground());
+            assert_eq!(mask.ink, (255, 255, 255));
+            assert_eq!(mask.accent, (255, 255, 255));
+            assert_eq!(base.for_top_bar(TopBarBackground::Frosted, None), base);
+            assert_eq!(base.for_top_bar(TopBarBackground::Transparent, None), base);
+            // Immersive maximized window color always overrides the desktop style.
+            let light_caption = base.for_top_bar(TopBarBackground::Tinted, Some(0x00F0_F0F0));
+            assert!(light_caption.light_ground());
+            assert_eq!(light_caption.ink, (0, 0, 0));
+        }
     }
 }
