@@ -201,9 +201,15 @@ impl Bars {
         let (Some(preview), Some(renderer)) = (&mut self.preview, self.renderer.as_mut()) else {
             return Ok(());
         };
-        let blur = (self.settings.enabled(Appearance(WindowCustom))
-            && self.settings.get(Appearance(WindowOpacity)) < 100)
-            .then(|| self.settings.get(Appearance(WindowBlur)));
+        let blur = if !platform::display::transparency().unwrap_or(false) {
+            None
+        } else if self.settings.enabled(Appearance(WindowCustom)) {
+            (self.settings.get(Appearance(WindowOpacity)) < 100
+                && self.settings.get(Appearance(WindowBlur)) > 0)
+                .then(|| self.settings.get(Appearance(WindowBlur)))
+        } else {
+            Some(70)
+        };
         if preview.blur != blur {
             // GDI presents the chrome as opaque pixels, so even clear glass needs
             // the pixels under the preview. A denied capture keeps the opaque fill.

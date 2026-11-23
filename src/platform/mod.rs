@@ -1055,8 +1055,15 @@ impl PanelWindow {
 
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
     /// height and the left and right edges of the close button, and `sidebar` the
-    /// sidebar's width, in client pixels.
-    pub fn create(r: Rect, caption: (i32, i32, i32), sidebar: i32, dark: bool) -> Result<Self> {
+    /// sidebar's width, in client pixels. When `dwm_acrylic` is false, DeskIsle's live
+    /// Liquid Glass compositor supplies the sidebar backdrop and DWM only frames the window.
+    pub fn create(
+        r: Rect,
+        caption: (i32, i32, i32),
+        sidebar: i32,
+        dark: bool,
+        dwm_acrylic: bool,
+    ) -> Result<Self> {
         PANEL_CAPTION.set(caption);
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -1074,17 +1081,15 @@ impl PanelWindow {
                 Some(instance.into()),
                 None,
             )?;
-            // Acrylic blurs whatever lies behind the window, like the vibrancy of a macOS
-            // sidebar. Builds before Windows 11 22H2 reject the attribute, and the
-            // renderer then paints over the sidebar opaquely.
             let backdrop = DWMSBT_TRANSIENTWINDOW;
-            let glass = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&raw const backdrop).cast(),
-                size_of_val(&backdrop) as u32,
-            )
-            .is_ok();
+            let glass = dwm_acrylic
+                && DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    (&raw const backdrop).cast(),
+                    size_of_val(&backdrop) as u32,
+                )
+                .is_ok();
             let window = Self(hwnd, glass);
             window.set_dark(dark);
             // Cosmetic only: builds without this attribute keep square corners.

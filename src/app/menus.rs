@@ -267,16 +267,29 @@ impl Bars {
         layout: &MenuLayout,
         folder: bool,
     ) -> Option<Backdrop> {
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(crate::render::Renderer::has_live_glass)
+            || !display::transparency().unwrap_or(false)
+        {
+            return None;
+        }
         let (custom, blur, opacity) = if folder {
             (FolderCustom, FolderBlur, FolderOpacity)
         } else {
             (MenuCustom, MenuBlur, MenuOpacity)
         };
-        let strength = self.settings.get(Appearance(blur));
-        if !self.settings.enabled(Appearance(custom))
-            || strength == 0
-            || self.settings.get(Appearance(opacity)) == 100
-        {
+        let strength = if self.settings.enabled(Appearance(custom)) {
+            if self.settings.get(Appearance(opacity)) >= 100 {
+                0
+            } else {
+                self.settings.get(Appearance(blur))
+            }
+        } else {
+            74
+        };
+        if strength == 0 {
             return None;
         }
         let (l, t, r, b) = layout.panel();

@@ -71,8 +71,14 @@ pub struct AboutWindow(pub HWND, bool);
 
 impl AboutWindow {
     /// Creates the hidden window at `r`, in screen pixels. `controls` are the clickable
-    /// areas, in client pixels.
-    pub fn create(r: Rect, controls: [(i32, i32, i32, i32); 2], dark: bool) -> Result<Self> {
+    /// areas, in client pixels. When `dwm_acrylic` is false, DeskIsle's live Liquid Glass
+    /// compositor supplies the backdrop while DWM keeps the rounded frame and shadow.
+    pub fn create(
+        r: Rect,
+        controls: [(i32, i32, i32, i32); 2],
+        dark: bool,
+        dwm_acrylic: bool,
+    ) -> Result<Self> {
         CONTROLS.set(controls);
         unsafe {
             let hwnd = CreateWindowExW(
@@ -89,16 +95,15 @@ impl AboutWindow {
                 Some(GetModuleHandleW(None)?.into()),
                 None,
             )?;
-            // Acrylic blurs the desktop behind the card, like the vibrancy of the macOS
-            // window. Builds before Windows 11 22H2 reject it and the card paints opaque.
             let backdrop = DWMSBT_TRANSIENTWINDOW;
-            let glass = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&raw const backdrop).cast(),
-                size_of_val(&backdrop) as u32,
-            )
-            .is_ok();
+            let glass = dwm_acrylic
+                && DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    (&raw const backdrop).cast(),
+                    size_of_val(&backdrop) as u32,
+                )
+                .is_ok();
             let window = Self(hwnd, glass);
             window.set_dark(dark);
             // Cosmetic only: builds without this attribute keep square corners.

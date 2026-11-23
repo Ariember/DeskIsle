@@ -61,6 +61,7 @@ impl Tones {
 /// The About card's composition target. It repaints only on hover and theme changes.
 pub(super) struct AboutView {
     hwnd: HWND,
+    glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     root: IDCompositionVisual2,
@@ -68,8 +69,8 @@ pub(super) struct AboutView {
 
 impl Renderer {
     /// Paints `layout` into `hwnd`, the About window, binding to it on first use and again
-    /// after the device was rebuilt. With `glass` the card stays translucent over the
-    /// backdrop DWM draws behind it.
+    /// after the device was rebuilt. With `backdrop > 0` the card renders translucent
+    /// Liquid Glass over the live desktop behind it.
     pub fn draw_about(
         &mut self,
         hwnd: HWND,
@@ -79,20 +80,52 @@ impl Renderer {
     ) -> Result<()> {
         if self.about.as_ref().map(|view| view.hwnd) != Some(hwnd) {
             self.close_about();
+            let glass_surface = self.glass.as_ref().and_then(|g| g.attach(hwnd).ok());
             unsafe {
                 let target = self.device.CreateTargetForHwnd(hwnd, true)?;
                 let root = self.device.CreateVisual()?;
                 target.SetRoot(&root)?;
                 self.about = Some(AboutView {
                     hwnd,
+                    glass: glass_surface,
                     _target: target,
                     root,
                 });
             }
         }
         let (width, height) = layout.pixels();
+        let scale = dpi as f32 / 96.;
+        let mut live_glass = false;
+        if let (Some(engine), Some(about_view)) = (&self.glass, self.about.as_mut())
+            && let Some(surface) = &mut about_view.glass
+        {
+            live_glass = backdrop > 0
+                && surface
+                    .update(
+                        engine,
+                        super::glass::GlassSpec {
+                            x: 0.,
+                            y: 0.,
+                            width: width as f32,
+                            height: height as f32,
+                            radius: 8. * scale,
+                            strength: backdrop,
+                            dark: self.palette.dark,
+                            dpi,
+                        },
+                    )
+                    .is_ok();
+            if !live_glass {
+                let _ = surface.hide();
+            }
+        }
+        let eff_backdrop = if live_glass || self.glass.is_none() {
+            backdrop
+        } else {
+            0
+        };
         let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-            self.paint_about(c, layout, backdrop)
+            self.paint_about(c, layout, eff_backdrop)
         })?;
         let view = self.about.as_ref().expect("about card bound above");
         unsafe {
@@ -134,15 +167,24 @@ impl Renderer {
         let t = Tones::new(c.p.dark);
         let (w, h) = (layout.width, layout.height);
         if backdrop > 0 {
-            let (tint, alpha) = t.glass;
-            c.fill(
-                0.,
-                0.,
-                w,
-                h,
-                0.,
-                tint,
-                1. - (1. - alpha) * backdrop as f32 / 100.,
+            let (tint, _) = t.glass;
+            let strength = backdrop as f32 / 100.;
+            let opacity = 1. - 0.74 * strength;
+            let top_tint = if c.p.dark {
+                (42, 48, 64)
+            } else {
+                (252, 254, 255)
+            };
+            c.liquid_glass_shell(
+                Area::new(0., 0., w, h),
+                8.,
+                super::glass::LiquidShell {
+                    top_tint,
+                    bottom_tint: tint,
+                    opacity,
+                    rim: 0.85 * strength,
+                    glass_active: true,
+                },
             )?;
         } else {
             c.gradient(0., 0., w, h, 0., (t.top, 1.), (t.bottom, 1.))?;

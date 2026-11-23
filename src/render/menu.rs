@@ -20,7 +20,7 @@ use super::{Renderer, ease};
 
 /// The panel's corner radius. The highlight inside it, inset by the panel padding,
 /// uses a radius that keeps both corners concentric.
-const MENU_RADIUS: f32 = 12.;
+const MENU_RADIUS: f32 = 16.;
 const HIGHLIGHT_RADIUS: f32 = MENU_RADIUS - menu::PADDING;
 /// Diameter of the round backing every icon of a menu row sits on.
 const ICON_BADGE: f32 = menu::ICON_BADGE;
@@ -41,6 +41,7 @@ const HOVER_DURATION: f32 = 0.09;
 /// The open context menu. Its surfaces are painted once; pointer movement only animates
 /// the highlight's offset and opacity in the compositor.
 pub(super) struct MenuView {
+    _glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     _root: IDCompositionVisual2,
@@ -133,41 +134,90 @@ impl Renderer {
         self.close_menu();
         let (width, height) = layout.pixels();
         let (left, top, right, bottom) = layout.panel();
-        let (custom, opacity, border) = if menu.folder_icon_size.is_some() {
-            (FolderCustom, FolderOpacity, FolderBorder)
+        let (custom_key, blur_key, opacity_key, border_key) = if menu.folder_icon_size.is_some() {
+            (FolderCustom, FolderBlur, FolderOpacity, FolderBorder)
         } else {
-            (MenuCustom, MenuOpacity, MenuBorder)
+            (MenuCustom, MenuBlur, MenuOpacity, MenuBorder)
         };
-        let custom = self.appearance.enabled(Appearance(custom));
-        let (opacity, border) = if custom {
-            (
-                self.appearance.get(Appearance(opacity)) as f32 / 100.,
-                self.appearance.get(Appearance(border)) as f32 / 100.,
-            )
+        let custom = self.appearance.enabled(Appearance(custom_key));
+        let (blur_strength, mut opacity, mut rim) = if !self.transparency {
+            (0, 0.96, 0.55)
+        } else if custom {
+            let op = self.appearance.get(Appearance(opacity_key)) as f32 / 100.;
+            let br = self.appearance.get(Appearance(border_key)) as f32 / 100.;
+            let blur = if op >= 1. {
+                0
+            } else {
+                self.appearance.get(Appearance(blur_key))
+            };
+            (blur, op, 0.35 + 1.15 * br)
         } else {
-            (0.985, 0.12)
+            (74, if self.palette.dark { 0.24 } else { 0.22 }, 1.08)
+        };
+
+        let mut glass_surface = None;
+        if blur_strength > 0
+            && let Some(engine) = &self.glass
+            && let Ok(mut surface) = engine.attach(hwnd)
+        {
+            let spec = super::glass::GlassSpec {
+                x: left * layout.scale,
+                y: top * layout.scale,
+                width: (right - left) * layout.scale,
+                height: (bottom - top) * layout.scale,
+                radius: MENU_RADIUS * layout.scale,
+                strength: blur_strength,
+                dark: self.palette.dark,
+                dpi,
+            };
+            if surface.update(engine, spec).is_ok() {
+                if animate {
+                    let _ = surface.animate_open(engine, width, height, OPEN_DURATION);
+                }
+                glass_surface = Some(surface);
+            }
+        }
+        let glass_active = glass_surface.is_some() || (blur_strength > 0 && backdrop.is_some());
+        if !glass_active && !custom {
+            opacity = 0.96;
+            rim = 0.62;
+        }
+        let (top_tint, bottom_tint) = if self.palette.dark {
+            ((38, 46, 62), (18, 22, 32))
+        } else {
+            ((252, 254, 255), (235, 243, 252))
         };
         let background = paint(&self.device, self.palette, width, height, dpi, |c| {
             let area = Area::new(left, top, right, bottom);
             c.shadow(
                 area,
                 MENU_RADIUS,
-                menu::SHADOW - 2.,
-                if custom { opacity } else { 1. },
+                menu::SHADOW - 1.5,
+                if custom { opacity.max(0.35) } else { 0.85 },
             )?;
-            if let Some(image) = backdrop {
-                c.backdrop(image, area, MENU_RADIUS)?;
+            if glass_surface.is_none()
+                && blur_strength > 0
+                && let Some(image) = backdrop
+            {
+                c.liquid_backdrop(
+                    image,
+                    area,
+                    MENU_RADIUS,
+                    blur_strength as f32 / 100.,
+                    c.p.dark,
+                )?;
             }
-            c.gradient(
-                left,
-                top,
-                right,
-                bottom,
+            c.liquid_glass_shell(
+                area,
                 MENU_RADIUS,
-                (c.p.panel_top, opacity),
-                (c.p.panel, opacity),
-            )?;
-            c.stroke(left, top, right, bottom, MENU_RADIUS, c.p.line, border)
+                super::glass::LiquidShell {
+                    top_tint,
+                    bottom_tint,
+                    opacity,
+                    rim,
+                    glass_active,
+                },
+            )
         })?;
         let content = paint(&self.device, self.palette, width, height, dpi, |c| {
             for (index, entry) in menu.entries.iter().enumerate() {
@@ -192,8 +242,8 @@ impl Renderer {
             }
         }
         let (row_left, _, row_right, _) = layout.row(0);
-        // A plain rounded wash, the same shape the status bar uses behind its targets.
-        let highlight = |accent: Rgb, alpha: f32| {
+        // A Liquid Glass pill wash with a delicate specular rim behind the hovered row.
+        let highlight = |accent: Rgb, alpha: f32, rim: f32| {
             paint(
                 &self.device,
                 self.palette,
@@ -202,12 +252,23 @@ impl Renderer {
                 dpi,
                 |c| {
                     let (w, h) = (row_right - row_left, menu::ITEM_HEIGHT);
-                    c.fill(0., 1., w, h - 1., HIGHLIGHT_RADIUS, accent, alpha)
+                    c.liquid_pill(
+                        Area::new(0., 1., w, h - 1.),
+                        HIGHLIGHT_RADIUS,
+                        accent,
+                        alpha,
+                        rim,
+                    )
                 },
             )
         };
-        let accent = highlight(self.palette.accent, 0.1)?;
-        let danger = highlight(self.palette.danger, 0.12)?;
+        let pill_tint = if self.palette.dark {
+            (215, 232, 255)
+        } else {
+            (255, 255, 255)
+        };
+        let accent = highlight(pill_tint, if self.palette.dark { 0.14 } else { 0.34 }, 0.42)?;
+        let danger = highlight(self.palette.danger, 0.18, 0.45)?;
         unsafe {
             let target = self.device.CreateTargetForHwnd(hwnd, true)?;
             let root = self.device.CreateVisual()?;
@@ -244,6 +305,7 @@ impl Renderer {
             target.SetRoot(&root)?;
             self.device.Commit()?;
             self.menu = Some(MenuView {
+                _glass: glass_surface,
                 _target: target,
                 _root: root,
                 content,
@@ -305,34 +367,59 @@ impl Renderer {
         let size = ((w * s).round() as i32, (h * s).round() as i32);
         paint(&self.device, self.palette, size.0, size.1, dpi, |c| {
             let radius = h / 2.;
-            c.fill(0., 0., w, h, radius, c.p.line, 0.1)?;
+            let track_tint = if c.p.dark {
+                (205, 222, 248)
+            } else {
+                (255, 255, 255)
+            };
+            c.liquid_pill(
+                Area::new(0., 0., w, h),
+                radius,
+                track_tint,
+                if c.p.dark { 0.12 } else { 0.32 },
+                if c.p.dark { 0.30 } else { 0.48 },
+            )?;
             let button = Area::new(0., 0., h, h);
             let Some(value) = slider.value else {
                 return c.symbol_in(slider.symbol, button, SLIDER_ICON, c.p.muted, 0.6);
             };
             let x = radius + (w - h) * f32::from(value.min(100)) / 100.;
-            c.fill(0., 0., x + radius, h, radius, c.p.accent, 1.)?;
+            let fill_area = Area::new(0., 0., x + radius, h);
+            c.liquid_pill(fill_area, radius, c.p.accent, 0.86, 0.62)?;
             let knob = radius - 1.5;
+            let knob_area = Area::new(x - knob, radius - knob, x + knob, radius + knob);
             c.fill(
-                x - knob,
-                radius - knob,
-                x + knob,
-                radius + knob,
+                knob_area.left,
+                knob_area.top + 0.8,
+                knob_area.right,
+                knob_area.bottom + 0.8,
                 knob,
-                c.p.panel_top,
-                1.,
+                (0, 0, 0),
+                0.20,
+            )?;
+            c.gradient_stops(
+                knob_area.left,
+                knob_area.top,
+                knob_area.right,
+                knob_area.bottom,
+                knob,
+                &[
+                    (0.00, ((255, 255, 255), 0.98)),
+                    (0.65, ((240, 246, 255), 0.94)),
+                    (1.00, ((222, 234, 250), 0.96)),
+                ],
             )?;
             c.stroke(
-                x - knob,
-                radius - knob,
-                x + knob,
-                radius + knob,
+                knob_area.left,
+                knob_area.top,
+                knob_area.right,
+                knob_area.bottom,
                 knob,
-                c.p.line,
-                0.25,
+                (255, 255, 255),
+                0.85,
             )?;
             // The knob covers the icon at the low end of the range.
-            let ink = if x < h { c.p.ink } else { c.p.on_accent };
+            let ink = if x < h { (24, 28, 36) } else { c.p.on_accent };
             c.symbol_in(slider.symbol, button, SLIDER_ICON, ink, 1.)
         })
     }
@@ -472,15 +559,10 @@ impl Renderer {
         Ok(())
     }
 
-    /// A circle of `size` centered on `x`, `y`: filled with the accent when `on`,
-    /// otherwise a faint wash.
+    /// A Liquid Glass orb of `size` centered on `x`, `y`: radiant accent glass when
+    /// `on`, translucent crystal droplet otherwise.
     fn backing(c: &Canvas, x: f32, y: f32, size: f32, on: bool) -> Result<()> {
-        let r = size / 2.;
-        if on {
-            c.fill(x - r, y - r, x + r, y + r, r, c.p.accent, 1.)
-        } else {
-            c.fill(x - r, y - r, x + r, y + r, r, c.p.line, 0.09)
-        }
+        c.liquid_orb(x, y, size, c.p.accent, on)
     }
 
     /// An icon in a circle, filled with the accent when `on`.
@@ -555,10 +637,20 @@ impl Renderer {
             Entry::Slider(_) => Ok(()),
             Entry::Calendar(calendar) => self.paint_calendar(c, calendar, layout, index),
             Entry::Tiles(tiles) => {
+                let card_tint = if c.p.dark {
+                    (210, 228, 252)
+                } else {
+                    (255, 255, 255)
+                };
                 for (part, tile) in tiles.iter().enumerate() {
                     let (l, t, r, b) = layout.tile(index, part, tiles.len());
-                    c.fill(l, t, r, b, 10., c.p.line, 0.055)?;
-                    c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
+                    c.liquid_pill(
+                        Area::new(l, t, r, b),
+                        12.,
+                        card_tint,
+                        if c.p.dark { 0.10 } else { 0.30 },
+                        if c.p.dark { 0.28 } else { 0.46 },
+                    )?;
                     let y = (t + b) / 2.;
                     // Three tiles share the fixed dropdown width; keep their text room.
                     self.badge(c, tile.symbol, l + 6. + 14., y, 28., tile.on)?;
@@ -587,11 +679,27 @@ impl Renderer {
                 buttons,
             } => {
                 let (l, t, r, b) = layout.block(index);
-                c.fill(l, t, r, b, 10., c.p.line, 0.055)?;
-                c.stroke(l, t, r, b, 10., c.p.line, 0.07)?;
+                let card_tint = if c.p.dark {
+                    (210, 228, 252)
+                } else {
+                    (255, 255, 255)
+                };
+                c.liquid_pill(
+                    Area::new(l, t, r, b),
+                    12.,
+                    card_tint,
+                    if c.p.dark { 0.10 } else { 0.30 },
+                    if c.p.dark { 0.28 } else { 0.46 },
+                )?;
                 let y = (t + b) / 2.;
-                c.fill(l + 8., y - 18., l + 44., y + 18., 8., c.p.line, 0.08)?;
                 let art = Area::new(l + 8., y - 18., l + 44., y + 18.);
+                c.liquid_pill(
+                    art,
+                    9.,
+                    card_tint,
+                    if c.p.dark { 0.12 } else { 0.34 },
+                    if c.p.dark { 0.28 } else { 0.44 },
+                )?;
                 c.symbol_in(PLAYER_SYMBOL, art, 18., c.p.muted, 1.)?;
                 let text_right = if buttons.is_empty() {
                     r - 8.

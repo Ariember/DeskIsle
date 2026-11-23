@@ -489,8 +489,8 @@ pub const SCHEMA: &[Spec] = &[
         key: Key::Backdrop,
         id: "general.backdrop",
         section: Section::General,
-        label: "毛玻璃效果强度",
-        help: "调整设置侧栏和关于本机的背景透视效果",
+        label: "液态玻璃效果强度",
+        help: "调整设置侧栏和关于本机的折射与透视强度",
         control: Control::Slider {
             min: 0,
             max: 100,
@@ -796,14 +796,14 @@ pub const SCHEMA: &[Spec] = &[
             },
             Choice {
                 id: "frosted",
-                label: "毛玻璃",
+                label: "液态玻璃",
             },
             Choice {
                 id: "transparent",
                 label: "透明",
             },
         ]),
-        default: 0,
+        default: 1,
         store: Store::File,
     },
     Spec {
@@ -1167,19 +1167,19 @@ pub const SCHEMA: &[Spec] = &[
         A::DockSkin,
         "appearance.dock_skin",
         "Dock 皮肤",
-        "选择 Dock 底板的样式",
+        "选择 Dock 液态玻璃底板的样式",
         Control::Choice(&[
             Choice {
                 id: "default",
-                label: "默认",
+                label: "液态玻璃",
             },
             Choice {
                 id: "frosted",
-                label: "磨砂",
+                label: "冰晶",
             },
             Choice {
                 id: "ink",
-                label: "墨色",
+                label: "黑曜",
             },
         ]),
         0,

@@ -914,6 +914,7 @@ impl Bars {
             Renderer::new(self.top.0, self.bottom.0, self.dark(), &self.settings)
                 .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
         );
+        self.sync_bar_backdrops();
         self.draw_frame()?;
         self.paint_preview()?;
         self.paint_panel()?;

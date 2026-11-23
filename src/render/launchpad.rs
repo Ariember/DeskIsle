@@ -33,6 +33,7 @@ const DEEPEN: f32 = 0.26;
 
 pub(super) struct LaunchpadView {
     hwnd: HWND,
+    glass: Option<super::glass::GlassSurface>,
     bar: Bar,
     highlight: IDCompositionVisual2,
     fade: IDCompositionEffectGroup,
@@ -60,6 +61,7 @@ impl Renderer {
     ) -> Result<()> {
         if self.launchpad.as_ref().map(|v| v.hwnd) != Some(hwnd) {
             let bar = Bar::new(&self.device, hwnd)?;
+            let glass = self.glass.as_ref().and_then(|g| g.attach(hwnd).ok());
             unsafe {
                 let highlight = self.device.CreateVisual()?;
                 let fade = self.device.CreateEffectGroup()?;
@@ -73,6 +75,7 @@ impl Renderer {
                 bar.root.AddVisual(&veil, false, None)?;
                 self.launchpad = Some(LaunchpadView {
                     hwnd,
+                    glass,
                     bar,
                     highlight,
                     fade,
@@ -104,7 +107,7 @@ impl Renderer {
                 (w * scale).ceil() as i32,
                 (h * scale).ceil() as i32,
                 layout.dpi,
-                |c| c.fill(0., 0., w, h, 12., WHITE, 0.095),
+                |c| c.liquid_pill(Area::new(0., 0., w, h), 14., WHITE, 0.12, 0.36),
             )?;
             unsafe { view.highlight.SetContent(&glow)? };
             for tile in &layout.tiles {
@@ -159,6 +162,36 @@ impl Renderer {
             unsafe { view.veil.SetContent(&veil)? };
             view.veil_key = Some(key);
         }
+        let custom = self.appearance.enabled(Appearance(LaunchpadCustom));
+        let strength = if custom {
+            self.appearance.get(Appearance(LaunchpadBlur))
+        } else {
+            68
+        };
+        let want_live =
+            self.transparency && backdrop.is_none() && (!custom || (acrylic && strength > 0));
+        let mut live_glass = false;
+        if let (Some(engine), Some(surface)) = (&self.glass, &mut view.glass) {
+            live_glass = want_live
+                && surface
+                    .update(
+                        engine,
+                        super::glass::GlassSpec {
+                            x: 0.,
+                            y: 0.,
+                            width: layout.width as f32,
+                            height: layout.height as f32,
+                            radius: 0.,
+                            strength,
+                            dark: true,
+                            dpi: layout.dpi,
+                        },
+                    )
+                    .is_ok();
+            if !live_glass {
+                let _ = surface.hide();
+            }
+        }
         let surface = paint(
             &self.device,
             p,
@@ -167,19 +200,15 @@ impl Renderer {
             layout.dpi,
             |c| {
                 let (w, h) = (layout.width as f32 / scale, layout.height as f32 / scale);
-                let (top, bottom) = if self.appearance.enabled(Appearance(LaunchpadCustom)) {
-                    if let Some(image) = backdrop {
-                        c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
-                    }
-                    let strength = self.appearance.get(Appearance(LaunchpadBlur)) as f32 / 100.;
-                    let tint = if acrylic {
-                        0.26 + strength * 0.30
-                    } else {
-                        0.48
-                    };
-                    (tint, tint + 0.04)
+                let blur_f = strength as f32 / 100.;
+                let (top, bottom) = if let Some(image) = backdrop {
+                    c.liquid_backdrop(image, Area::new(0., 0., w, h), 0., blur_f, true)?;
+                    (0.28, 0.34)
+                } else if live_glass || acrylic {
+                    let tint = 0.22 + (1. - blur_f) * 0.20;
+                    (tint, tint + 0.06)
                 } else {
-                    (0.82, 0.84)
+                    (0.84, 0.88)
                 };
                 c.gradient(
                     0.,
@@ -187,27 +216,16 @@ impl Renderer {
                     w,
                     h,
                     0.,
-                    ((29, 30, 33), top),
-                    ((22, 23, 25), bottom),
+                    ((24, 28, 38), top),
+                    ((16, 20, 28), bottom),
                 )?;
                 let search = layout.search;
-                c.fill(
-                    search.left,
-                    search.top,
-                    search.right,
-                    search.bottom,
-                    7.,
+                c.liquid_pill(
+                    search,
+                    (search.bottom - search.top) * 0.5,
                     WHITE,
-                    0.09,
-                )?;
-                c.stroke(
-                    search.left,
-                    search.top,
-                    search.right,
-                    search.bottom,
-                    7.,
-                    WHITE,
-                    0.34,
+                    0.12,
+                    0.46,
                 )?;
                 let searching = !query.is_empty();
                 let glass_x = if searching {

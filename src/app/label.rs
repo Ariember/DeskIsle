@@ -64,7 +64,9 @@ impl Bars {
             height,
         };
         let blur = self.settings.get(Key::Appearance(A::LabelBlur));
-        let image = (blur > 0 && self.settings.get(Key::Appearance(A::LabelOpacity)) < 100)
+        let image = (!renderer.has_live_glass()
+            && blur > 0
+            && self.settings.get(Key::Appearance(A::LabelOpacity)) < 100)
             .then(|| Backdrop::capture(rect, blur, false).ok())
             .flatten();
         let window = LabelWindow::create(self.bottom.0, rect)?;

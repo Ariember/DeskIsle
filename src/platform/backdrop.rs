@@ -33,9 +33,16 @@ impl Drop for MemoryDc {
 
 impl Backdrop {
     pub fn capture(rect: Rect, blur: i32, wallpaper: bool) -> Result<Self> {
-        let sample = 1. + 0.32 * blur.clamp(0, 100) as f64;
-        let width = (rect.width as f64 / sample).ceil().max(1.) as i32;
-        let height = (rect.height as f64 / sample).ceil().max(1.) as i32;
+        // Keep enough detail for GPU optical meniscus refraction and smooth Gaussian
+        // diffusion; only large full-screen snapshots step down slightly to cap memory.
+        let area = i64::from(rect.width.max(1)) * i64::from(rect.height.max(1));
+        let scale = if area > 800_000 {
+            1.6 + 0.004 * blur.clamp(0, 100) as f64
+        } else {
+            1.0
+        };
+        let width = (rect.width as f64 / scale).ceil().max(1.) as i32;
+        let height = (rect.height as f64 / scale).ceil().max(1.) as i32;
         Self::sample(rect, width, height, wallpaper)
     }
 

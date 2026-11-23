@@ -7,8 +7,11 @@ use windows::Win32::{Foundation::HWND, Graphics::DirectWrite::DWRITE_TEXT_ALIGNM
 use windows::core::Result;
 
 pub(crate) struct LabelView {
+    _glass: Option<super::glass::GlassSurface>,
     _bar: Bar,
 }
+
+const LABEL_RADIUS: f32 = 9.;
 
 impl Renderer {
     pub(crate) fn draw_label(
@@ -20,8 +23,40 @@ impl Renderer {
         image: Option<&Backdrop>,
     ) -> Result<LabelView> {
         let bar = Bar::new(&self.device, hwnd)?;
+        let scale = dpi as f32 / 96.;
+        let blur = self.appearance.get(Key::Appearance(A::LabelBlur));
         let opacity = self.appearance.get(Key::Appearance(A::LabelOpacity)) as f32 / 100.;
         let border = self.appearance.get(Key::Appearance(A::LabelBorder)) as f32 / 100.;
+        let strength = if !self.transparency || opacity >= 1. {
+            0
+        } else {
+            blur
+        };
+        let mut glass_surface = None;
+        if strength > 0
+            && let Some(engine) = &self.glass
+            && let Ok(mut surface) = engine.attach(hwnd)
+        {
+            let spec = super::glass::GlassSpec {
+                x: 0.,
+                y: 0.,
+                width: rect.width as f32,
+                height: rect.height as f32,
+                radius: LABEL_RADIUS * scale,
+                strength,
+                dark: self.palette.dark,
+                dpi,
+            };
+            if surface.update(engine, spec).is_ok() {
+                glass_surface = Some(surface);
+            }
+        }
+        let glass_active = glass_surface.is_some() || (strength > 0 && image.is_some());
+        let (top_tint, bottom_tint) = if self.palette.dark {
+            ((38, 46, 62), (18, 22, 32))
+        } else {
+            ((252, 254, 255), (235, 243, 252))
+        };
         let surface = paint(
             &self.device,
             self.palette,
@@ -31,11 +66,29 @@ impl Renderer {
             |c| {
                 let w = rect.width as f32 / c.scale;
                 let h = rect.height as f32 / c.scale;
-                if let Some(image) = image {
-                    c.backdrop(image, Area::new(0., 0., w, h), 7.)?;
+                let area = Area::new(0., 0., w, h);
+                if glass_surface.is_none()
+                    && strength > 0
+                    && let Some(image) = image
+                {
+                    c.liquid_backdrop(image, area, LABEL_RADIUS, strength as f32 / 100., c.p.dark)?;
                 }
-                c.fill(0., 0., w, h, 7., c.p.panel, opacity)?;
-                c.stroke(0., 0., w, h, 7., c.p.edge, border)?;
+                let eff_opacity = if glass_active {
+                    opacity * (1. - 0.50 * (strength as f32 / 100.) * (1. - opacity))
+                } else {
+                    opacity.max(0.88)
+                };
+                c.liquid_glass_shell(
+                    area,
+                    LABEL_RADIUS,
+                    super::glass::LiquidShell {
+                        top_tint,
+                        bottom_tint,
+                        opacity: eff_opacity,
+                        rim: 0.38 + 0.95 * border,
+                        glass_active,
+                    },
+                )?;
                 c.draw_text(
                     &self.write,
                     text,
@@ -54,6 +107,9 @@ impl Renderer {
             bar.root.SetContent(&surface)?;
             self.device.Commit()?;
         }
-        Ok(LabelView { _bar: bar })
+        Ok(LabelView {
+            _glass: glass_surface,
+            _bar: bar,
+        })
     }
 }

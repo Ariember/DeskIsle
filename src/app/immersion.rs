@@ -44,6 +44,11 @@ impl Bars {
     }
 
     pub(super) fn sync_dock_backdrop(&mut self) {
+        if !self.dock_shown()
+            && let Some(renderer) = self.renderer.as_mut()
+        {
+            renderer.hide_dock_glass();
+        }
         let region = self
             .dock_glass_requested
             .filter(|_| self.dock_shown())

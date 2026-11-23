@@ -197,24 +197,31 @@ impl Bars {
     pub(super) fn paint_launchpad(&mut self) -> Result<()> {
         let dropping = self.dropping_on_launchpad();
         if let (Some(pad), Some(renderer)) = (&mut self.launchpad, self.renderer.as_mut()) {
-            let wallpaper = self.settings.enabled(Appearance(LaunchpadWallpaper));
-            let blur = self.settings.get(Appearance(LaunchpadBlur));
-            let background =
-                self.settings
-                    .enabled(Appearance(LaunchpadCustom))
-                    .then(|| LaunchpadBackground {
-                        rect: pad.rect,
-                        blur,
-                        wallpaper,
-                        dynamic: !wallpaper
-                            && self.settings.enabled(Appearance(LaunchpadDynamic))
-                            && platform::display::transparency().unwrap_or(false),
-                    });
+            let live_glass = renderer.has_live_glass();
+            let custom = self.settings.enabled(Appearance(LaunchpadCustom));
+            let wallpaper = custom && self.settings.enabled(Appearance(LaunchpadWallpaper));
+            let blur = if custom {
+                self.settings.get(Appearance(LaunchpadBlur))
+            } else {
+                68
+            };
+            let dynamic = !wallpaper
+                && (!custom || self.settings.enabled(Appearance(LaunchpadDynamic)))
+                && platform::display::transparency().unwrap_or(false);
+            let background = Some(LaunchpadBackground {
+                rect: pad.rect,
+                blur,
+                wallpaper,
+                dynamic,
+            });
             if pad.background != background {
-                let dynamic = background.is_some_and(|bg| bg.dynamic && bg.blur > 0);
-                pad.acrylic = platform::set_window_backdrop(pad.window.0, dynamic, true);
+                let want_dwm = !live_glass && dynamic && blur > 0;
+                pad.acrylic = platform::set_window_backdrop(pad.window.0, want_dwm, true);
                 pad.snapshot = background.and_then(|bg| {
-                    if pad.acrylic || (bg.dynamic && bg.blur == 0) {
+                    if (live_glass && bg.dynamic) || pad.acrylic || (bg.dynamic && bg.blur == 0) {
+                        return None;
+                    }
+                    if !custom && !platform::display::transparency().unwrap_or(false) {
                         return None;
                     }
                     Backdrop::behind(pad.window.0, pad.rect, bg.blur, bg.wallpaper).ok()
@@ -227,7 +234,7 @@ impl Bars {
                 &pad.paths,
                 &pad.query,
                 pad.snapshot.as_ref(),
-                pad.acrylic,
+                pad.acrylic || (live_glass && dynamic && blur > 0),
             )?;
             if pad.hover.is_some() {
                 renderer.hover_launchpad(&pad.layout, pad.hover)?;

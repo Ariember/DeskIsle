@@ -24,11 +24,10 @@ pub(super) struct Panel {
     pressed: Option<Action>,
 }
 
-/// The sidebar shows its backdrop only where DWM draws acrylic: the build supports it and
-/// transparency effects are on. Otherwise the opaque sidebar looks better than the flat
-/// fill DWM substitutes. An unreadable preference counts as off.
-fn glass(window: &PanelWindow) -> bool {
-    window.backdrop() && display::transparency().unwrap_or(false)
+/// The sidebar shows its backdrop when transparency effects are on and either DeskIsle's
+/// live Liquid Glass compositor or DWM acrylic is available.
+fn glass(window: &PanelWindow, live_glass: bool) -> bool {
+    display::transparency().unwrap_or(false) && (live_glass || window.backdrop())
 }
 
 /// Settings saved by the user, falling back to defaults with a message when the file
@@ -116,13 +115,36 @@ impl Bars {
             None
         };
 
+        let transparency = display::transparency().unwrap_or(false);
+        let mut live_glass = false;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_transparency(transparency);
+            live_glass = renderer.has_live_glass();
+        }
+
         let frosted = if custom {
-            level(A::TopBlur) > 0
+            level(A::TopBlur) > 0 && level(A::TopOpacity) < 100
         } else {
             self.settings.top_bar_background() == TopBarBackground::Frosted
         };
-        let dock_frosted = level(A::DockCustom) != 0 && level(A::DockBlur) > 0;
-        let glass = (frosted || dock_frosted) && display::transparency().unwrap_or(false);
+        if live_glass {
+            // Live Liquid Glass runs via Windows.UI.Composition underneath DComp; keep
+            // legacy DWM system backdrops off so inactive windows never gray out or bleed.
+            self.dock_glass_requested = None;
+            self.sync_dock_backdrop();
+            if self.top_glass_theme.take().is_some() {
+                self.top.set_top_backdrop(false, false);
+            }
+            self.top_glass = transparency && frosted;
+            return;
+        }
+
+        let dock_frosted = if level(A::DockCustom) != 0 {
+            level(A::DockBlur) > 0 && level(A::DockOpacity) < 100
+        } else {
+            true
+        };
+        let glass = (frosted || dock_frosted) && transparency;
         let dark = glass.then(|| self.dark());
         let theme = dark.filter(|_| frosted);
         self.dock_glass_requested = dark.filter(|_| dock_frosted);
@@ -158,6 +180,7 @@ impl Bars {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
+        let live_glass = renderer.has_live_glass();
         let repalette = renderer.set_appearance(dark, &self.settings);
         self.retheme_about(dark, repalette)?;
         if repalette {
@@ -168,7 +191,7 @@ impl Bars {
         let Some(panel) = self.panel.as_mut() else {
             return Ok(());
         };
-        let glass = glass(&panel.window);
+        let glass = glass(&panel.window, live_glass);
         if !repalette && glass == panel.glass {
             return Ok(());
         }
@@ -195,14 +218,19 @@ impl Bars {
         let dpi = panel_dpi(self.monitor.dpi, self.monitor.work);
         let mut state = PanelState::default();
         let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work);
+        let live_glass = self
+            .renderer
+            .as_ref()
+            .is_some_and(crate::render::Renderer::has_live_glass);
         let window = PanelWindow::create(
             layout.place(self.monitor.work),
             layout.caption_pixels(),
             layout.sidebar_pixels(),
             self.dark(),
+            !live_glass,
         )?;
         self.panel = Some(Panel {
-            glass: glass(&window),
+            glass: glass(&window, live_glass),
             window,
             pressed: None,
             state,

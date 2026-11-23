@@ -98,41 +98,47 @@ fn top_bar_preview(c: &Canvas, a: Area, style: TopBarBackground) -> Result<()> {
     };
     let dy = 0.7;
     c.clipped_round(l, t, r, b, 7., || {
-        c.gradient(l, t, r, b, 0., ((118, 152, 186), 1.), ((184, 206, 222), 1.))?;
-        for (x, y, start, end) in [
-            (0.30, 5., (156, 114, 232), (52, 68, 158)),
-            (0.17, 15., (224, 134, 212), (132, 54, 134)),
-            (0.02, 26., (255, 174, 146), (197, 79, 119)),
-            (-0.18, 37., (255, 212, 138), (231, 114, 90)),
-        ] {
-            let band = |spread: f32, alpha| {
-                c.gradient(
-                    l + w * x - spread,
-                    t + y - spread,
-                    l + w * (x + 0.66) + spread,
-                    b + 34. + spread,
-                    32. + spread,
-                    (start, alpha),
-                    (end, alpha),
-                )
-            };
-            if style == TopBarBackground::Frosted {
-                // Feather the miniature's wallpaper, which is drawn inside the panel
-                // rather than behind a separate window with a real DWM backdrop.
-                for (spread, alpha) in [
-                    (6., 0.08),
-                    (4., 0.16),
-                    (2., 0.24),
-                    (0., 0.32),
-                    (-2., 0.44),
-                    (-4., 0.67),
-                    (-6., 1.),
-                ] {
-                    band(spread, alpha)?;
+        let draw_wallpaper = |feathered: bool| -> Result<()> {
+            c.gradient(l, t, r, b, 0., ((106, 144, 196), 1.), ((176, 204, 228), 1.))?;
+            for (x, y, start, end) in [
+                (0.30, 5., (156, 114, 232), (52, 68, 158)),
+                (0.17, 15., (224, 134, 212), (132, 54, 134)),
+                (0.02, 26., (255, 174, 146), (197, 79, 119)),
+                (-0.18, 37., (255, 212, 138), (231, 114, 90)),
+            ] {
+                let band = |spread: f32, shift_y: f32, alpha| {
+                    c.gradient(
+                        l + w * x - spread,
+                        t + y + shift_y - spread,
+                        l + w * (x + 0.66) + spread,
+                        b + 34. + shift_y + spread,
+                        32. + spread,
+                        (start, alpha),
+                        (end, alpha),
+                    )
+                };
+                if feathered {
+                    for (spread, alpha) in [
+                        (6., 0.10),
+                        (4., 0.18),
+                        (2., 0.28),
+                        (0., 0.40),
+                        (-2., 0.56),
+                        (-4., 0.78),
+                        (-6., 1.),
+                    ] {
+                        band(spread, 2.2, alpha)?;
+                    }
+                } else {
+                    band(0., 0., 1.)?;
                 }
-            } else {
-                band(0., 1.)?;
             }
+            Ok(())
+        };
+        draw_wallpaper(false)?;
+        if style == TopBarBackground::Frosted {
+            // Only the bar strip diffuses and refracts the wallpaper; the desktop below stays sharp.
+            c.clipped(c.rect(l, t, r, t + bar_h), || draw_wallpaper(true))?;
         }
         c.top_background(Area::new(l, t, r, t + bar_h), style, true)?;
         if shadow {
@@ -219,6 +225,7 @@ impl Tones {
 /// it changes only on input, so nothing runs while it sits open.
 pub(super) struct PanelView {
     hwnd: HWND,
+    glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     root: IDCompositionVisual2,
@@ -226,8 +233,8 @@ pub(super) struct PanelView {
 
 impl Renderer {
     /// Paints `layout` into `hwnd`, the settings window, binding to it on first use and
-    /// again after the device was rebuilt. With `glass` the sidebar is left translucent
-    /// over the backdrop DWM draws behind it.
+    /// again after the device was rebuilt. With `glass` the sidebar renders translucent
+    /// Liquid Glass over the live desktop backdrop behind it.
     pub fn draw_panel(
         &mut self,
         hwnd: HWND,
@@ -237,20 +244,49 @@ impl Renderer {
     ) -> Result<()> {
         if self.panel.as_ref().map(|view| view.hwnd) != Some(hwnd) {
             self.close_panel();
+            let glass_surface = self.glass.as_ref().and_then(|g| g.attach(hwnd).ok());
             unsafe {
                 let target = self.device.CreateTargetForHwnd(hwnd, true)?;
                 let root = self.device.CreateVisual()?;
                 target.SetRoot(&root)?;
                 self.panel = Some(PanelView {
                     hwnd,
+                    glass: glass_surface,
                     _target: target,
                     root,
                 });
             }
         }
         let (width, height) = layout.pixels();
+        let sidebar_px = layout.sidebar_pixels() as f32;
+        let mut live_sidebar_glass = false;
+        if let (Some(engine), Some(panel_view)) = (&self.glass, self.panel.as_mut())
+            && let Some(surface) = &mut panel_view.glass
+        {
+            let strength = if glass { layout.backdrop } else { 0 };
+            live_sidebar_glass = strength > 0
+                && surface
+                    .update(
+                        engine,
+                        super::glass::GlassSpec {
+                            x: 0.,
+                            y: 0.,
+                            width: sidebar_px,
+                            height: height as f32,
+                            radius: 0.,
+                            strength,
+                            dark: self.palette.dark,
+                            dpi,
+                        },
+                    )
+                    .is_ok();
+            if !live_sidebar_glass {
+                let _ = surface.hide();
+            }
+        }
+        let use_glass = glass && (live_sidebar_glass || self.glass.is_none());
         let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-            self.paint_panel(c, layout, glass)
+            self.paint_panel(c, layout, use_glass)
         })?;
         let view = self.panel.as_ref().expect("panel bound above");
         unsafe {
@@ -349,14 +385,17 @@ impl Renderer {
         if glass {
             let (tint, alpha) = t.sidebar_glass;
             let glass_strength = layout.backdrop as f32 / 100.;
-            c.fill(
+            let eff_alpha = 1. - (1. - alpha * 0.72) * glass_strength;
+            c.liquid_glass_shell(
+                Area::new(0., 0., side, h),
                 0.,
-                0.,
-                side,
-                h,
-                0.,
-                tint,
-                1. - (1. - alpha) * glass_strength,
+                super::glass::LiquidShell {
+                    top_tint: mix(tint, WHITE, if c.p.dark { 0.12 } else { 0.45 }),
+                    bottom_tint: tint,
+                    opacity: eff_alpha,
+                    rim: 0.45 * glass_strength,
+                    glass_active: true,
+                },
             )?;
         } else {
             c.gradient(

@@ -21,10 +21,10 @@ pub(super) struct About {
     glass: bool,
 }
 
-/// The backdrop shows only where DWM draws acrylic: the build supports it and
-/// transparency effects are on. An unreadable preference counts as off.
-fn glass(window: &AboutWindow) -> bool {
-    window.backdrop() && display::transparency().unwrap_or(false)
+/// The backdrop shows when transparency effects are on and either DeskIsle's live
+/// Liquid Glass compositor or DWM acrylic is available.
+fn glass(window: &AboutWindow, live_glass: bool) -> bool {
+    display::transparency().unwrap_or(false) && (live_glass || window.backdrop())
 }
 
 impl Bars {
@@ -45,13 +45,18 @@ impl Bars {
         let machine = machine::query();
         let dpi = self.monitor.dpi;
         let layout = self.about_layout(&machine, dpi, None);
+        let live_glass = self
+            .renderer
+            .as_ref()
+            .is_some_and(crate::render::Renderer::has_live_glass);
         let window = AboutWindow::create(
             layout.place(self.monitor.work),
             layout.controls_pixels(),
             self.dark(),
+            !live_glass,
         )?;
         self.about = Some(About {
-            glass: glass(&window),
+            glass: glass(&window, live_glass),
             window,
             machine,
             layout,
@@ -103,10 +108,14 @@ impl Bars {
     /// Follows a palette or transparency change, which Windows announces as a setting
     /// change; `repalette` says whether the renderer switched palettes.
     pub(super) fn retheme_about(&mut self, dark: bool, repalette: bool) -> Result<()> {
+        let live_glass = self
+            .renderer
+            .as_ref()
+            .is_some_and(crate::render::Renderer::has_live_glass);
         let Some(about) = self.about.as_mut() else {
             return Ok(());
         };
-        let glass = glass(&about.window);
+        let glass = glass(&about.window, live_glass);
         if !repalette && glass == about.glass {
             return Ok(());
         }

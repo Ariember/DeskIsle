@@ -164,9 +164,9 @@ impl Palette {
 }
 
 pub(super) struct Canvas {
-    ctx: ID2D1DeviceContext,
+    pub(super) ctx: ID2D1DeviceContext,
     pub(super) p: Palette,
-    origin: POINT,
+    pub(super) origin: POINT,
     pub(super) scale: f32,
 }
 
@@ -339,7 +339,7 @@ impl Canvas {
         unsafe { self.ctx.CreateSolidColorBrush(&color(r, g, b, a), None) }
     }
 
-    fn shape(&self, l: f32, t: f32, r: f32, b: f32, radius: f32) -> D2D1_ROUNDED_RECT {
+    pub(super) fn shape(&self, l: f32, t: f32, r: f32, b: f32, radius: f32) -> D2D1_ROUNDED_RECT {
         D2D1_ROUNDED_RECT {
             rect: self.rect(l, t, r, b),
             radiusX: radius * self.scale,
@@ -530,32 +530,83 @@ impl Canvas {
         Ok(())
     }
 
+    pub(super) fn dock_radius(width: f32, height: f32, _skin: i32) -> f32 {
+        (height * 0.36)
+            .min(20.)
+            .min(width * 0.5)
+            .min(height * 0.5)
+            .max(0.)
+    }
+
     pub(super) fn dock_background(
         &self,
         width: i32,
         height: i32,
         separators: &[i32],
         settings: &Settings,
+        glass_active: bool,
     ) -> Result<()> {
+        use super::glass::LiquidShell;
         let s = self.scale;
         let (w, h) = (width as f32 / s, height as f32 / s);
         let get = |key| settings.get(Key::Appearance(key));
-        let (top, bottom, radius, mut a, mut b) = match get(AppearanceKey::DockSkin) {
-            1 => ((239, 247, 255), (162, 193, 211), 18., 0.78, 0.62),
-            2 => ((54, 57, 64), (20, 22, 26), 12., 0.95, 0.90),
-            _ => (self.p.panel_top, self.p.bar, 18., 0.74, 0.64),
+        let skin = get(AppearanceKey::DockSkin);
+        let radius = Self::dock_radius(w, h, skin);
+        let (top_tint, bottom_tint, mut opacity, mut rim) = match skin {
+            1 => (
+                (234, 246, 255),
+                (176, 208, 232),
+                if glass_active { 0.25 } else { 0.84 },
+                if glass_active { 1.18 } else { 0.78 },
+            ),
+            2 => (
+                (44, 48, 58),
+                (16, 18, 24),
+                if glass_active { 0.52 } else { 0.94 },
+                if glass_active { 0.82 } else { 0.55 },
+            ),
+            _ if self.p.dark => (
+                (38, 46, 62),
+                (16, 20, 30),
+                if glass_active { 0.20 } else { 0.86 },
+                if glass_active { 1.06 } else { 0.65 },
+            ),
+            _ => (
+                (252, 254, 255),
+                (234, 242, 252),
+                if glass_active { 0.22 } else { 0.86 },
+                if glass_active { 1.08 } else { 0.68 },
+            ),
         };
-        let mut edge = 0.16;
         if get(AppearanceKey::DockCustom) != 0 {
-            let opacity = get(AppearanceKey::DockOpacity) as f32 / 100.;
-            let glass = get(AppearanceKey::DockBlur) as f32 / 100.;
-            // Windows supplies the acrylic behind the bar. Reveal more of that
-            // material as strength increases, preserving the opacity endpoints.
-            a = opacity;
-            b = opacity - opacity * (1. - opacity) * glass;
-            edge *= opacity;
+            let user_opacity = get(AppearanceKey::DockOpacity) as f32 / 100.;
+            let user_glass = get(AppearanceKey::DockBlur) as f32 / 100.;
+            if user_opacity <= 0. {
+                opacity = 0.;
+                rim = 0.;
+            } else if user_opacity >= 1. {
+                opacity = 1.;
+                rim *= 0.85;
+            } else {
+                opacity = if glass_active {
+                    user_opacity * (1. - 0.52 * user_glass * (1. - user_opacity))
+                } else {
+                    user_opacity
+                };
+                rim *= (0.38 + 0.82 * user_opacity).min(1.2);
+            }
         }
-        self.gradient(0., 0., w, h, radius, (top, a), (bottom, b))?;
+        self.liquid_glass_shell(
+            Area::new(0., 0., w, h),
+            radius,
+            LiquidShell {
+                top_tint,
+                bottom_tint,
+                opacity,
+                rim,
+                glass_active,
+            },
+        )?;
         // Align the one-DIP rule to whole pixels, including at fractional DPI.
         let thickness = s.round().max(1.) as i32;
         let inset = (height as f32 * 0.18).round() / s;
@@ -571,7 +622,7 @@ impl Canvas {
                 0.30,
             )?;
         }
-        self.stroke(0., 0., w, h, radius, self.p.line, edge)
+        Ok(())
     }
 
     /// Shared by the live top bar and the three miniatures in settings.
@@ -603,21 +654,74 @@ impl Canvas {
                 )
             }
             TopBarBackground::Frosted if frosted => {
-                let (top, bottom, edge) = if self.p.dark {
-                    (
-                        ((36, 38, 44), 0.34),
-                        ((16, 18, 22), 0.20),
-                        ((255, 255, 255), 0.10),
-                    )
+                let stops = if self.p.dark {
+                    [
+                        (0.00, ((92, 112, 144), 0.24)),
+                        (0.22, ((30, 36, 48), 0.16)),
+                        (0.76, ((16, 20, 28), 0.12)),
+                        (1.00, ((76, 98, 132), 0.22)),
+                    ]
                 } else {
-                    (
-                        ((255, 255, 255), 0.28),
-                        ((242, 245, 250), 0.16),
-                        ((0, 0, 0), 0.10),
-                    )
+                    [
+                        (0.00, ((255, 255, 255), 0.36)),
+                        (0.22, ((246, 250, 255), 0.20)),
+                        (0.76, ((236, 244, 252), 0.15)),
+                        (1.00, ((255, 255, 255), 0.30)),
+                    ]
                 };
-                self.gradient(l, t, r, b, 0., top, bottom)?;
-                self.fill(l, b - hairline, r, b, 0., edge.0, edge.1)
+                self.gradient_stops(l, t, r, b, 0., &stops)?;
+                // Overhead sky glint + upward meniscus inner glow + crisp Fresnel bottom rim.
+                self.fill(l, t, r, (t + hairline).min(b), 0., (255, 255, 255), 0.28)?;
+                let meniscus_top = (b - 3.6).max(t);
+                let glow_a = if self.p.dark { 0.16 } else { 0.24 };
+                self.gradient_stops(
+                    l,
+                    meniscus_top,
+                    r,
+                    b,
+                    0.,
+                    &[
+                        (0.00, ((220, 240, 255), 0.00)),
+                        (0.65, ((225, 242, 255), glow_a * 0.45)),
+                        (1.00, ((255, 255, 255), glow_a)),
+                    ],
+                )?;
+                if b - t > 2. * hairline {
+                    self.fill(
+                        l,
+                        b - 2. * hairline,
+                        r,
+                        b - hairline,
+                        0.,
+                        (156, 228, 255),
+                        if self.p.dark { 0.20 } else { 0.16 },
+                    )?;
+                }
+                self.gradient_stroke(
+                    Area::new(l, b - hairline * 0.5, r, b - hairline * 0.5),
+                    0.,
+                    hairline,
+                    (l, b),
+                    (r, b),
+                    &[
+                        (
+                            0.00,
+                            ((255, 255, 255), if self.p.dark { 0.46 } else { 0.66 }),
+                        ),
+                        (
+                            0.28,
+                            ((255, 255, 255), if self.p.dark { 0.68 } else { 0.88 }),
+                        ),
+                        (
+                            0.72,
+                            ((245, 252, 255), if self.p.dark { 0.64 } else { 0.84 }),
+                        ),
+                        (
+                            1.00,
+                            ((255, 255, 255), if self.p.dark { 0.44 } else { 0.64 }),
+                        ),
+                    ],
+                )
             }
             TopBarBackground::Frosted => {
                 self.gradient(l, t, r, b, 0., (self.p.panel_top, 1.), (self.p.bar, 1.))?;
@@ -1044,7 +1148,7 @@ impl Canvas {
     }
 }
 
-fn color(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
+pub(super) fn color(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: r as f32 / 255.,
         g: g as f32 / 255.,

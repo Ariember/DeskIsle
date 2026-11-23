@@ -1,5 +1,6 @@
 mod about;
 mod canvas;
+mod glass;
 mod label;
 mod launchpad;
 pub(crate) use label::LabelView;
@@ -94,12 +95,16 @@ type Dimensions = (i32, i32, u32);
 pub struct Renderer {
     d2d: ID2D1Device,
     device: IDCompositionDesktopDevice,
+    glass: Option<glass::GlassEngine>,
+    top_glass: Option<glass::GlassSurface>,
+    bottom_glass: Option<glass::GlassSurface>,
+    transparency: bool,
     top: Bar,
     bottom: Bar,
     write: IDWriteFactory,
     imaging: IWICImagingFactory,
     icons: Vec<IconLayer>,
-    bottom_size: Option<Dimensions>,
+    bottom_size: Option<(Dimensions, bool)>,
     separator_centers: Vec<i32>,
     top_state: Option<TopState>,
     pub(crate) wallpaper_tint: Option<(u8, u8, u8)>,
@@ -194,8 +199,8 @@ const DROP_LIFT: f32 = 1.06;
 const DROP_SHADE: f32 = 0.32;
 /// The running indicator's layer in DIPs: its size, and how far its top sits above the
 /// Dock's bottom edge.
-const DOT_BOX: (f32, f32) = (20., 8.);
-const DOT_TOP: f32 = 10.5;
+const DOT_BOX: (f32, f32) = (28., 11.);
+const DOT_TOP: f32 = 11.5;
 /// Vertical offset in DIPs for the soft shadow behind translucent top-bar text and icons.
 pub(super) const TOP_SHADOW_Y: f32 = 0.85;
 
@@ -205,12 +210,10 @@ pub(super) fn top_bar_shadow(style: TopBarBackground, immersive_color: Option<u3
     immersive_color.is_none()
         && matches!(
             style,
-            TopBarBackground::Tinted | TopBarBackground::Transparent
+            TopBarBackground::Tinted | TopBarBackground::Frosted | TopBarBackground::Transparent
         )
 }
 
-/// Corner radius of the backing behind a hovered or open status bar target, in DIPs.
-const PILL_RADIUS: f32 = 7.;
 /// Size of the icons on the status bar, in DIPs. The battery is drawn larger with the
 /// same stroke weight, so its body reads at the bar's height.
 const BAR_ICON: f32 = layout::BAR_ICON as f32;
@@ -391,12 +394,35 @@ impl IconLayer {
                 let width = (w * s).ceil() as i32;
                 let surface = paint(device, palette, width, (h * s).ceil() as i32, dpi, |c| {
                     let mid = w / 2.;
-                    let half = if item.active { 5. } else { 2. };
+                    let cy = h * 0.56;
                     if item.active {
-                        c.fill(mid - 9., 1., mid + 9., 7., 3., c.p.accent, 0.18)?;
+                        // Radiant ambient caustic bloom onto the lower Liquid Glass rim.
+                        for (rx, ry, a) in [(11.5, 4.4, 0.09), (8.2, 3.2, 0.16), (5.8, 2.2, 0.28)] {
+                            c.fill(mid - rx, cy - ry, mid + rx, cy + ry, ry, c.p.accent, a)?;
+                        }
+                        c.fill(
+                            mid - 4.2,
+                            cy - 1.5,
+                            mid + 4.2,
+                            cy + 1.5,
+                            1.5,
+                            c.p.accent,
+                            0.95,
+                        )?;
+                        c.fill(
+                            mid - 2.6,
+                            cy - 0.9,
+                            mid + 2.6,
+                            cy + 0.5,
+                            0.7,
+                            (255, 255, 255),
+                            0.78,
+                        )
+                    } else {
+                        let glow = if c.p.dark { (220, 236, 255) } else { c.p.ink };
+                        c.fill(mid - 3.6, cy - 2.6, mid + 3.6, cy + 2.6, 2.6, glow, 0.16)?;
+                        c.fill(mid - 1.9, cy - 1.9, mid + 1.9, cy + 1.9, 1.9, glow, 0.82)
                     }
-                    let ink = if item.active { c.p.accent } else { c.p.muted };
-                    c.round(mid - half, 2.5, mid + half, 5.5, 1.5, ink)
                 })?;
                 let dot = device.CreateVisual()?;
                 dot.SetContent(&surface)?;
@@ -423,9 +449,18 @@ impl Renderer {
             let dxgi: IDXGIDevice = d3d.cast()?;
             let d2d = D2D1CreateDevice(&dxgi, None)?;
             let device: IDCompositionDesktopDevice = DCompositionCreateDevice2(&d2d)?;
+            let top_bar = Bar::new(&device, top)?;
+            let bottom_bar = Bar::new(&device, bottom)?;
+            let glass = glass::GlassEngine::new(&d2d).ok();
+            let top_glass = glass.as_ref().and_then(|g| g.attach(top).ok());
+            let bottom_glass = glass.as_ref().and_then(|g| g.attach(bottom).ok());
             Ok(Self {
-                top: Bar::new(&device, top)?,
-                bottom: Bar::new(&device, bottom)?,
+                top: top_bar,
+                bottom: bottom_bar,
+                glass,
+                top_glass,
+                bottom_glass,
+                transparency: true,
                 d2d,
                 device,
                 write: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
@@ -452,6 +487,35 @@ impl Renderer {
 
     pub fn is_dark(&self) -> bool {
         self.palette.dark
+    }
+
+    pub fn has_live_glass(&self) -> bool {
+        self.glass.is_some()
+    }
+
+    pub fn set_transparency(&mut self, enabled: bool) -> bool {
+        if self.transparency == enabled {
+            return false;
+        }
+        self.transparency = enabled;
+        self.top_state = None;
+        self.bottom_size = None;
+        if !enabled {
+            if let Some(surface) = &mut self.top_glass {
+                let _ = surface.hide();
+            }
+            if let Some(surface) = &mut self.bottom_glass {
+                let _ = surface.hide();
+            }
+        }
+        true
+    }
+
+    pub fn hide_dock_glass(&mut self) {
+        if let Some(surface) = &mut self.bottom_glass {
+            let _ = surface.hide();
+        }
+        self.bottom_size = None;
     }
 
     /// Invalidates painted layers when their colors or text settings change.
@@ -526,8 +590,44 @@ impl Renderer {
         let level = |key| self.appearance.get(Key::Appearance(key));
         let custom = level(A::TopCustom) != 0;
         let opacity = level(A::TopOpacity) as f32 / 100.;
+        let top_strength = if immersive_color.is_some() || !self.transparency {
+            0
+        } else if custom {
+            if level(A::TopOpacity) >= 100 {
+                0
+            } else {
+                level(A::TopBlur)
+            }
+        } else if self.top_background == TopBarBackground::Frosted {
+            68
+        } else {
+            0
+        };
+        let mut live_top_glass = false;
+        if let (Some(engine), Some(surface)) = (&self.glass, &mut self.top_glass) {
+            live_top_glass = top_strength > 0
+                && surface
+                    .update(
+                        engine,
+                        glass::GlassSpec {
+                            x: 0.,
+                            y: 0.,
+                            width: layout.width as f32,
+                            height: layout.height as f32,
+                            radius: 0.,
+                            strength: top_strength,
+                            dark: self.palette.dark,
+                            dpi,
+                        },
+                    )
+                    .is_ok();
+            if !live_top_glass {
+                let _ = surface.hide();
+            }
+        }
+        let frosted = frosted || live_top_glass;
         let glass_mix = if frosted {
-            level(A::TopBlur) as f32 / 100.
+            (if custom { level(A::TopBlur) } else { 68 }) as f32 / 100.
         } else {
             0.
         };
@@ -571,20 +671,26 @@ impl Renderer {
         let dip = |px: i32| px as f32 / s;
         let w = dip(layout.width);
         let h = dip(layout.height);
-        // Every target shares one rounded backing: faint while hovered, stronger while
-        // its dropdown is open.
+        // Every target shares one rounded Liquid Glass pill backing: subtle while
+        // hovered, brighter while its dropdown is open.
         let open_slot = open.and_then(|hit| layout.target(hit));
         let hover_slot = hover
             .and_then(|hit| layout.target(hit))
             .filter(|&slot| Some(slot) != open_slot);
-        let (hover_alpha, open_alpha) = if palette.light_ground() {
-            (0.08, 0.15)
+        let (hover_alpha, open_alpha, hover_rim, open_rim) = if palette.light_ground() {
+            (0.16, 0.28, 0.38, 0.56)
         } else {
-            (0.14, 0.24)
+            (0.13, 0.24, 0.34, 0.52)
         };
-        let backing = |c: &Canvas, slot: Rect, alpha: f32| {
+        let backing = |c: &Canvas, slot: Rect, alpha: f32, rim: f32| {
             let (l, r) = (dip(slot.x) + 2., dip(slot.x + slot.width) - 2.);
-            c.fill(l, 4., r, h - 4., PILL_RADIUS, c.p.line, alpha)
+            let pill = Area::new(l, 3.5, r, h - 3.5);
+            let tint_rgb = if palette.light_ground() {
+                (255, 255, 255)
+            } else {
+                (215, 230, 250)
+            };
+            c.liquid_pill(pill, (h - 7.).max(4.) * 0.5, tint_rgb, alpha, rim)
         };
         let surface = paint(
             &self.device,
@@ -596,14 +702,17 @@ impl Renderer {
                 if immersive_color.is_some() {
                     c.round(0., 0., w, h, 0., c.p.bar)?;
                 } else if custom {
-                    c.fill(
+                    let eff_opacity = opacity * (1. - 0.65 * glass_mix * (1. - opacity));
+                    c.liquid_glass_shell(
+                        Area::new(0., 0., w, h),
                         0.,
-                        0.,
-                        w,
-                        h,
-                        0.,
-                        c.p.bar,
-                        opacity * (1. - 0.65 * glass_mix * (1. - opacity)),
+                        glass::LiquidShell {
+                            top_tint: c.p.panel_top,
+                            bottom_tint: c.p.bar,
+                            opacity: eff_opacity,
+                            rim: if frosted { 0.85 } else { 0.25 * eff_opacity },
+                            glass_active: frosted,
+                        },
                     )?;
                 } else {
                     c.top_background(Area::new(0., 0., w, h), self.top_background, frosted)?;
@@ -633,10 +742,10 @@ impl Renderer {
                     c.p.ink,
                 )?;
                 if let Some(slot) = hover_slot {
-                    backing(c, slot, hover_alpha)?;
+                    backing(c, slot, hover_alpha, hover_rim)?;
                 }
                 if let Some(slot) = open_slot {
-                    backing(c, slot, open_alpha)?;
+                    backing(c, slot, open_alpha, open_rim)?;
                 }
                 let icon_size = (BAR_ICON * s).round();
                 for (slot, image) in layout.tray.iter().zip(icons) {
@@ -928,26 +1037,79 @@ impl Renderer {
         lift: f32,
         resting_scale: f32,
     ) -> Result<()> {
-        let palette = match self
+        let skin = self
             .appearance
-            .get(Key::Appearance(AppearanceKey::DockSkin))
-        {
+            .get(Key::Appearance(AppearanceKey::DockSkin));
+        let palette = match skin {
             1 => Palette::new(false, &self.appearance),
             2 => Palette::new(true, &self.appearance),
             _ => self.palette,
         };
-        let size = (width, height, dpi);
+        let s = dpi as f32 / 96.;
+        let dock_custom = self
+            .appearance
+            .enabled(Key::Appearance(AppearanceKey::DockCustom));
+        let dock_strength = if !self.transparency {
+            0
+        } else if dock_custom {
+            if self
+                .appearance
+                .get(Key::Appearance(AppearanceKey::DockOpacity))
+                >= 100
+            {
+                0
+            } else {
+                self.appearance
+                    .get(Key::Appearance(AppearanceKey::DockBlur))
+            }
+        } else {
+            match skin {
+                1 => 82,
+                2 => 58,
+                _ => 70,
+            }
+        };
+        let radius_px = Canvas::dock_radius(width as f32 / s, height as f32 / s, skin) * s;
+        let mut dock_glass_active = false;
+        if let (Some(engine), Some(surface)) = (&self.glass, &mut self.bottom_glass) {
+            dock_glass_active = dock_strength > 0
+                && surface
+                    .update(
+                        engine,
+                        glass::GlassSpec {
+                            x: 0.,
+                            y: 0.,
+                            width: width as f32,
+                            height: height as f32,
+                            radius: radius_px,
+                            strength: dock_strength,
+                            dark: palette.dark,
+                            dpi,
+                        },
+                    )
+                    .is_ok();
+            if !dock_glass_active {
+                let _ = surface.hide();
+            }
+        }
+        let size = ((width, height, dpi), dock_glass_active);
         let layout_changed = self.icons.len() != items.len()
             || self.icons.iter().zip(items).any(|(layer, icon)| {
                 !layer.matches(icon, dpi) || layer.center != (icon.center_x, icon.center_y)
             });
         // A resized Dock re-centers on the screen, so the old offsets do not line up with
         // the new slots. Icons then take their places at once.
-        let slide = self.bottom_size == Some(size);
-        let panel_changed = !slide || self.separator_centers != separators;
+        let slide = self.bottom_size.map(|(dim, _)| dim) == Some(size.0);
+        let panel_changed = self.bottom_size != Some(size) || self.separator_centers != separators;
         if panel_changed {
             let surface = paint(&self.device, palette, width, height, dpi, |c| {
-                c.dock_background(width, height, separators, &self.appearance)
+                c.dock_background(
+                    width,
+                    height,
+                    separators,
+                    &self.appearance,
+                    dock_glass_active,
+                )
             })?;
             unsafe { self.bottom.root.SetContent(&surface)? };
             self.bottom_size = Some(size);
@@ -1191,7 +1353,7 @@ mod tests {
                 let palette = Palette::new(dark, &Settings::default());
                 let paint = |lines: &[i32]| {
                     canvas::paint_pixels(&device, palette, width, height, dpi, |c| {
-                        c.dock_background(width, height, lines, &Settings::default())
+                        c.dock_background(width, height, lines, &Settings::default(), false)
                     })
                 };
                 let plain = paint(&[])?;
@@ -1225,7 +1387,7 @@ mod tests {
             settings.set(Key::Appearance(AppearanceKey::DockOpacity), opacity);
             let pixels =
                 canvas::paint_pixels(&device, Palette::new(false, &settings), 64, 64, 96, |c| {
-                    c.dock_background(64, 64, &[], &settings)
+                    c.dock_background(64, 64, &[], &settings, false)
                 })?;
             assert_eq!(pixels[(32 * 64 + 32) * 4 + 3], expected_alpha);
         }

@@ -33,6 +33,24 @@ impl Renderer {
         let dip = |px: i32| px as f32 / s;
         let w = dip(layout.bounds.width);
         let h = dip(layout.bounds.height);
+        let custom = self.appearance.enabled(Appearance(WindowCustom));
+        let blur_strength = if custom {
+            self.appearance.get(Appearance(WindowBlur)) as f32 / 100.
+        } else {
+            0.70
+        };
+        let user_opacity = if custom {
+            self.appearance.get(Appearance(WindowOpacity)) as f32 / 100.
+        } else if self.is_dark() {
+            0.24
+        } else {
+            0.22
+        };
+        let rim = if custom {
+            0.35 + 1.15 * (self.appearance.get(Appearance(WindowBorder)) as f32 / 100.)
+        } else {
+            1.08
+        };
         paint_pixels(
             &self.d2d,
             self.palette,
@@ -40,19 +58,36 @@ impl Renderer {
             layout.bounds.height,
             dpi,
             |c| {
-                let mut opacity = 1.;
+                let glass_active = backdrop.is_some() && blur_strength > 0. && user_opacity < 1.;
+                let opacity = if glass_active { user_opacity } else { 1. };
                 if let Some(image) = backdrop {
-                    c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
-                    opacity = self.appearance.get(Appearance(WindowOpacity)) as f32 / 100.;
+                    if glass_active {
+                        c.liquid_backdrop(
+                            image,
+                            Area::new(0., 0., w, h),
+                            8.,
+                            blur_strength,
+                            c.p.dark,
+                        )?;
+                    } else {
+                        c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
+                    }
                 }
-                c.gradient(
-                    0.,
-                    0.,
-                    w + 1.,
-                    h + 1.,
-                    0.,
-                    (c.p.panel_top, opacity),
-                    (c.p.panel, opacity),
+                let (top_tint, bottom_tint) = if c.p.dark {
+                    ((38, 46, 62), (18, 22, 32))
+                } else {
+                    ((252, 254, 255), (235, 243, 252))
+                };
+                c.liquid_glass_shell(
+                    Area::new(0., 0., w, h),
+                    8.,
+                    super::glass::LiquidShell {
+                        top_tint,
+                        bottom_tint,
+                        opacity,
+                        rim,
+                        glass_active,
+                    },
                 )?;
                 for (index, card) in layout.cards.iter().enumerate() {
                     let card_hovered = hover.is_some_and(|hit| hit.index() == index);
@@ -64,7 +99,18 @@ impl Renderer {
                         dip(card.bounds.y + card.bounds.height),
                     );
                     if card_hovered {
-                        c.fill(cl, ct, cr, cb, 0., c.p.line, 0.085)?;
+                        let hover_tint = if c.p.dark {
+                            (215, 232, 255)
+                        } else {
+                            (255, 255, 255)
+                        };
+                        c.liquid_pill(
+                            Area::new(cl + 2., ct + 2., cr - 2., cb - 2.),
+                            7.,
+                            hover_tint,
+                            if c.p.dark { 0.12 } else { 0.28 },
+                            0.38,
+                        )?;
                     }
 
                     let (tl, tt, tr, tb) = (
@@ -78,9 +124,18 @@ impl Renderer {
                         tt,
                         tr,
                         tb,
-                        4.,
+                        5.,
                         (0, 0, 0),
-                        if c.p.dark { 0.35 } else { 0.08 },
+                        if c.p.dark { 0.30 } else { 0.08 },
+                    )?;
+                    c.stroke(
+                        tl - 0.5,
+                        tt - 0.5,
+                        tr + 0.5,
+                        tb + 0.5,
+                        5.5,
+                        (255, 255, 255),
+                        if c.p.dark { 0.24 } else { 0.45 },
                     )?;
 
                     if let Some(info) = windows.get(index)
@@ -159,10 +214,6 @@ impl Renderer {
                             y += ch;
                         }
                     }
-                }
-                if self.appearance.enabled(Appearance(WindowCustom)) {
-                    let border = self.appearance.get(Appearance(WindowBorder)) as f32 / 100.;
-                    c.stroke(0., 0., w, h, 8., c.p.line, border)?;
                 }
                 Ok(())
             },
