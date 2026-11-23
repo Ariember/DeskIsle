@@ -1074,8 +1074,9 @@ fn pixels(bitmap: &IWICBitmapSource) -> Result<Vec<u8>> {
 /// are usually drawn for a taskbar of the other theme. `pixels` are premultiplied BGRA.
 fn faint(pixels: &[u8], light_ground: bool) -> bool {
     let (mut covered, mut standing) = (0, 0);
-    for pixel in pixels.chunks_exact(4) {
-        let [b, g, r, a] = [pixel[0], pixel[1], pixel[2], pixel[3]].map(u32::from);
+    let (pixels, _) = pixels.as_chunks::<4>();
+    for pixel in pixels {
+        let [b, g, r, a] = pixel.map(u32::from);
         // Premultiplied luma against half the coverage, without dividing.
         let light = 2 * (299 * r + 587 * g + 114 * b) > 1000 * a;
         covered += a;
