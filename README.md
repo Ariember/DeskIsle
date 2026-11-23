@@ -1,23 +1,83 @@
+<div align="center">
+
+<img src="docs/images/logo.svg" width="96" alt="DeskIsle 标志" />
+
 # DeskIsle
 
-DeskIsle 是面向 Windows 11 的桌面工具，在主屏提供仿 macOS 的半透明顶部状态栏和底部 Dock。Dock 用于启动应用和切换窗口，状态栏集中显示应用托盘图标、资源监控、系统状态和时间。DeskIsle 使用 Rust 编写，界面由 DirectComposition 合成、Direct2D 自绘，动画交给系统合成器执行，静置时几乎没有开销。
+**给 Windows 11 一座安静的桌面小岛**
 
-## 功能一览
+半透明顶部状态栏 · 悬浮 Dock · 启动台 —— 用 Rust 自绘，静置时几乎零开销
+
+[![最新版本](https://img.shields.io/github/v/release/Ariember/DeskIsle?style=flat-square&color=7A5CFA&label=release)](https://github.com/Ariember/DeskIsle/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/Ariember/DeskIsle/total?style=flat-square&color=5B8CFF)](https://github.com/Ariember/DeskIsle/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/Ariember/DeskIsle/release.yml?branch=main&style=flat-square&label=CI)](https://github.com/Ariember/DeskIsle/actions/workflows/release.yml)
+![平台](https://img.shields.io/badge/Windows%2011-x64-22C1C3?style=flat-square&logo=windows11&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-2024-DEA584?style=flat-square&logo=rust&logoColor=white)
+
+[**下载**](https://github.com/Ariember/DeskIsle/releases/latest) · [功能](#-功能一览) · [安装](#-安装) · [使用指南](#-使用指南) · [常见问题](#-常见问题) · [开发](#-开发)
+
+<br />
+
+<img src="docs/images/hero.jpg" width="100%" alt="DeskIsle 概念图：顶部毛玻璃状态栏与底部悬浮 Dock" />
+
+</div>
+
+<br />
+
+DeskIsle 是面向 Windows 11 的桌面工具，在主屏提供仿 macOS 的半透明顶部状态栏和底部 Dock。Dock 用于启动应用和切换窗口，状态栏集中显示应用托盘图标、资源监控、系统状态和时间。界面由 **DirectComposition** 合成、**Direct2D** 自绘，动画交给系统合成器执行。
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### 🪶 轻
+单个 `deskisle.exe`，免安装、免管理员权限、无额外运行时。静置时动画由系统合成器托管，几乎不占 CPU。
+
+</td>
+<td width="33%" valign="top">
+
+### 🫧 美
+亚克力毛玻璃、悬停放大、窗口预览、图标倒影与 Dock 皮肤，每处背景都可单独调整。
+
+</td>
+<td width="33%" valign="top">
+
+### 🧭 稳
+被强制结束时，恢复进程会还原原生任务栏；自动更新下载后先校验再重启。
+
+</td>
+</tr>
+</table>
+
+## ✨ 功能一览
 
 | 区域 | 提供的功能 |
 | --- | --- |
-| 顶部状态栏 | 系统菜单与关于本机、前台应用名、应用托盘、资源监控、网络 / 声音 / 显示 / 电源面板、控制中心、输入法状态、时钟与日历 |
-| Dock | 固定与拖动排序、分割线分区、启动与切换窗口、多窗口列表、窗口预览、运行指示、悬停放大、多种显示隐藏模式 |
-| 启动台 | 拖入快捷方式或程序、名称搜索、翻页、从 Dock 拖入 |
-| 管理面板 | 外观、顶部栏、Dock、监控、时间等设置，改动立即生效并保存 |
+| 🔝 **顶部状态栏** | 系统菜单与关于本机、前台应用名、应用托盘、资源监控、网络 / 声音 / 显示 / 电源面板、控制中心、输入法状态、时钟与日历 |
+| ⚓ **Dock** | 固定与拖动排序、分割线分区、启动与切换窗口、多窗口列表、窗口预览、运行指示、悬停放大、多种显示隐藏模式 |
+| 🚀 **启动台** | 拖入快捷方式或程序、名称搜索、翻页、从 Dock 拖入 |
+| ⚙️ **管理面板** | 外观、主题、顶部栏、Dock、监控、时间等设置，改动立即生效并保存 |
 
-## 系统要求
+<table>
+<tr>
+<td width="50%"><img src="docs/images/topbar.jpg" alt="顶部状态栏与控制中心概念图" /></td>
+<td width="50%"><img src="docs/images/dock.jpg" alt="Dock 悬停放大与窗口预览概念图" /></td>
+</tr>
+<tr>
+<td align="center"><b>顶部状态栏</b><br /><sub>托盘、资源监控、系统面板与控制中心</sub></td>
+<td align="center"><b>Dock</b><br /><sub>固定、分区、窗口预览与悬停放大</sub></td>
+</tr>
+</table>
+
+<p align="center"><sub>以上为风格示意图，实际界面以运行效果为准。</sub></p>
+
+## 📋 系统要求
 
 - Windows 11 x64。DeskIsle 以普通用户权限运行，无需管理员权限或额外运行时。
 - 亮度调节需要显示器支持 DDC/CI。
 - CPU 核心温度需要已运行的 [Core Temp](https://www.alcpu.com/CoreTemp/)。
 
-## 安装
+## 📦 安装
 
 ### 下载发布版
 
@@ -41,9 +101,9 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 
 如需随 Windows 启动，在「管理面板 → 常规」打开首项“开机自动启动”。下次登录当前账户时，Windows 会从当前位置启动 DeskIsle。
 
-## 使用
+## 🧭 使用指南
 
-### 顶部状态栏
+### 🔝 顶部状态栏
 
 - **系统菜单**。单击最左侧的圆环标志打开系统菜单。菜单打开期间，圆环轻按一下，中心长出一枚实心圆点，像湖心出现一座小岛；菜单关闭后圆点收回。菜单中可打开仿 macOS 的关于本机卡片（处理器、图形卡、内存和 Windows 版本）、DeskIsle 管理面板、Windows 设置、应用商店和任务管理器，也可显示桌面，或让电脑睡眠、重新启动、关机、锁定屏幕和注销。重新启动、关机和注销不强制关闭应用，有未保存工作的应用仍可提示。
 - **前台应用**。标志右侧显示前台应用名称，点击可打开该应用的窗口列表或退出。
@@ -52,7 +112,7 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 - **资源监控**。在「管理面板 → 监控」选择顶栏项目。监控图标位于应用托盘与系统图标之间，默认显示内存条形和 CPU 百分比。CPU、内存和磁盘活动支持条形、环形、曲线和数值。开启高占用提醒后，达到 90% 的项目会变色。
 - **温度**。核心温度显示 Core Temp 共享的最高核心温度，勾选 GPU 可另外显示显卡驱动报告的温度。Core Temp 需提供绝对温度。未取得有效读数或计数器正在预热时，顶栏显示「—」。
 
-### Dock
+### ⚓ Dock
 
 - **启动与切换**。左键启动应用或切换窗口，多窗口时可从列表中选择。中键新开一个实例。
 - **文件夹**。把文件夹拖到 Dock 的应用区域即可固定。点击后可分页浏览内容，选择文件可用默认应用打开，也可在文件资源管理器中打开整个目录。
@@ -71,13 +131,13 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 | 桌面 | 仅在桌面位于前台时显示 |
 | 始终显示 | 切换应用时将 Dock 重新置顶；需要在全屏应用上使用时选择“始终显示包括全屏” |
 
-### 启动台
+### 🚀 启动台
 
 单击 Dock 左端的四格按钮打开启动台。将一个或多个 `.lnk`、`.exe` 或 `.url` 文件拖到四格按钮或已打开的启动台，松开即可加入列表。拖入时四格按钮抬起，已打开的启动台会显示接收提示；添加成功后，按钮会轻轻回弹。重复拖入同一路径只保留一项。也可以把 Dock 上的应用拖到启动台，原有固定位置会保留。需要取文件时可用 Alt+Tab 切换窗口。
 
 直接输入名称搜索，用滚轮或底部圆点翻页。右键图标可从列表移除，原文件保留。按 Esc 或再次单击启动台按钮即可关闭。
 
-### 管理面板与退出
+### ⚙️ 管理面板与退出
 
 右键顶部栏标志，或点击栏空白处打开菜单，选择“设置”或“退出 DeskIsle”。也可在系统菜单中选择“管理面板”。
 
@@ -89,7 +149,7 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 - **时间**：时钟格式预览，仅本次运行有效。
 - **关于**：查看当前 DeskIsle 版本、检查更新、打开 GitHub 项目主页或版本发布页。选择“退出程序”会退出 DeskIsle 并恢复系统任务栏。
 
-## 常见问题
+## ❓ 常见问题
 
 - **托盘图标一直显示“仅显示”，或顶部栏提示权限受限**。标为“仅显示”的图标仍可固定，应用注册点击回调后即可操作。如果一直无法操作，可在设置中关闭“隐藏系统任务栏”，从 Windows 原生通知区域操作。
 - **托盘菜单位置或内容不一致**。托盘菜单由所属应用绘制，菜单位置和可用操作取决于应用。
@@ -97,13 +157,13 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 - **点击“睡眠”后屏幕关闭但没有立即睡眠**。在支持现代待机的电脑上，DeskIsle 会请求关闭屏幕，随后由 Windows 按电源策略进入低功耗状态。
 - **DeskIsle 被强制结束后**。恢复进程会感知主进程退出并还原原生任务栏。Explorer 可能暂时保留顶部预留的条带。
 
-## 卸载
+## 🧹 卸载
 
 1. 在「管理面板 → 常规」关闭开机启动。
 2. 从菜单选择“退出 DeskIsle”，任务栏和工作区会恢复。
 3. 删除 `deskisle.exe`。如需清除配置，再删除 `%APPDATA%\DeskIsle\`。
 
-## 本地配置
+## 🗂️ 本地配置
 
 配置保存在 `%APPDATA%\DeskIsle\`，开机自动启动状态由当前用户的 Windows 注册表启动项管理。
 
@@ -115,7 +175,7 @@ DeskIsle 默认在运行期间隐藏主屏的 Windows 任务栏，退出时恢�
 | `tray-hidden.txt` | 隐藏的托盘图标 |
 | `tray-order.txt` | 用户调整过的托盘图标顺序 |
 
-## 开发
+## 🛠️ 开发
 
 开发前阅读[开发规范](AGENTS.md)、[开发选型](docs/technology.md)和[架构规范](docs/architecture.md)。代码按以下层次组织：
 
@@ -136,14 +196,29 @@ cargo test --locked
 
 在交互式 Windows 桌面上，可运行 `cargo test --locked --test windows_bars -- --ignored` 验证双栏位置和工作区恢复。
 
-## 自动发布
+<details>
+<summary><b>自动发布</b></summary>
+
+<br />
 
 向 `main` 提交 PR 或推送代码时，GitHub Actions 会在 Windows x64 上运行格式检查、Clippy、测试和 Release 构建。需要交互式桌面的测试仍由开发者在本机运行。
 
 发布新版本时，更新 `Cargo.toml` 的 `[package].version`，运行 `cargo check` 同步 `Cargo.lock`，将两者一起合入 `main`。检查通过后，工作流会为尚未发布的版本在本次提交上创建 `v<版本号>` 标签和 GitHub Release，生成发布说明，并附上 `deskisle.exe`。已发布的版本会跳过，带预发布标识的版本（如 `0.2.0-beta.1`）会标记为预发布。
 
-## 项目文档
+</details>
+
+## 📚 项目文档
 
 - [开发规范](AGENTS.md)
 - [开发选型](docs/technology.md)
 - [架构规范](docs/architecture.md)
+
+<div align="center">
+
+<br />
+
+<img src="docs/images/logo.svg" width="40" alt="" />
+
+<sub>Made with Rust for Windows 11 · 如果 DeskIsle 让你的桌面更安静一点，欢迎点一颗 ⭐</sub>
+
+</div>
