@@ -1,5 +1,6 @@
 pub mod about;
 pub mod audio;
+pub mod backdrop;
 pub mod display;
 mod drop_files;
 pub mod input;
@@ -355,48 +356,56 @@ impl Drop for AppBar {
     }
 }
 
-impl Bar {
-    /// Windows 11 22H2 and newer can provide desktop acrylic beneath the top surface.
-    /// On other builds the renderer paints the frosted style with an opaque fallback.
-    pub fn set_top_backdrop(&self, requested: bool, dark: bool) -> bool {
-        let material = if requested {
-            DWMSBT_TRANSIENTWINDOW
-        } else {
-            DWMSBT_NONE
-        };
-        let set_material = |material: windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE| unsafe {
+/// Applies Windows' desktop acrylic to an owned UI window when the system supports it.
+pub fn set_window_backdrop(hwnd: HWND, requested: bool, dark: bool) -> bool {
+    set_backdrop_region(hwnd, requested, dark, -1)
+}
+
+pub fn set_backdrop_region(hwnd: HWND, requested: bool, dark: bool, height: i32) -> bool {
+    let material = if requested {
+        DWMSBT_TRANSIENTWINDOW
+    } else {
+        DWMSBT_NONE
+    };
+    let set_material = |material: windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE| unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&raw const material).cast(),
+            size_of_val(&material) as u32,
+        )
+    };
+    if set_material(material).is_err() {
+        return false;
+    }
+    let margins = MARGINS {
+        cxLeftWidth: if requested && height < 0 { -1 } else { 0 },
+        cyTopHeight: if requested { height.max(0) } else { 0 },
+        ..Default::default()
+    };
+    if unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }.is_err() {
+        if requested {
+            let _ = set_material(DWMSBT_NONE);
+        }
+        return false;
+    }
+    if requested {
+        let dark = BOOL::from(dark);
+        let _ = unsafe {
             DwmSetWindowAttribute(
-                self.0,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&raw const material).cast(),
-                size_of_val(&material) as u32,
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const dark).cast(),
+                size_of_val(&dark) as u32,
             )
         };
-        if set_material(material).is_err() {
-            return false;
-        }
-        let margins = MARGINS {
-            cxLeftWidth: if requested { -1 } else { 0 },
-            ..Default::default()
-        };
-        if unsafe { DwmExtendFrameIntoClientArea(self.0, &margins) }.is_err() {
-            if requested {
-                let _ = set_material(DWMSBT_NONE);
-            }
-            return false;
-        }
-        if requested {
-            let dark = BOOL::from(dark);
-            let _ = unsafe {
-                DwmSetWindowAttribute(
-                    self.0,
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    (&raw const dark).cast(),
-                    size_of_val(&dark) as u32,
-                )
-            };
-        }
-        requested
+    }
+    requested
+}
+
+impl Bar {
+    pub fn set_top_backdrop(&self, requested: bool, dark: bool) -> bool {
+        set_window_backdrop(self.0, requested, dark)
     }
 
     pub fn capture(&self) {
@@ -841,6 +850,43 @@ pub fn clock(hwnd: HWND) -> Result<String> {
 /// DeskIsle's own popup menu window. It takes activation so that a click anywhere else
 /// deactivates it; clicks on the bars, which never activate, arrive as [`Event::Press`].
 pub struct MenuWindow(pub HWND);
+
+/// A click-through label owned by the Dock. STATIC needs no additional window procedure.
+pub struct LabelWindow(pub HWND);
+
+impl LabelWindow {
+    pub fn create(owner: HWND, rect: Rect) -> Result<Self> {
+        unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOPMOST
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOREDIRECTIONBITMAP,
+                w!("STATIC"),
+                None,
+                WS_POPUP,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )
+            .map(Self)
+        }
+    }
+    pub fn show(&self) {
+        let _ = unsafe { ShowWindow(self.0, SW_SHOWNOACTIVATE) };
+    }
+}
+impl Drop for LabelWindow {
+    fn drop(&mut self) {
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
 
 impl MenuWindow {
     /// Creates the hidden window at `r`, in screen pixels, for the renderer to bind to.

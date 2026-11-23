@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 
 use super::Bars;
 use crate::geometry::Rect;
+use crate::platform::backdrop::Backdrop;
 use crate::platform::preview::{PreviewEvent, PreviewWindow};
 use crate::platform::{self, shell};
 use crate::render::is_device_lost;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::ui::layout::DockHit;
 use crate::ui::preview::PreviewHit;
 use windows::Win32::Foundation::POINT;
@@ -45,6 +47,8 @@ pub(super) struct Preview {
     pub(super) app_id: String,
     source_ids: Vec<isize>,
     window: PreviewWindow,
+    backdrop: Option<Backdrop>,
+    blur: Option<i32>,
     anchor: (i32, i32),
     work: Rect,
     dpi: u32,
@@ -52,6 +56,12 @@ pub(super) struct Preview {
     /// Hit target and source window ID captured when the left button went down.
     pressed: Option<(PreviewHit, isize)>,
     grace: Option<LeaveGrace>,
+}
+
+impl Preview {
+    pub(super) fn bounds(&self) -> Rect {
+        self.window.bounds()
+    }
 }
 
 impl Bars {
@@ -188,14 +198,32 @@ impl Bars {
 
     /// Repaints the open preview without recovering from a lost device.
     pub(super) fn paint_preview(&mut self) -> Result<()> {
-        let (Some(preview), Some(renderer)) = (&self.preview, self.renderer.as_mut()) else {
+        let (Some(preview), Some(renderer)) = (&mut self.preview, self.renderer.as_mut()) else {
             return Ok(());
         };
+        let blur = (self.settings.enabled(Appearance(WindowCustom))
+            && self.settings.get(Appearance(WindowOpacity)) < 100)
+            .then(|| self.settings.get(Appearance(WindowBlur)));
+        if preview.blur != blur {
+            // GDI presents the chrome as opaque pixels, so even clear glass needs
+            // the pixels under the preview. A denied capture keeps the opaque fill.
+            preview.backdrop = blur.and_then(|strength| {
+                Backdrop::behind(
+                    preview.window.hwnd(),
+                    preview.window.bounds(),
+                    strength,
+                    false,
+                )
+                .ok()
+            });
+            preview.blur = blur;
+        }
         let pixels = renderer.paint_preview(
             preview.window.layout(),
             preview.window.windows(),
             preview.dpi,
             preview.hover,
+            preview.backdrop.as_ref(),
         )?;
         preview.window.set_pixels(pixels);
         Ok(())
@@ -283,6 +311,8 @@ impl Bars {
                     app_id,
                     source_ids,
                     window,
+                    backdrop: None,
+                    blur: None,
                     anchor: anchor_xy,
                     work: self.monitor.work,
                     dpi: self.monitor.dpi,

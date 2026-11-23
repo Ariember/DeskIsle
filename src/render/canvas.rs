@@ -1,3 +1,6 @@
+mod reflection;
+pub(super) use reflection::Reflection;
+
 use windows::Win32::{
     Foundation::{POINT, RECT},
     Graphics::{
@@ -10,7 +13,7 @@ use windows::Win32::{
 };
 use windows::core::{Result, w};
 
-use crate::settings::{Key, Settings, TopBarBackground};
+use crate::settings::{AppearanceKey, Key, Settings, TopBarBackground};
 use crate::ui::icon::{self, Paint, Step, Symbol, Tone};
 use crate::ui::panel::Area;
 
@@ -508,15 +511,8 @@ impl Canvas {
 
     /// A soft drop shadow under a rounded rectangle, stacked from translucent layers.
     /// It is painted once into the surface, so it costs nothing per frame.
-    pub(super) fn shadow(
-        &self,
-        l: f32,
-        t: f32,
-        r: f32,
-        b: f32,
-        radius: f32,
-        spread: f32,
-    ) -> Result<()> {
+    pub(super) fn shadow(&self, area: Area, radius: f32, spread: f32, opacity: f32) -> Result<()> {
+        let (l, t, r, b) = (area.left, area.top, area.right, area.bottom);
         const LAYERS: usize = 10;
         let drop = spread * 0.25;
         for k in 0..LAYERS {
@@ -528,22 +524,10 @@ impl Canvas {
                 b + d + drop,
                 radius + d,
                 (0, 0, 0),
-                0.02,
+                0.02 * opacity,
             )?;
         }
         Ok(())
-    }
-
-    pub(super) fn bar_glass(&self, a: Area, radius: f32) -> Result<()> {
-        self.gradient(
-            a.left,
-            a.top,
-            a.right,
-            a.bottom,
-            radius,
-            (self.p.panel_top, 0.74),
-            (self.p.bar, 0.64),
-        )
     }
 
     pub(super) fn dock_background(
@@ -551,10 +535,27 @@ impl Canvas {
         width: i32,
         height: i32,
         separators: &[i32],
+        settings: &Settings,
     ) -> Result<()> {
         let s = self.scale;
         let (w, h) = (width as f32 / s, height as f32 / s);
-        self.bar_glass(Area::new(0., 0., w, h), 18.)?;
+        let get = |key| settings.get(Key::Appearance(key));
+        let (top, bottom, radius, mut a, mut b) = match get(AppearanceKey::DockSkin) {
+            1 => ((239, 247, 255), (162, 193, 211), 18., 0.78, 0.62),
+            2 => ((54, 57, 64), (20, 22, 26), 12., 0.95, 0.90),
+            _ => (self.p.panel_top, self.p.bar, 18., 0.74, 0.64),
+        };
+        let mut edge = 0.16;
+        if get(AppearanceKey::DockCustom) != 0 {
+            let opacity = get(AppearanceKey::DockOpacity) as f32 / 100.;
+            let glass = get(AppearanceKey::DockBlur) as f32 / 100.;
+            // Windows supplies the acrylic behind the bar. Reveal more of that
+            // material as strength increases, preserving the opacity endpoints.
+            a = opacity;
+            b = opacity - opacity * (1. - opacity) * glass;
+            edge *= opacity;
+        }
+        self.gradient(0., 0., w, h, radius, (top, a), (bottom, b))?;
         // Align the one-DIP rule to whole pixels, including at fractional DPI.
         let thickness = s.round().max(1.) as i32;
         let inset = (height as f32 * 0.18).round() / s;
@@ -570,7 +571,7 @@ impl Canvas {
                 0.30,
             )?;
         }
-        self.stroke(0., 0., w, h, 18., self.p.line, 0.16)
+        self.stroke(0., 0., w, h, radius, self.p.line, edge)
     }
 
     /// Shared by the live top bar and the three miniatures in settings.
@@ -683,6 +684,60 @@ impl Canvas {
             std::mem::ManuallyDrop::drop(&mut params.opacityBrush);
             result
         }
+    }
+
+    /// Paints a captured backdrop into the same rounded bounds as its tint.
+    pub(super) fn backdrop(
+        &self,
+        image: &crate::platform::backdrop::Backdrop,
+        area: Area,
+        radius: f32,
+    ) -> Result<()> {
+        // CreateBitmap trusts the pointer and stride. Check the buffer before passing
+        // it across the API boundary, including on 32-bit targets.
+        let stride = image.width.checked_mul(4).ok_or_else(|| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
+        if stride == 0
+            || image.height == 0
+            || (stride as usize).checked_mul(image.height as usize) != Some(image.pixels.len())
+        {
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+        let shape = self.shape(area.left, area.top, area.right, area.bottom, radius);
+        let size = D2D_SIZE_U {
+            width: image.width,
+            height: image.height,
+        };
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.,
+            dpiY: 96.,
+            ..Default::default()
+        };
+        let mut brush_props = D2D1_BRUSH_PROPERTIES {
+            opacity: 1.,
+            ..Default::default()
+        };
+        brush_props.transform.M11 = (shape.rect.right - shape.rect.left) / image.width as f32;
+        brush_props.transform.M22 = (shape.rect.bottom - shape.rect.top) / image.height as f32;
+        brush_props.transform.M31 = shape.rect.left;
+        brush_props.transform.M32 = shape.rect.top;
+        unsafe {
+            let bitmap =
+                self.ctx
+                    .CreateBitmap(size, Some(image.pixels.as_ptr().cast()), stride, &props)?;
+            let brush = self
+                .ctx
+                .CreateBitmapBrush(&bitmap, None, Some(&brush_props))?;
+            self.ctx.FillRoundedRectangle(&shape, &brush);
+        }
+        Ok(())
     }
 
     pub(super) fn bitmap(&self, bitmap: &IWICBitmapSource, rect: D2D_RECT_F) -> Result<()> {
@@ -1056,6 +1111,36 @@ pub(super) fn text_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backdrop_fills_only_rounded_bounds_and_ignores_gdi_alpha() -> Result<()> {
+        use crate::platform::backdrop::Backdrop;
+        use windows::Win32::Graphics::{Direct3D::D3D_DRIVER_TYPE_WARP, Dxgi::IDXGIDevice};
+        use windows::core::Interface;
+
+        let dxgi: IDXGIDevice = super::super::d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
+        let device = unsafe { D2D1CreateDevice(&dxgi, None)? };
+        let image = Backdrop {
+            width: 2,
+            height: 1,
+            // GDI only supplies BGR; a zero high byte must still draw opaquely.
+            pixels: vec![255, 0, 0, 0, 0, 0, 255, 0],
+        };
+        let pixels = paint_pixels(
+            &device,
+            Palette::new(false, &Settings::default()),
+            40,
+            20,
+            96,
+            |c| c.backdrop(&image, Area::new(4., 2., 36., 18.), 6.),
+        )?;
+        let at = |x: usize, y: usize| &pixels[(y * 40 + x) * 4..(y * 40 + x + 1) * 4];
+        assert_eq!(at(0, 10), [0; 4]);
+        assert_eq!(at(4, 2), [0; 4]);
+        assert_eq!(at(8, 10), [255, 0, 0, 255]);
+        assert_eq!(at(31, 10), [0, 0, 255, 255]);
+        Ok(())
+    }
 
     #[test]
     fn gradient_mask_top_bar_uses_light_foreground_in_both_themes() {

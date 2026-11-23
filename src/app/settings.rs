@@ -4,7 +4,9 @@
 use super::Bars;
 use crate::platform::{self, Event, PanelKey, PanelWindow, display, startup};
 use crate::render::is_device_lost;
-use crate::settings::{Adjust, Key, SCHEMA, SECTIONS, Settings, Store, Theme, TopBarBackground};
+use crate::settings::{
+    Adjust, AppearanceKey as A, Key, SCHEMA, SECTIONS, Settings, Store, Theme, TopBarBackground,
+};
 use crate::storage;
 use crate::ui::layout::DockStyle;
 use crate::ui::panel::{Action, Nav, PanelLayout, PanelState, panel_dpi};
@@ -105,10 +107,26 @@ impl Bars {
         dark(&self.settings)
     }
 
-    pub(super) fn sync_top_backdrop(&mut self) {
-        let theme = (self.settings.top_bar_background() == TopBarBackground::Frosted
-            && display::transparency().unwrap_or(false))
-        .then(|| self.dark());
+    pub(super) fn sync_bar_backdrops(&mut self) {
+        let level = |key| self.settings.get(Key::Appearance(key));
+        let custom = level(A::TopCustom) != 0;
+        self.wallpaper_tint = if custom && level(A::TopTint) > 0 {
+            platform::backdrop::wallpaper_tint(self.monitor.bounds).ok()
+        } else {
+            None
+        };
+
+        let frosted = if custom {
+            level(A::TopBlur) > 0
+        } else {
+            self.settings.top_bar_background() == TopBarBackground::Frosted
+        };
+        let dock_frosted = level(A::DockCustom) != 0 && level(A::DockBlur) > 0;
+        let glass = (frosted || dock_frosted) && display::transparency().unwrap_or(false);
+        let dark = glass.then(|| self.dark());
+        let theme = dark.filter(|_| frosted);
+        self.dock_glass_requested = dark.filter(|_| dock_frosted);
+        self.sync_dock_backdrop();
         if theme != self.top_glass_theme {
             self.top_glass = self
                 .top
@@ -135,7 +153,7 @@ impl Bars {
     /// panel's sidebar after transparency effects were switched; Windows announces both
     /// as a setting change. The bars repaint on their next draw; the panel repaints here.
     pub(super) fn apply_theme(&mut self) -> Result<()> {
-        self.sync_top_backdrop();
+        self.sync_bar_backdrops();
         let dark = self.dark();
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
@@ -143,6 +161,7 @@ impl Bars {
         let repalette = renderer.set_appearance(dark, &self.settings);
         self.retheme_about(dark, repalette)?;
         if repalette {
+            self.label = None;
             self.retheme_preview(dark)?;
             self.draw_launchpad()?;
         }
@@ -418,7 +437,7 @@ impl Bars {
                     top_height_changed = true;
                     Ok(())
                 }
-                Key::TopBarBackground | Key::ColorTrayIcons => {
+                Key::Appearance(_) | Key::TopBarBackground | Key::ColorTrayIcons => {
                     retheme = true;
                     Ok(())
                 }

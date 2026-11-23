@@ -1,7 +1,9 @@
 mod about;
 mod commands;
 mod drag;
+mod folder;
 mod immersion;
+mod label;
 mod launchpad;
 mod menus;
 mod monitor;
@@ -53,6 +55,8 @@ struct Bars {
     /// Unregister the global shortcut before destroying its owner window.
     taskbar_shortcut: Option<platform::Shortcut>,
     dock_shortcut: Option<platform::Shortcut>,
+    // The owned label window must be destroyed before its Dock owner.
+    label: Option<label::DockLabel>,
     top: Bar,
     bottom: Bar,
     pins: Vec<Pin>,
@@ -67,6 +71,9 @@ struct Bars {
     /// Last acrylic request (dark or light), and whether DWM supplied the material.
     top_glass_theme: Option<bool>,
     top_glass: bool,
+    dock_glass_requested: Option<bool>,
+    dock_glass_region: Option<(bool, i32)>,
+    wallpaper_tint: Option<(u8, u8, u8)>,
     /// A full-screen application covers the primary monitor.
     fullscreen: bool,
     /// What the shell last reported. It also reports the desktop as a full-screen
@@ -240,6 +247,10 @@ pub(crate) fn run() -> Result<()> {
         top_rect,
         top_glass_theme: None,
         top_glass: false,
+        dock_glass_requested: None,
+        dock_glass_region: None,
+        wallpaper_tint: None,
+        label: None,
         fullscreen,
         shell_fullscreen: fullscreen,
         layout,
@@ -273,7 +284,7 @@ pub(crate) fn run() -> Result<()> {
         platform::report_error(Some(bars.top.0), &error);
         bars.settings.set(Key::ShowInputLanguageIcon, 0);
     }
-    bars.sync_top_backdrop();
+    bars.sync_bar_backdrops();
     bars.refresh_top_window(true);
     bars.apply_monitor_settings()?;
     bars.position()?;
@@ -298,7 +309,10 @@ pub(crate) fn run() -> Result<()> {
                 bars.restatus();
                 bars.draw()?;
             }
-            Event::Display => bars.display(false)?,
+            Event::Display => {
+                bars.display(false)?;
+                bars.refresh_launchpad_desktop()?;
+            }
             Event::AppBarMoved => bars.display(true)?,
             Event::ShellRestart if bars.appbar.shell_changed() => {
                 bars.hide_taskbar()?;
@@ -887,6 +901,7 @@ impl Bars {
 
     fn rebuild_renderer(&mut self) -> Result<()> {
         // Release composition targets before binding a new device to these HWNDs.
+        self.label = None;
         self.renderer.take();
         self.renderer = Some(
             Renderer::new(self.top.0, self.bottom.0, self.dark(), &self.settings)
@@ -900,6 +915,7 @@ impl Bars {
     }
 
     fn draw_frame(&mut self) -> Result<()> {
+        self.sync_dock_label()?;
         let (preview, dock_hover) = self.dock_preview();
         let dropping = self.dropping_on_launchpad();
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
@@ -940,6 +956,7 @@ impl Bars {
             .iter()
             .map(|&(item, _)| self.system.mark(item))
             .collect::<Vec<_>>();
+        renderer.wallpaper_tint = self.wallpaper_tint;
         renderer.draw_top(
             &self.status,
             dpi,

@@ -9,6 +9,7 @@ use crate::visibility::DockDisplayMode;
 /// [`Settings`]; the panel and the settings file go through [`SCHEMA`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
+    Appearance(AppearanceKey),
     InterfaceScale,
     Backdrop,
     Theme,
@@ -68,6 +69,7 @@ pub enum MonitorKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     General,
+    Appearance,
     Dock,
     TopBar,
     Clock,
@@ -77,6 +79,7 @@ pub enum Section {
 
 pub const SECTIONS: &[Section] = &[
     Section::General,
+    Section::Appearance,
     Section::Dock,
     Section::TopBar,
     Section::Clock,
@@ -88,6 +91,7 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::General => "常规",
+            Section::Appearance => "主题",
             Section::Dock => "Dock",
             Section::TopBar => "顶部栏",
             Section::Clock => "时间",
@@ -323,6 +327,126 @@ const fn top_bar_toggle(
         store: Store::File,
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppearanceKey {
+    DockCustom,
+    DockBlur,
+    DockOpacity,
+    Reflection,
+    ReflectionBlur,
+    ReflectionOpacity,
+    ReflectionDistance,
+    ReflectionFade,
+    LabelCustom,
+    LabelBlur,
+    LabelOpacity,
+    LabelBorder,
+    MenuCustom,
+    MenuBlur,
+    MenuOpacity,
+    MenuBorder,
+    FolderCustom,
+    FolderBlur,
+    FolderOpacity,
+    FolderBorder,
+    FolderIconCustom,
+    FolderIconSize,
+    WindowCustom,
+    WindowBlur,
+    WindowOpacity,
+    WindowBorder,
+    TopCustom,
+    TopBlur,
+    TopOpacity,
+    TopTint,
+    LaunchpadCustom,
+    LaunchpadWallpaper,
+    LaunchpadDynamic,
+    LaunchpadBlur,
+    IconTheme,
+    DockSkin,
+}
+
+impl AppearanceKey {
+    /// The switch controlling this setting, if any. Switching it off keeps the stored value.
+    pub fn parent(self) -> Option<Self> {
+        use AppearanceKey::*;
+        match self {
+            DockBlur | DockOpacity => Some(DockCustom),
+            ReflectionBlur | ReflectionOpacity | ReflectionDistance | ReflectionFade => {
+                Some(Reflection)
+            }
+            LabelBlur | LabelOpacity | LabelBorder => Some(LabelCustom),
+            MenuBlur | MenuOpacity | MenuBorder => Some(MenuCustom),
+            FolderBlur | FolderOpacity | FolderBorder => Some(FolderCustom),
+            FolderIconSize => Some(FolderIconCustom),
+            WindowBlur | WindowOpacity | WindowBorder => Some(WindowCustom),
+            TopBlur | TopOpacity | TopTint => Some(TopCustom),
+            LaunchpadWallpaper | LaunchpadDynamic | LaunchpadBlur => Some(LaunchpadCustom),
+            _ => None,
+        }
+    }
+
+    pub fn editable(self, settings: &Settings) -> bool {
+        self.parent()
+            .is_none_or(|parent| settings.enabled(Key::Appearance(parent)))
+            && (self != Self::LaunchpadDynamic
+                || !settings.enabled(Key::Appearance(Self::LaunchpadWallpaper)))
+    }
+}
+
+const fn appearance(
+    key: AppearanceKey,
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+    control: Control,
+    default: i32,
+) -> Spec {
+    Spec {
+        key: Key::Appearance(key),
+        id,
+        section: Section::Appearance,
+        label,
+        help,
+        control,
+        default,
+        store: Store::File,
+    }
+}
+
+const fn appearance_percent(
+    key: AppearanceKey,
+    id: &'static str,
+    label: &'static str,
+    default: i32,
+) -> Spec {
+    appearance(
+        key,
+        id,
+        label,
+        "",
+        Control::Slider {
+            min: 0,
+            max: 100,
+            step: 1,
+            unit: "%",
+        },
+        default,
+    )
+}
+
+const fn appearance_toggle(
+    key: AppearanceKey,
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+) -> Spec {
+    appearance(key, id, label, help, Control::Toggle, 0)
+}
+
+use AppearanceKey as A;
 
 pub const SCHEMA: &[Spec] = &[
     Spec {
@@ -838,6 +962,217 @@ pub const SCHEMA: &[Spec] = &[
         Control::Choice(MONITOR_STYLES),
         2,
     ),
+    appearance_toggle(
+        A::DockCustom,
+        "appearance.dock.custom",
+        "自定义 Dock 背景",
+        "调整 Dock 底板的毛玻璃与不透明度",
+    ),
+    appearance_percent(A::DockBlur, "appearance.dock.blur", "模糊强度", 30),
+    appearance_percent(
+        A::DockOpacity,
+        "appearance.dock.opacity",
+        "背景不透明度",
+        50,
+    ),
+    appearance_toggle(
+        A::Reflection,
+        "appearance.reflection.enabled",
+        "Dock 图标倒影",
+        "在 Dock 图标下方显示镜像",
+    ),
+    appearance_percent(
+        A::ReflectionBlur,
+        "appearance.reflection.blur",
+        "倒影模糊强度",
+        100,
+    ),
+    appearance_percent(
+        A::ReflectionOpacity,
+        "appearance.reflection.opacity",
+        "倒影不透明度",
+        45,
+    ),
+    appearance(
+        A::ReflectionDistance,
+        "appearance.reflection.distance",
+        "倒影距离",
+        "",
+        Control::Slider {
+            min: 0,
+            max: 12,
+            step: 1,
+            unit: "DIP",
+        },
+        6,
+    ),
+    appearance_percent(
+        A::ReflectionFade,
+        "appearance.reflection.fade",
+        "倒影渐变距离",
+        0,
+    ),
+    appearance_toggle(
+        A::LabelCustom,
+        "appearance.label.custom",
+        "显示 Dock 图标标签",
+        "悬停时显示名称，可调整背景与边框",
+    ),
+    appearance_percent(A::LabelBlur, "appearance.label.blur", "模糊强度", 30),
+    appearance_percent(
+        A::LabelOpacity,
+        "appearance.label.opacity",
+        "背景不透明度",
+        50,
+    ),
+    appearance_percent(
+        A::LabelBorder,
+        "appearance.label.border",
+        "边框不透明度",
+        50,
+    ),
+    appearance_toggle(
+        A::MenuCustom,
+        "appearance.menu.custom",
+        "自定义菜单背景",
+        "调整 DeskIsle 菜单和下拉面板",
+    ),
+    appearance_percent(A::MenuBlur, "appearance.menu.blur", "模糊强度", 30),
+    appearance_percent(
+        A::MenuOpacity,
+        "appearance.menu.opacity",
+        "背景不透明度",
+        50,
+    ),
+    appearance_percent(A::MenuBorder, "appearance.menu.border", "边框不透明度", 50),
+    appearance_toggle(
+        A::FolderCustom,
+        "appearance.folder.custom",
+        "自定义文件夹背景",
+        "调整文件夹面板的背景与边框",
+    ),
+    appearance_percent(A::FolderBlur, "appearance.folder.blur", "模糊强度", 30),
+    appearance_percent(
+        A::FolderOpacity,
+        "appearance.folder.opacity",
+        "背景不透明度",
+        50,
+    ),
+    appearance_percent(
+        A::FolderBorder,
+        "appearance.folder.border",
+        "边框不透明度",
+        50,
+    ),
+    appearance_toggle(
+        A::FolderIconCustom,
+        "appearance.folder.custom_icons",
+        "自定义文件夹图标大小",
+        "调整文件夹面板内的图标",
+    ),
+    appearance(
+        A::FolderIconSize,
+        "appearance.folder.icon_size",
+        "图标大小",
+        "",
+        Control::Slider {
+            min: 16,
+            max: 48,
+            step: 1,
+            unit: "DIP",
+        },
+        24,
+    ),
+    appearance_toggle(
+        A::WindowCustom,
+        "appearance.window.custom",
+        "自定义窗口预览背景",
+        "调整 Dock 上方的窗口预览卡片",
+    ),
+    appearance_percent(A::WindowBlur, "appearance.window.blur", "模糊强度", 30),
+    appearance_percent(
+        A::WindowOpacity,
+        "appearance.window.opacity",
+        "背景不透明度",
+        50,
+    ),
+    appearance_percent(
+        A::WindowBorder,
+        "appearance.window.border",
+        "边框不透明度",
+        50,
+    ),
+    appearance_toggle(
+        A::TopCustom,
+        "appearance.top.custom",
+        "自定义顶部栏背景",
+        "调整顶部状态栏外观，沉浸模式优先使用窗口配色",
+    ),
+    appearance_percent(A::TopBlur, "appearance.top.blur", "模糊强度", 30),
+    appearance_percent(A::TopOpacity, "appearance.top.opacity", "背景不透明度", 50),
+    appearance_percent(A::TopTint, "appearance.top.tint", "壁纸调色浓度", 0),
+    appearance_toggle(
+        A::LaunchpadCustom,
+        "appearance.launchpad.custom",
+        "自定义启动台背景",
+        "调整启动台打开时的背景与模糊效果",
+    ),
+    appearance_toggle(
+        A::LaunchpadWallpaper,
+        "appearance.launchpad.wallpaper",
+        "使用当前屏幕壁纸",
+        "将显示器壁纸用作启动台背景",
+    ),
+    appearance_toggle(
+        A::LaunchpadDynamic,
+        "appearance.launchpad.dynamic",
+        "使用动态模糊",
+        "使用屏幕后景时随窗口变化更新毛玻璃",
+    ),
+    appearance_percent(
+        A::LaunchpadBlur,
+        "appearance.launchpad.blur",
+        "模糊强度",
+        30,
+    ),
+    appearance(
+        A::IconTheme,
+        "appearance.icon_theme",
+        "图标主题",
+        "选择 Dock 图标的配色",
+        Control::Choice(&[
+            Choice {
+                id: "default",
+                label: "默认",
+            },
+            Choice {
+                id: "monochrome",
+                label: "单色",
+            },
+        ]),
+        0,
+    ),
+    appearance(
+        A::DockSkin,
+        "appearance.dock_skin",
+        "Dock 皮肤",
+        "选择 Dock 底板的样式",
+        Control::Choice(&[
+            Choice {
+                id: "default",
+                label: "默认",
+            },
+            Choice {
+                id: "frosted",
+                label: "磨砂",
+            },
+            Choice {
+                id: "ink",
+                label: "墨色",
+            },
+        ]),
+        0,
+    ),
 ];
 
 pub fn spec(key: Key) -> &'static Spec {
@@ -1179,6 +1514,29 @@ mod tests {
         }
         assert_eq!(restored, settings);
         assert_eq!(restored.icon_size(), 42);
+    }
+
+    #[test]
+    fn appearance_settings_keep_adjustments_while_the_effect_is_off() {
+        use AppearanceKey::*;
+        let mut settings = Settings::default();
+        settings.set_text("appearance.theme", "dark").unwrap();
+        assert!(!settings.enabled(Key::Appearance(Reflection)));
+        assert!(!ReflectionOpacity.editable(&settings));
+        settings.adjust(Key::Appearance(Reflection), Adjust::Toggle);
+        settings.adjust(Key::Appearance(ReflectionOpacity), Adjust::Set(73));
+        settings.adjust(Key::Appearance(Reflection), Adjust::Toggle);
+        settings.adjust(Key::Appearance(DockSkin), Adjust::Pick(2));
+        let mut restored = Settings::default();
+        for (id, value) in settings.file_entries() {
+            restored.set_text(id, &value).unwrap();
+        }
+        assert_eq!(restored, settings);
+        assert!(!ReflectionOpacity.editable(&restored));
+        restored.adjust(Key::Appearance(Reflection), Adjust::Toggle);
+        assert!(ReflectionOpacity.editable(&restored));
+        assert_eq!(restored.get(Key::Appearance(ReflectionOpacity)), 73);
+        assert_eq!(restored.theme(), Theme::Dark);
     }
 
     #[test]

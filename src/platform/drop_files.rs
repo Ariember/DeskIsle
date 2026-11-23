@@ -28,6 +28,11 @@ pub(super) enum Target {
 pub(super) struct Registration(HWND);
 
 impl Target {
+    fn accepts(self, path: &std::path::Path) -> bool {
+        crate::launchpad::supported(path)
+            || (matches!(self, Self::Dock) && super::shell::dock_folder(path))
+    }
+
     fn interface(self, hwnd: HWND) -> IDropTarget {
         FileTarget {
             hwnd,
@@ -73,7 +78,7 @@ struct FileTarget {
 enum FileKinds {
     None,
     Unsupported,
-    IncludesProgram,
+    IncludesSupported,
 }
 
 fn file_format() -> FORMATETC {
@@ -129,8 +134,8 @@ impl IDropTarget_Impl for FileTarget_Impl {
         // Inspect the names once on entry. The importer checks accessibility at drop
         // time and reports unsupported files, including those in a mixed selection.
         let files = match data.ok().and_then(ole_paths) {
-            Ok(paths) if paths.iter().any(|p| crate::launchpad::supported(p)) => {
-                FileKinds::IncludesProgram
+            Ok(paths) if paths.iter().any(|p| self.target.accepts(p)) => {
+                FileKinds::IncludesSupported
             }
             Ok(paths) if !paths.is_empty() => FileKinds::Unsupported,
             _ => FileKinds::None,
@@ -146,7 +151,7 @@ impl IDropTarget_Impl for FileTarget_Impl {
         *effect = destination.map_or(DROPEFFECT_NONE, |(_, effect)| effect);
         self.set_hover(
             destination
-                .filter(|_| self.files.get() == FileKinds::IncludesProgram)
+                .filter(|_| self.files.get() == FileKinds::IncludesSupported)
                 .map(|(point, _)| point),
         );
         Ok(())
@@ -171,7 +176,7 @@ impl IDropTarget_Impl for FileTarget_Impl {
         let result = if let Some(((x, y), accepted)) = destination {
             data.ok().and_then(ole_paths).map(|paths| {
                 if !paths.is_empty() {
-                    if paths.iter().any(|p| crate::launchpad::supported(p)) {
+                    if paths.iter().any(|p| self.target.accepts(p)) {
                         *effect = accepted;
                     }
                     let event = match self.target {

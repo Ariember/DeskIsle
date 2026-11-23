@@ -119,6 +119,8 @@ pub enum Entry<C> {
 #[derive(Clone, Debug)]
 pub struct Menu<C> {
     pub entries: Vec<Entry<C>>,
+    /// Dock folder contents use their own background and file icon size in DIPs.
+    pub folder_icon_size: Option<f32>,
     /// The narrowest the panel gets, in DIPs.
     pub min_width: f32,
     /// The widest the panel gets, in DIPs. Longer text ends in an ellipsis.
@@ -130,6 +132,7 @@ impl<C> Menu<C> {
     pub fn fixed(width: f32) -> Self {
         Self {
             entries: Vec::new(),
+            folder_icon_size: None,
             min_width: width,
             max_width: width,
         }
@@ -368,6 +371,7 @@ pub struct MenuLayout {
     pub rows: Vec<(f32, f32)>,
     /// Reserved for leading icons when at least one item uses one.
     pub icon_column: f32,
+    pub file_icon_size: f32,
 }
 
 impl MenuLayout {
@@ -376,12 +380,13 @@ impl MenuLayout {
         if matches!(menu.entries.last(), Some(Entry::Separator)) {
             menu.entries.pop();
         }
+        let file_icon_size = menu.folder_icon_size.unwrap_or(18.);
         let icon_column = if menu
             .entries
             .iter()
             .any(|entry| matches!(entry, Entry::Item(item) if item.icon != Icon::None))
         {
-            ICON_COLUMN
+            ICON_COLUMN + (file_icon_size - ICON_BADGE).max(0.)
         } else {
             0.
         };
@@ -405,7 +410,11 @@ impl MenuLayout {
                         width += 24. + measure(&item.detail, DETAIL_SIZE, false);
                     }
                     content = content.max(width + TEXT_INSET);
-                    ITEM_HEIGHT
+                    if matches!(item.icon, Icon::File(_)) {
+                        ITEM_HEIGHT.max(file_icon_size + 8.)
+                    } else {
+                        ITEM_HEIGHT
+                    }
                 }
                 Entry::Label(text) => {
                     let width = measure(text, DETAIL_SIZE, true);
@@ -457,6 +466,7 @@ impl MenuLayout {
             height: y + PADDING + SHADOW,
             rows,
             icon_column,
+            file_icon_size,
         }
     }
 
@@ -489,7 +499,10 @@ impl MenuLayout {
     /// The round backing of the leading icon in entry `index`'s row.
     pub fn icon_badge(&self, index: usize) -> (f32, f32, f32, f32) {
         let (left, top, _, bottom) = self.row(index);
-        let (x, y) = (left + ICON_INSET + ICON_BADGE / 2., (top + bottom) / 2.);
+        let (x, y) = (
+            left + ICON_INSET + ICON_BADGE.max(self.file_icon_size) / 2.,
+            (top + bottom) / 2.,
+        );
         let r = ICON_BADGE / 2.;
         (x - r, y - r, x + r, y + r)
     }
@@ -703,6 +716,7 @@ pub enum Command {
     Window(String, isize),
     NewInstance(PathBuf),
     OpenDocument(PathBuf),
+    FolderPage(usize),
     Reveal(PathBuf),
     /// Puts the full path of a program on the clipboard as text.
     CopyPath(PathBuf),
@@ -750,6 +764,65 @@ pub enum Command {
     /// Changes a system feature from a status bar flyout, which stays open.
     System(crate::ui::system::SystemCommand),
     Quit,
+}
+
+/// A Dock folder lists one page of Shell items above its icon.
+pub fn folder_menu(
+    folder: &std::path::Path,
+    title: &str,
+    paths: &[PathBuf],
+    icon_size: f32,
+    available: f32,
+    page: usize,
+) -> Menu<Command> {
+    let mut menu = Menu::fixed(DROPDOWN_WIDTH);
+    menu.folder_icon_size = Some(icon_size);
+    let row = ITEM_HEIGHT.max(icon_size + 8.);
+    let reserved = 2. * (PADDING + SHADOW) + GAP + HEADER_HEIGHT + ITEM_HEIGHT;
+    let single = ((available - reserved) / row).floor().max(1.) as usize;
+    let per_page = if paths.len() <= single {
+        single
+    } else {
+        ((available - reserved - 2. * ITEM_HEIGHT) / row)
+            .floor()
+            .max(1.) as usize
+    };
+    let pages = paths.len().div_ceil(per_page).max(1);
+    let page = page.min(pages - 1);
+    menu.header(
+        title,
+        format!("{} 个项目 · {}/{}", paths.len(), page + 1, pages),
+        Icon::Symbol(Symbol::Folder),
+    );
+    for path in paths.iter().skip(page * per_page).take(per_page) {
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        menu.item(
+            name,
+            Icon::File(path.clone()),
+            Some(Command::OpenDocument(path.clone())),
+        );
+    }
+    if pages > 1 {
+        menu.item(
+            "上一页",
+            Icon::None,
+            page.checked_sub(1).map(Command::FolderPage),
+        );
+        menu.item(
+            "下一页",
+            Icon::None,
+            (page + 1 < pages).then_some(Command::FolderPage(page + 1)),
+        );
+    }
+    menu.item(
+        "在文件资源管理器中打开",
+        Icon::Symbol(Symbol::Folder),
+        Some(Command::OpenDocument(folder.into())),
+    );
+    menu
 }
 
 /// Long lists end in a summary so the menu fits on screen.
@@ -1357,6 +1430,38 @@ mod tests {
         (0..menu.entries.len())
             .filter_map(|i| menu.command(i).cloned())
             .collect()
+    }
+
+    #[test]
+    fn large_folder_icons_fit_the_page_and_keep_each_file_reachable() {
+        let folder = std::path::Path::new(r"C:\Folder");
+        let files: Vec<_> = (0..27).map(|i| folder.join(format!("File {i}"))).collect();
+        let mut found = Vec::new();
+        let mut page = 0;
+        loop {
+            let mut menu = folder_menu(folder, "Folder", &files, 48., 400., page);
+            let layout = MenuLayout::new(&mut menu, 144, |_, _, _| 40.);
+            assert!(layout.height <= 400.);
+            let mut next = None;
+            for (index, entry) in menu.entries.iter().enumerate() {
+                let Entry::Item(item) = entry else { continue };
+                if let Icon::File(path) = &item.icon {
+                    let (_, y, _, end) = layout.row(index);
+                    assert!(end - y >= 48.);
+                    assert_eq!(item.command, Some(Command::OpenDocument(path.clone())));
+                    found.push(path.clone());
+                }
+                if let Some(Command::FolderPage(target)) = item.command
+                    && target > page
+                {
+                    next = Some(target);
+                }
+            }
+            let Some(target) = next else { break };
+            assert_eq!(target, page + 1);
+            page = target;
+        }
+        assert_eq!(found, files);
     }
 
     #[test]

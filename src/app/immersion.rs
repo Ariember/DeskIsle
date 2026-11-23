@@ -43,7 +43,21 @@ impl Bars {
         }
     }
 
-    pub(super) fn position_dock(&self) -> Result<()> {
+    pub(super) fn sync_dock_backdrop(&mut self) {
+        let region = self
+            .dock_glass_requested
+            .filter(|_| self.dock_shown())
+            .map(|dark| (dark, self.layout.bottom.height));
+        if region != self.dock_glass_region {
+            // Keep the transparent reveal strip below the drawn bar free of acrylic.
+            let (dark, height) = region.unwrap_or_default();
+            platform::set_backdrop_region(self.bottom.0, region.is_some(), dark, height);
+            self.dock_glass_region = region;
+        }
+    }
+
+    pub(super) fn position_dock(&mut self) -> Result<()> {
+        self.sync_dock_backdrop();
         self.bottom.position_layer(
             self.dock_window_rect(),
             self.dock_policy != DockPolicy::Hidden,

@@ -54,6 +54,7 @@ fn panel_caption(text: &str, traditional: bool) -> Result<Cow<'_, str>> {
 fn section_color(section: Section) -> Rgb {
     match section {
         Section::General => (87, 102, 116),
+        Section::Appearance => (154, 84, 159),
         Section::Dock => (27, 112, 178),
         Section::TopBar => (94, 83, 166),
         Section::Clock => (15, 128, 138),
@@ -66,6 +67,7 @@ fn section_color(section: Section) -> Rgb {
 fn section_symbol(section: Section) -> Symbol {
     match section {
         Section::General => Symbol::Computer,
+        Section::Appearance => Symbol::Palette,
         Section::Dock => Symbol::Dock,
         Section::TopBar => Symbol::Window,
         Section::Clock => Symbol::Clock,
@@ -478,6 +480,18 @@ impl Renderer {
             for (index, row) in layout.rows.iter().enumerate() {
                 if row.card.bottom > view.top && row.card.top < view.bottom {
                     self.paint_row(c, &t, layout, index, row)?;
+                    if !row.enabled {
+                        let a = row.card;
+                        c.fill(
+                            a.left + 1.,
+                            a.top + 1.,
+                            a.right - 1.,
+                            a.bottom - 1.,
+                            GROUP_RADIUS,
+                            mix(t.window, c.p.line, t.group),
+                            0.48,
+                        )?;
+                    }
                 }
             }
             Ok(())
@@ -537,6 +551,9 @@ impl Renderer {
             )?;
         }
         self.button_face(c, &t, r, 6., hover(Action::Reset))?;
+        if section == Section::Appearance && layout.focus == Some(layout.rows.len()) {
+            c.stroke(r.left, r.top, r.right, r.bottom, 6., t.accent, 1.)?;
+        }
         self.label_aligned(
             c,
             "恢复默认",
@@ -952,8 +969,14 @@ impl Renderer {
                     c.round(left, y - 2., x, y + 2., 2., t.accent)?;
                 }
                 self.button_face(c, t, Area::new(x - 5., y - 10., x + 5., y + 10.), 5., false)?;
+                let readout_top = area.top
+                    - if matches!(key, Key::Appearance(_)) {
+                        30.
+                    } else {
+                        45.
+                    };
                 let readout =
-                    Area::new(area.right - 76., area.top - 45., area.right, area.top - 25.);
+                    Area::new(area.right - 76., readout_top, area.right, readout_top + 20.);
                 self.label_aligned(
                     c,
                     &format!("{value} {unit}"),
@@ -1202,6 +1225,7 @@ mod render_tests {
             renderer.set_appearance(dark, &settings);
             for section in [
                 Section::General,
+                Section::Appearance,
                 Section::Dock,
                 Section::TopBar,
                 Section::About,

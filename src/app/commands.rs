@@ -68,7 +68,9 @@ impl Bars {
             Command::DateTime => shell::execute(owner, "ms-settings:dateandtime"),
             Command::Notifications => shell::execute(owner, "ms-actioncenter:"),
             // Navigation is handled inside the open menu.
-            Command::Calendar(..) | Command::TrayPage(_) => return Ok(false),
+            Command::FolderPage(_) | Command::Calendar(..) | Command::TrayPage(_) => {
+                return Ok(false);
+            }
             Command::TrayActivate(index) => {
                 self.tray_anchored_input(index, TrayInput::KeySelect)?;
                 return Ok(false);
@@ -153,7 +155,13 @@ impl Bars {
         match app.action() {
             Action::Launch(path) => {
                 if !was_running {
-                    shell::launch(self.bottom.0, path, id, &snapshot)?;
+                    if path.is_dir() {
+                        if let Some(index) = self.apps.iter().position(|app| app.app_id == id) {
+                            self.open_folder(path, self.icon_anchor(index))?;
+                        }
+                    } else {
+                        shell::launch(self.bottom.0, path, id, &snapshot)?;
+                    }
                 }
             }
             Action::Activate(window) => {

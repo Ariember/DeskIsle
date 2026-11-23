@@ -7,6 +7,8 @@ use windows::Win32::{
 };
 use windows::core::Result;
 
+use crate::platform::backdrop::Backdrop;
+use crate::settings::{AppearanceKey::*, Key::Appearance};
 use crate::ui::calendar::{self, Note};
 use crate::ui::icon::Symbol;
 use crate::ui::menu::{self, Calendar, Entry, Icon, Menu, MenuLayout, Slider};
@@ -117,6 +119,7 @@ impl Renderer {
     /// Paints `menu` into `hwnd`, a hidden menu window sized to `layout`, and fades it in
     /// when `animate`; a flyout rebuilt after a change appears in place instead.
     /// `tray` resolves tray icon indices while the tray host keeps owning the handles.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_menu<C>(
         &mut self,
         hwnd: HWND,
@@ -125,22 +128,46 @@ impl Renderer {
         dpi: u32,
         tray: &dyn Fn(usize) -> Option<HICON>,
         animate: bool,
+        backdrop: Option<&Backdrop>,
     ) -> Result<()> {
         self.close_menu();
         let (width, height) = layout.pixels();
         let (left, top, right, bottom) = layout.panel();
+        let (custom, opacity, border) = if menu.folder_icon_size.is_some() {
+            (FolderCustom, FolderOpacity, FolderBorder)
+        } else {
+            (MenuCustom, MenuOpacity, MenuBorder)
+        };
+        let custom = self.appearance.enabled(Appearance(custom));
+        let (opacity, border) = if custom {
+            (
+                self.appearance.get(Appearance(opacity)) as f32 / 100.,
+                self.appearance.get(Appearance(border)) as f32 / 100.,
+            )
+        } else {
+            (0.985, 0.12)
+        };
         let background = paint(&self.device, self.palette, width, height, dpi, |c| {
-            c.shadow(left, top, right, bottom, MENU_RADIUS, menu::SHADOW - 2.)?;
+            let area = Area::new(left, top, right, bottom);
+            c.shadow(
+                area,
+                MENU_RADIUS,
+                menu::SHADOW - 2.,
+                if custom { opacity } else { 1. },
+            )?;
+            if let Some(image) = backdrop {
+                c.backdrop(image, area, MENU_RADIUS)?;
+            }
             c.gradient(
                 left,
                 top,
                 right,
                 bottom,
                 MENU_RADIUS,
-                (c.p.panel_top, 0.985),
-                (c.p.panel, 0.985),
+                (c.p.panel_top, opacity),
+                (c.p.panel, opacity),
             )?;
-            c.stroke(left, top, right, bottom, MENU_RADIUS, c.p.line, 0.12)
+            c.stroke(left, top, right, bottom, MENU_RADIUS, c.p.line, border)
         })?;
         let content = paint(&self.device, self.palette, width, height, dpi, |c| {
             for (index, entry) in menu.entries.iter().enumerate() {
@@ -654,7 +681,7 @@ impl Renderer {
                         self.tray_badge(c, tray(*index), icon_x, middle, *on)?;
                     }
                     icon => {
-                        let size = 18.;
+                        let size = layout.file_icon_size;
                         self.paint_icon(
                             c,
                             icon,
