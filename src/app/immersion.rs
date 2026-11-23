@@ -95,13 +95,16 @@ impl Bars {
             }
             return Ok(());
         }
-        // Keep an active drag or a pointer already over the Dock when a smart-hide
-        // window moves across it. Leaving the Dock then collapses it as usual.
+        // Keep an active drag or a pointer already over the Dock or its preview when a
+        // smart-hide window moves across it. Leaving them then collapses the Dock as usual.
         let keep_open = policy == DockPolicy::EdgeReveal
             && self.dock_shown()
             && (self.dock_press.is_some()
+                || self.preview_pressed()
                 || self.dock_file_target.is_some()
-                || platform::cursor().is_ok_and(|p| self.layout.bottom.contains(p.x, p.y)));
+                || platform::cursor().is_ok_and(|p| {
+                    self.layout.bottom.contains(p.x, p.y) || self.preview_holds_dock(p)
+                }));
         self.dock_policy = policy;
         let exposure = if policy == DockPolicy::EdgeReveal && !keep_open {
             DockExposure::Edge
@@ -128,20 +131,29 @@ impl Bars {
     }
 
     pub(super) fn hide_idle_dock(&mut self) -> Result<()> {
-        if self.dock_policy == DockPolicy::EdgeReveal && self.dock_press.is_none() {
+        if self.dock_policy == DockPolicy::EdgeReveal
+            && self.dock_press.is_none()
+            && !self.preview_pressed()
+        {
             self.set_dock_exposure(DockExposure::Edge, false)?;
         }
         Ok(())
     }
 
     pub(super) fn check_dock_pointer(&mut self, window_leave: bool) -> Result<()> {
-        if self.dock_policy != DockPolicy::EdgeReveal || self.dock_press.is_some() {
+        if self.dock_policy != DockPolicy::EdgeReveal
+            || self.dock_press.is_some()
+            || self.preview_pressed()
+        {
             return Ok(());
         }
         if self.dock_exposure.collapsed() && window_leave {
             return self.hide_idle_dock();
         }
         let point = platform::cursor()?;
+        if self.preview_holds_dock(point) {
+            return Ok(());
+        }
         let inside = self.dock_window_rect().contains(point.x, point.y);
         if !inside
             && self

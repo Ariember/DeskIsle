@@ -178,6 +178,81 @@ pub(super) fn paint(
     Ok(surface)
 }
 
+/// Paints an offscreen BGRA pixel buffer using the same Direct2D/DirectWrite pipeline.
+/// Used by windows that host DWM thumbnails without `WS_EX_NOREDIRECTIONBITMAP`.
+pub(super) fn paint_pixels(
+    d2d: &ID2D1Device,
+    palette: Palette,
+    width: i32,
+    height: i32,
+    dpi: u32,
+    draw: impl FnOnce(&Canvas) -> Result<()>,
+) -> Result<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        return Ok(Vec::new());
+    }
+    let size = D2D_SIZE_U {
+        width: width as u32,
+        height: height as u32,
+    };
+    let pixel_format = D2D1_PIXEL_FORMAT {
+        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+    };
+    let target_props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: pixel_format,
+        dpiX: 96.,
+        dpiY: 96.,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+        ..Default::default()
+    };
+    let staging_props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: pixel_format,
+        dpiX: 96.,
+        dpiY: 96.,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        ..Default::default()
+    };
+    unsafe {
+        let ctx = d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+        let target = ctx.CreateBitmap(size, None, 0, &target_props)?;
+        ctx.SetTarget(&target);
+        ctx.SetDpi(96., 96.);
+        ctx.SetTextAntialiasMode(if palette.typography.smooth {
+            D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+        } else {
+            D2D1_TEXT_ANTIALIAS_MODE_ALIASED
+        });
+        ctx.BeginDraw();
+        ctx.Clear(Some(&D2D1_COLOR_F::default()));
+        let canvas = Canvas {
+            ctx: ctx.clone(),
+            p: palette,
+            origin: POINT::default(),
+            scale: dpi as f32 / 96.,
+        };
+        let result = draw(&canvas);
+        drop(canvas);
+        let end = ctx.EndDraw(None, None);
+        ctx.SetTarget(None);
+        result.and(end)?;
+
+        let staging = ctx.CreateBitmap(size, None, 0, &staging_props)?;
+        let src: &ID2D1Bitmap = &target;
+        staging.CopyFromBitmap(None, src, None)?;
+        let mapped = staging.Map(D2D1_MAP_OPTIONS_READ)?;
+        let row_bytes = width as usize * 4;
+        let stride = mapped.pitch as usize;
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        for y in 0..height as usize {
+            let src_row = std::slice::from_raw_parts(mapped.bits.add(y * stride), row_bytes);
+            pixels[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(src_row);
+        }
+        staging.Unmap()?;
+        Ok(pixels)
+    }
+}
+
 /// Clears and repaints a physical pixel rectangle using the full surface's coordinates.
 pub(super) fn paint_region(
     surface: &IDCompositionSurface,

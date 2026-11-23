@@ -5,6 +5,7 @@ mod immersion;
 mod launchpad;
 mod menus;
 mod monitor;
+mod preview;
 mod settings;
 mod system;
 mod tray_drag;
@@ -14,7 +15,6 @@ use std::collections::BTreeSet;
 use crate::dock::{AppGroup, PinnedApp, group_apps};
 use crate::geometry::Rect;
 use crate::metrics::Indicator;
-use crate::platform::preview::PreviewWindow;
 use crate::platform::system_worker::SystemWorker;
 use crate::platform::taskbar::{self, NativeTaskbar};
 use crate::platform::tray::{TrayHost, TrayInput};
@@ -86,7 +86,7 @@ struct Bars {
     dock_policy: DockPolicy,
     dock_hotkey_shown: bool,
     dock_exposure: DockExposure,
-    preview: Option<PreviewWindow>,
+    preview: Option<preview::Preview>,
     /// The status bar target under the pointer, highlighted on the bar.
     top_hover: Option<StatusHit>,
     /// Wheel movement over the sound icon not yet turned into a volume step.
@@ -341,6 +341,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.hover_dock_edge(true)?;
             }
             Event::DockEdgeTimer if bars.dock_shown() => bars.check_dock_pointer(false)?,
+            Event::PreviewLeaveTimer => bars.preview_leave_timer()?,
             Event::Audio => bars.refresh_audio()?,
             Event::MetricsUpdate => match bars.draw_metrics() {
                 Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
@@ -494,6 +495,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
             Event::Launchpad(input) => bars.launchpad_event(input)?,
             Event::About(input) => bars.about_event(input)?,
+            Event::Preview(input) => bars.preview_event(input)?,
             event @ (Event::PanelPress(..)
             | Event::PanelCancel
             | Event::PanelMove(..)
@@ -659,13 +661,25 @@ impl Bars {
             self.sync_dock_visibility(true)?;
         }
         if self.hover.is_some() {
-            self.hover = platform::cursor().ok().and_then(|point| {
-                self.layout.hit(
-                    point.x - self.layout.bottom.x,
-                    point.y - self.layout.bottom.y,
-                )
-            });
+            let preview_app = self.preview_pointer_app();
+            self.hover = if let Some(app_id) = preview_app.as_deref() {
+                self.apps
+                    .iter()
+                    .position(|app| app.app_id == app_id)
+                    .map(DockHit::App)
+            } else {
+                platform::cursor().ok().and_then(|point| {
+                    self.layout.hit(
+                        point.x - self.layout.bottom.x,
+                        point.y - self.layout.bottom.y,
+                    )
+                })
+            };
             self.update_preview();
+            if preview_app.is_some() && self.preview.is_none() {
+                self.hover = None;
+                self.check_dock_pointer(false)?;
+            }
         }
         Ok(true)
     }
@@ -812,22 +826,23 @@ impl Bars {
         let foreground_changed = self.foreground != foreground;
         self.foreground = foreground;
         if self.apps != apps {
-            let sources_changed = if let Some(DockHit::App(i)) = self.hover {
-                apps.get(i).is_none_or(|new| {
-                    let old = &self.apps[i];
-                    new.app_id != old.app_id
-                        || new
-                            .windows
-                            .iter()
-                            .map(|w| w.id)
-                            .ne(old.windows.iter().map(|w| w.id))
-                })
-            } else {
-                false
-            };
+            let preview_app = self.preview_pointer_app();
             self.apps = apps;
-            if !self.relayout(self.layout.first)? && sources_changed {
-                self.update_preview();
+            if !self.relayout(self.layout.first)? {
+                if let Some(app_id) = preview_app.as_deref() {
+                    self.hover = self
+                        .apps
+                        .iter()
+                        .position(|app| app.app_id == app_id)
+                        .map(DockHit::App);
+                    self.update_preview();
+                    if self.preview.is_none() {
+                        self.hover = None;
+                        self.check_dock_pointer(false)?;
+                    }
+                } else if self.hover.is_some() {
+                    self.update_preview();
+                }
             }
         }
         self.refresh_top_window(false);
@@ -843,31 +858,6 @@ impl Bars {
             self.draw()?;
         }
         Ok(())
-    }
-
-    fn update_preview(&mut self) {
-        self.preview = None;
-        let Some(DockHit::App(index)) = self.hover else {
-            return;
-        };
-        let windows = &self.apps[index].windows;
-        if windows.is_empty() {
-            return;
-        }
-        let anchor = self.icon_anchor(index);
-        match PreviewWindow::show(
-            windows,
-            anchor.x,
-            anchor.y,
-            self.monitor.work,
-            self.monitor.dpi,
-        ) {
-            Ok(preview) => self.preview = preview,
-            Err(error) => {
-                self.tray_notice = Some(format!("窗口预览不可用（{}）", error.code()));
-                platform::time_tray_notice(self.top.0);
-            }
-        }
     }
 
     /// Highlights the status bar target under the pointer. The title and empty space
@@ -896,6 +886,7 @@ impl Bars {
                 .map_err(|e| Error::new(e.code(), format!("重建双栏图形设备失败：{e}")))?,
         );
         self.draw_frame()?;
+        self.paint_preview()?;
         self.paint_panel()?;
         self.paint_about()?;
         self.paint_launchpad()

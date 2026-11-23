@@ -143,6 +143,7 @@ impl Bars {
         let repalette = renderer.set_appearance(dark, &self.settings);
         self.retheme_about(dark, repalette)?;
         if repalette {
+            self.retheme_preview(dark)?;
             self.draw_launchpad()?;
         }
         let Some(panel) = self.panel.as_mut() else {

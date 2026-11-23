@@ -27,13 +27,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
     GUITHREADINFO, GWL_EXSTYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
     GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA, SPI_SETWORKAREA,
-    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageTimeoutW, SetCursorPos,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_APP, WM_CANCELMODE,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP, WindowFromPoint,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, MSG, PM_REMOVE,
+    PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SPI_GETWORKAREA,
+    SPI_SETWORKAREA, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, WM_APP, WM_CANCELMODE, WM_CLOSE, WM_DISPLAYCHANGE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WindowFromPoint,
 };
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
@@ -439,6 +440,71 @@ fn hovering_the_probe_shows_its_preview(pid: u32, dock: HWND, probe: HWND) {
             },
         );
     }
+    // Moving from the Dock icon onto the preview window must keep the preview open.
+    let preview_hwnd = Bars::visible_for(pid).preview.unwrap();
+    let preview_cx = (preview.left + preview.right) / 2;
+    let preview_cy = (preview.top + preview.bottom) / 2;
+    unsafe { SetCursorPos(preview_cx, preview_cy) }.unwrap();
+    let hold_until = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < hold_until {
+        poll_desktop();
+    }
+    assert_eq!(
+        Bars::visible_for(pid).preview,
+        Some(preview_hwnd),
+        "moving onto the preview window closed it"
+    );
+
+    // Clicking the preview card restores and activates its window, then closes the preview.
+    let _ = unsafe { ShowWindow(probe, SW_MINIMIZE) };
+    wait_until("probe did not minimize", || {
+        unsafe { IsIconic(probe) }.as_bool()
+    });
+    let center_lp =
+        LPARAM((((preview_cy - preview.top) << 16) | (preview_cx - preview.left)) as isize);
+    send_to_child(pid, preview_hwnd, WM_LBUTTONDOWN, WPARAM(1), center_lp);
+    send_to_child(pid, preview_hwnd, WM_LBUTTONUP, WPARAM(0), center_lp);
+    wait_until("clicking the preview did not close it", || {
+        Bars::visible_for(pid).preview.is_none()
+    });
+    wait_until(
+        "clicking the preview did not restore and activate its window",
+        || !unsafe { IsIconic(probe) }.as_bool() && unsafe { GetForegroundWindow() } == probe,
+    );
+    let _ = unsafe { ShowWindow(probe, SW_MAXIMIZE) };
+
+    // Clicking a card's top-right close button closes only that window.
+    let extra = TestWindow::maximized();
+    let _ = unsafe { SetForegroundWindow(extra.0) };
+    wait_until(
+        "extra window did not reach foreground",
+        || unsafe { GetForegroundWindow() } == extra.0,
+    );
+    unsafe { SetCursorPos(x, y) }.unwrap();
+    let single_width = preview.right - preview.left;
+    wait_until(
+        "re-hovering the Dock icon did not open a two-card preview",
+        || {
+            Bars::visible_for(pid).preview.is_some_and(|hwnd| {
+                let r = window_rect(hwnd);
+                r.right - r.left > single_width
+            })
+        },
+    );
+    let two_hwnd = Bars::visible_for(pid).preview.unwrap();
+    let two_rect = window_rect(two_hwnd);
+    let px = |dip: i32| (dip * dpi + 48) / 96;
+    // `extra` is foreground so it is card 0 (leftmost); its close button sits at its top-right.
+    let close_x = (two_rect.right - two_rect.left) / 2 - px(13);
+    let close_y = px(13);
+    let close_lp = LPARAM(((close_y << 16) | close_x) as isize);
+    send_to_child(pid, two_hwnd, WM_LBUTTONDOWN, WPARAM(1), close_lp);
+    send_to_child(pid, two_hwnd, WM_LBUTTONUP, WPARAM(0), close_lp);
+    wait_until("preview close button did not close its window", || {
+        !unsafe { IsWindow(Some(extra.0)) }.as_bool()
+    });
+    assert!(unsafe { IsWindow(Some(probe)) }.as_bool());
+
     unsafe { SetCursorPos(x, rect.top - 1) }.unwrap();
     wait_until("moving off the Dock did not hide the preview", || {
         Bars::visible_for(pid).preview.is_none()

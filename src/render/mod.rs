@@ -4,6 +4,7 @@ mod launchpad;
 mod menu;
 mod metrics;
 mod panel;
+mod preview;
 
 use std::{
     path::{Path, PathBuf},
@@ -13,7 +14,7 @@ use std::{
 use windows::Win32::{
     Foundation::{D2DERR_RECREATE_TARGET, E_UNEXPECTED, HMODULE, HWND},
     Graphics::{
-        Direct2D::D2D1CreateDevice,
+        Direct2D::{D2D1CreateDevice, ID2D1Device},
         Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
         Direct3D11::*,
         DirectComposition::*,
@@ -71,6 +72,7 @@ pub struct TrayImage {
 type Dimensions = (i32, i32, u32);
 
 pub struct Renderer {
+    d2d: ID2D1Device,
     device: IDCompositionDesktopDevice,
     top: Bar,
     bottom: Bar,
@@ -398,6 +400,7 @@ impl Renderer {
             Ok(Self {
                 top: Bar::new(&device, top)?,
                 bottom: Bar::new(&device, bottom)?,
+                d2d,
                 device,
                 write: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
                 imaging: CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?,

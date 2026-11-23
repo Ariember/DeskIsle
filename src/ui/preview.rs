@@ -1,54 +1,157 @@
 use crate::geometry::Rect;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewHit {
+    Window(usize),
+    Close(usize),
+}
+
+impl PreviewHit {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Window(index) | Self::Close(index) => index,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewCard {
+    /// Whole card area in client pixels.
+    pub bounds: Rect,
+    /// Window title text area in client pixels.
+    pub title: Rect,
+    /// Top-right close button hit area in client pixels.
+    pub close: Rect,
+    /// Area reserved for the live DWM thumbnail in client pixels, below the header.
+    pub thumbnail: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviewLayout {
     /// Screen pixels above the Dock.
     pub bounds: Rect,
-    /// Client pixels, in the same order as the source windows.
-    pub cells: Vec<Rect>,
+    /// Client-pixel cards, in the same order as the source windows.
+    pub cards: Vec<PreviewCard>,
 }
+
+/// Header bar height at the top of each preview card, in DIPs.
+pub const HEADER_HEIGHT: i32 = 26;
+/// Size of the top-right close button in each preview card, in DIPs.
+pub const CLOSE_SIZE: i32 = 22;
 
 impl PreviewLayout {
     pub fn new(center_x: i32, dock_top: i32, work: Rect, dpi: u32, count: usize) -> Option<Self> {
         let count = i32::try_from(count).ok().filter(|&count| count > 0)?;
         let px = |dip: i32| ((i64::from(dip) * i64::from(dpi) + 48) / 96) as i32;
-        let gap = px(8);
-        let bottom = (dock_top - gap).min(work.y + work.height);
+        let dock_gap = px(8);
+        let header = px(HEADER_HEIGHT).max(1);
+        let card_pad = px(6);
+        let close_size = px(CLOSE_SIZE).max(1);
+        let title_inset = px(2);
+        let title_gap = px(4);
+        let bottom = (dock_top - dock_gap).min(work.y + work.height);
         let available_height = bottom - work.y;
         let preferred_width = px(224);
 
-        // Pack 16:9 cells at their preferred size where possible. When the group
-        // wraps, choose the arrangement with the largest thumbnails.
-        let max_columns = count.min((work.width - gap) / (gap + 1));
-        let (width, columns, rows) = (1..=max_columns)
+        // Pack 16:9 thumbnails below their title headers at their preferred size where
+        // possible. Cards sit flush against the preview window edges without an outer
+        // frame; when the group wraps, choose the arrangement with the largest thumbnails.
+        let max_columns = count.min(work.width.max(0));
+        let (thumb_width, columns, rows) = (1..=max_columns)
             .filter_map(|columns| {
                 let rows = 1 + (count - 1) / columns;
-                let cell_width = (work.width - gap) / columns - gap;
-                let cell_height = (available_height - gap) / rows - gap;
-                if cell_height <= 0 {
+                let cell_width = work.width / columns;
+                let cell_height = available_height / rows;
+                let avail_thumb_w = cell_width - 2 * card_pad;
+                let avail_thumb_h = cell_height - header - card_pad;
+                if avail_thumb_w <= 0 || avail_thumb_h <= 0 {
                     return None;
                 }
-                let width = preferred_width.min(cell_width).min(cell_height * 16 / 9);
-                Some((width, columns, rows))
+                let width = preferred_width
+                    .min(avail_thumb_w)
+                    .min(avail_thumb_h * 16 / 9);
+                (width > 0).then_some((width, columns, rows))
             })
             .max()?;
-        let height = (width * 9 / 16).max(1);
-        let bounds_width = gap + columns * (width + gap);
-        let bounds_height = gap + rows * (height + gap);
+        let thumb_height = (thumb_width * 9 / 16).max(1);
+        let card_width = thumb_width + 2 * card_pad;
+        let card_height = header + thumb_height + card_pad;
+        let bounds_width = columns * card_width;
+        let bounds_height = rows * card_height;
         let bounds = Rect {
             x: (center_x - bounds_width / 2).clamp(work.x, work.x + work.width - bounds_width),
             y: bottom - bounds_height,
             width: bounds_width,
             height: bounds_height,
         };
-        let cells = (0..count)
-            .map(|index| Rect {
-                x: gap + (index % columns) * (width + gap),
-                y: gap + (index / columns) * (height + gap),
-                width,
-                height,
+        let cards = (0..count)
+            .map(|index| {
+                let x = (index % columns) * card_width;
+                let y = (index / columns) * card_height;
+                let card_bounds = Rect {
+                    x,
+                    y,
+                    width: card_width,
+                    height: card_height,
+                };
+                let close_w = close_size.min(card_width);
+                let close_h = close_size.min(header);
+                let close_margin = ((header - close_h) / 2).min(card_pad);
+                let close = Rect {
+                    x: (x + card_width - close_margin - close_w).max(x),
+                    y: y + (header - close_h) / 2,
+                    width: close_w,
+                    height: close_h,
+                };
+                let title_x = (x + card_pad + title_inset).min(close.x);
+                let title = Rect {
+                    x: title_x,
+                    y,
+                    width: (close.x - title_gap - title_x).max(0),
+                    height: header,
+                };
+                let thumbnail = Rect {
+                    x: x + card_pad,
+                    y: y + header,
+                    width: thumb_width,
+                    height: thumb_height,
+                };
+                PreviewCard {
+                    bounds: card_bounds,
+                    title,
+                    close,
+                    thumbnail,
+                }
             })
             .collect();
-        Some(Self { bounds, cells })
+        Some(Self { bounds, cards })
+    }
+
+    pub fn hit(&self, x: i32, y: i32) -> Option<PreviewHit> {
+        self.cards.iter().enumerate().find_map(|(index, card)| {
+            if card.close.contains(x, y) {
+                Some(PreviewHit::Close(index))
+            } else if card.bounds.contains(x, y) {
+                Some(PreviewHit::Window(index))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Screen rectangle connecting the preview panel to its Dock icon slot, covering
+    /// both the air gap above the Dock and the Dock's top rim above the slot.
+    pub fn bridge(&self, slot_screen: Rect) -> Rect {
+        let left = self.bounds.x.min(slot_screen.x);
+        let right = (self.bounds.x + self.bounds.width).max(slot_screen.x + slot_screen.width);
+        let top = self.bounds.y + self.bounds.height;
+        let bottom = slot_screen.y.max(top);
+        Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        }
     }
 }
 
@@ -88,7 +191,19 @@ mod tests {
                 center.bounds.y + center.bounds.height,
                 525 - 8 * dpi as i32 / 96
             );
-            assert_eq!(center.cells[0].width, 224 * dpi as i32 / 96);
+            let card = center.cards[0];
+            assert_eq!(
+                card.bounds,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: center.bounds.width,
+                    height: center.bounds.height,
+                }
+            );
+            assert_eq!(card.thumbnail.width, 224 * dpi as i32 / 96);
+            assert!(card.close.y + card.close.height <= card.thumbnail.y);
+            assert!(card.title.x + card.title.width <= card.close.x);
             let left = PreviewLayout::new(-790, 525, WORK, dpi, 1).unwrap();
             let right = PreviewLayout::new(-10, 525, WORK, dpi, 1).unwrap();
             assert_eq!(left.bounds.x, WORK.x);
@@ -97,22 +212,85 @@ mod tests {
     }
 
     #[test]
-    fn all_windows_fit_in_distinct_cells_when_a_group_wraps() {
+    fn all_windows_fit_in_distinct_cards_when_a_group_wraps() {
         let layout = PreviewLayout::new(-200, 525, WORK, 144, 12).unwrap();
-        assert_eq!(layout.cells.len(), 12);
+        assert_eq!(layout.cards.len(), 12);
         assert!(layout.bounds.y >= WORK.y);
-        assert!(layout.cells.last().unwrap().y > layout.cells[0].y);
-        for (i, cell) in layout.cells.iter().enumerate() {
-            assert!(cell.x >= 0 && cell.x + cell.width <= layout.bounds.width);
-            assert!(cell.y >= 0 && cell.y + cell.height <= layout.bounds.height);
-            assert!(
-                layout.cells[..i].iter().all(
-                    |other| other.y + other.height <= cell.y || other.x + other.width <= cell.x
-                )
-            );
+        assert!(layout.cards.last().unwrap().bounds.y > layout.cards[0].bounds.y);
+        for (i, card) in layout.cards.iter().enumerate() {
+            let b = card.bounds;
+            assert!(b.x >= 0 && b.x + b.width <= layout.bounds.width);
+            assert!(b.y >= 0 && b.y + b.height <= layout.bounds.height);
+            assert!(card.close.x >= b.x && card.close.x + card.close.width <= b.x + b.width);
+            assert!(card.close.y >= b.y && card.close.y + card.close.height <= card.thumbnail.y);
+            assert!(layout.cards[..i].iter().all(|other| {
+                other.bounds.y + other.bounds.height <= b.y
+                    || other.bounds.x + other.bounds.width <= b.x
+            }));
         }
         assert!(PreviewLayout::new(-200, 525, WORK, 144, 0).is_none());
         assert!(PreviewLayout::new(-200, WORK.y, WORK, 144, 1).is_none());
+    }
+
+    #[test]
+    fn hit_testing_distinguishes_close_button_card_body_and_empty_cells() {
+        let layout = PreviewLayout::new(-400, 525, WORK, 144, 2).unwrap();
+        // Cards sit flush against the preview window edges with no dead outer margin.
+        assert_eq!(layout.hit(0, 0), Some(PreviewHit::Window(0)));
+        assert_eq!(
+            layout.hit(layout.bounds.width - 1, layout.bounds.height - 1),
+            Some(PreviewHit::Window(1))
+        );
+        assert_eq!(layout.hit(-1, 0), None);
+        assert_eq!(layout.hit(layout.bounds.width, 0), None);
+        for (i, card) in layout.cards.iter().enumerate() {
+            assert_eq!(
+                layout.hit(
+                    card.close.x + card.close.width / 2,
+                    card.close.y + card.close.height / 2,
+                ),
+                Some(PreviewHit::Close(i))
+            );
+            assert_eq!(
+                layout.hit(
+                    card.thumbnail.x + card.thumbnail.width / 2,
+                    card.thumbnail.y + card.thumbnail.height / 2,
+                ),
+                Some(PreviewHit::Window(i))
+            );
+            assert_eq!(
+                layout.hit(
+                    card.title.x + card.title.width / 2,
+                    card.title.y + card.title.height / 2,
+                ),
+                Some(PreviewHit::Window(i))
+            );
+        }
+        // A wrapped group with an incomplete last row leaves its trailing cell empty.
+        let wrapped = PreviewLayout::new(-400, 525, WORK, 144, 3).unwrap();
+        assert_eq!(
+            wrapped.hit(wrapped.bounds.width - 1, wrapped.bounds.height - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn bridge_spans_between_preview_bottom_and_dock_slot_top() {
+        let layout = PreviewLayout::new(-400, 525, WORK, 96, 1).unwrap();
+        let slot = Rect {
+            x: -426,
+            y: 529,
+            width: 52,
+            height: 56,
+        };
+        let bridge = layout.bridge(slot);
+        assert_eq!(bridge.y, layout.bounds.y + layout.bounds.height);
+        assert_eq!(bridge.y + bridge.height, slot.y);
+        // Covers both the 8px gap above the Dock and the 4px top rim inside the Dock.
+        assert!(bridge.contains(-400, 524));
+        assert!(bridge.contains(-400, 526));
+        assert!(!bridge.contains(-400, 529));
+        assert!(!bridge.contains(-400, layout.bounds.y + layout.bounds.height - 1));
     }
 
     #[test]

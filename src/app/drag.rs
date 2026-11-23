@@ -52,7 +52,7 @@ impl Bars {
             self.dock_file_target = target;
             if target.is_some() {
                 self.hover = None;
-                self.preview = None;
+                self.close_preview();
             }
             self.draw()?;
         }
@@ -132,7 +132,11 @@ impl Bars {
         {
             self.draw()?;
         }
-        self.set_hover(None)
+        if self.dock_press.is_some() {
+            self.set_hover(None)
+        } else {
+            self.leave_dock_preview()
+        }
     }
 
     fn drag_target(&self, source: usize, x: i32, y: i32) -> Option<DockDrop> {
@@ -150,7 +154,7 @@ impl Bars {
             return Ok(());
         }
         let Some(press) = self.dock_press.as_mut() else {
-            return self.set_hover(self.layout.hit(x, y));
+            return self.hover_dock_at(x, y);
         };
         if !press.moved(x, y) {
             return Ok(());

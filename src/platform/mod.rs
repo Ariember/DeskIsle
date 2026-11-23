@@ -173,7 +173,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         }
         launchpad::register_class(instance, wc.hCursor)?;
         about::register_class(instance, wc.hCursor)?;
-        preview::register_class(instance)?;
+        preview::register_class(instance, wc.hCursor)?;
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -237,6 +237,7 @@ pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
 const TRAY_NOTICE_TIMER: usize = 2;
 const DOCK_EDGE_TIMER: usize = 3;
+const PREVIEW_LEAVE_TIMER: usize = 5;
 const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
@@ -467,6 +468,22 @@ impl Bar {
     pub fn cancel_dock_edge_timer(&self) {
         let _ = unsafe { KillTimer(Some(self.0), DOCK_EDGE_TIMER) };
     }
+
+    /// Schedule a one-shot pointer check while crossing between the Dock and its preview.
+    pub fn time_preview_leave(&self, delay_ms: u32) -> Result<()> {
+        if unsafe { SetTimer(Some(self.0), PREVIEW_LEAVE_TIMER, delay_ms, None) } == 0 {
+            return Err(Error::from_thread());
+        }
+        Ok(())
+    }
+
+    pub fn cancel_preview_leave_timer(&self) {
+        let _ = unsafe { KillTimer(Some(self.0), PREVIEW_LEAVE_TIMER) };
+    }
+
+    pub fn contains_screen_point(&self, x: i32, y: i32) -> bool {
+        unsafe { WindowFromPoint(POINT { x, y }) == self.0 }
+    }
 }
 
 pub fn drag_threshold(dpi: u32) -> (i32, i32) {
@@ -528,6 +545,7 @@ pub enum Event {
     TrayNoticeExpired,
     InputLanguage,
     DockEdgeTimer,
+    PreviewLeaveTimer,
     TaskbarShortcut(i32),
     DockShortcut,
     MetricsUpdate,
@@ -600,6 +618,7 @@ pub enum Event {
     PanelClose,
     Launchpad(launchpad::LaunchpadEvent),
     About(about::AboutEvent),
+    Preview(preview::PreviewEvent),
     Quit,
 }
 
@@ -676,6 +695,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let _ = unsafe { KillTimer(Some(hwnd), DOCK_EDGE_TIMER) };
             Event::DockEdgeTimer
         }
+        WM_TIMER if wp.0 == PREVIEW_LEAVE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), PREVIEW_LEAVE_TIMER) };
+            Event::PreviewLeaveTimer
+        }
         WM_TIMER if wp.0 == input::TIMER => Event::InputLanguage,
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => {
@@ -747,6 +770,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::PanelKey(_)
                     | Event::Launchpad(_)
                     | Event::About(_)
+                    | Event::Preview(_)
             )
         {
             events.push_back(event);
