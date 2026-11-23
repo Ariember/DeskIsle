@@ -15,6 +15,7 @@ pub mod startup;
 pub mod system_worker;
 pub mod taskbar;
 pub mod tray;
+pub mod update;
 
 use crate::geometry::Rect;
 use std::cell::{Cell, RefCell};
@@ -238,6 +239,7 @@ const METRICS_UPDATED: u32 = WM_APP + 6;
 const TRAY_NOTICE_TIMER: usize = 2;
 const DOCK_EDGE_TIMER: usize = 3;
 const PREVIEW_LEAVE_TIMER: usize = 5;
+const UPDATE_TIMER: usize = 6;
 const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
@@ -249,6 +251,20 @@ pub fn time_tray_notice(hwnd: HWND) {
 /// Wakes the UI thread. The worker holds the window's lifetime lock through this call.
 pub fn notify_metrics(hwnd: HWND) -> Result<()> {
     unsafe { PostMessageW(Some(hwnd), METRICS_UPDATED, WPARAM(0), LPARAM(0)) }
+}
+
+/// Poll only while a release check or a download is in flight.
+pub fn update_timer(hwnd: HWND, enabled: bool) -> Result<()> {
+    unsafe {
+        if enabled {
+            if SetTimer(Some(hwnd), UPDATE_TIMER, 300, None) == 0 {
+                return Err(Error::from_thread());
+            }
+        } else {
+            KillTimer(Some(hwnd), UPDATE_TIMER)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reserves the top edge of the primary monitor for the status bar, so maximized
@@ -549,6 +565,7 @@ pub enum Event {
     TaskbarShortcut(i32),
     DockShortcut,
     MetricsUpdate,
+    UpdateProgress,
     Move(HWND, i32, i32),
     Leave(HWND),
     CancelPress(HWND),
@@ -700,6 +717,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Event::PreviewLeaveTimer
         }
         WM_TIMER if wp.0 == input::TIMER => Event::InputLanguage,
+        WM_TIMER if wp.0 == UPDATE_TIMER => Event::UpdateProgress,
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => {
             // A non-activating bar may miss a release outside its visible area.
@@ -1311,6 +1329,43 @@ pub fn confirm_power(owner: HWND, restart: bool) -> Result<bool> {
     } else {
         Ok(answer == IDYES)
     }
+}
+
+pub fn confirm_update(owner: HWND, version: &str) -> Result<bool> {
+    let text = HSTRING::from(format!(
+        "发现 DeskIsle {version}（当前版本 {}）。现在下载并重启 DeskIsle 吗？",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let answer = unsafe {
+        MessageBoxW(
+            Some(owner),
+            PCWSTR(text.as_ptr()),
+            w!("DeskIsle 更新"),
+            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
+        )
+    };
+    if answer.0 == 0 {
+        Err(Error::from_thread())
+    } else {
+        Ok(answer == IDYES)
+    }
+}
+
+pub fn show_update_status(owner: HWND, message: &str, failed: bool) {
+    let text = HSTRING::from(message);
+    let icon = if failed {
+        MB_ICONERROR
+    } else {
+        MB_ICONINFORMATION
+    };
+    unsafe {
+        MessageBoxW(
+            Some(owner),
+            PCWSTR(text.as_ptr()),
+            w!("DeskIsle 更新"),
+            MB_OK | icon,
+        )
+    };
 }
 
 /// A maximized window's frame can extend outside the monitor while its client area

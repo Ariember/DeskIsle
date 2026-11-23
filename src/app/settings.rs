@@ -161,7 +161,7 @@ impl Bars {
     }
 
     /// Message boxes belong to the panel while it is open.
-    fn settings_owner(&self) -> HWND {
+    pub(super) fn settings_owner(&self) -> HWND {
         self.panel
             .as_ref()
             .map_or(self.bottom.0, |panel| panel.window.0)
@@ -227,6 +227,7 @@ impl Bars {
     /// Lays the panel out again after its state, the settings or its monitor changed,
     /// and repaints only when something visible moved.
     pub(super) fn relayout_panel(&mut self) -> Result<()> {
+        let update_status = self.update_status_label();
         let Some(panel) = self.panel.as_mut() else {
             return Ok(());
         };
@@ -235,7 +236,10 @@ impl Bars {
             self.settings.ui_dpi(platform::window_dpi(panel.window.0)),
             work,
         );
-        let layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work);
+        let mut layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work);
+        if let (Some(about), Some(label)) = (&mut layout.about, update_status) {
+            about.check_label = label;
+        }
         if layout == panel.layout {
             return Ok(());
         }
@@ -358,6 +362,7 @@ impl Bars {
                 return Ok(false);
             }
             Some(Action::Quit) => return Ok(true),
+            Some(Action::CheckUpdates) => self.check_for_updates(true),
             Some(Action::Open(uri)) => {
                 let owner = panel.window.0;
                 if let Err(error) = platform::shell::execute(owner, uri) {
@@ -438,7 +443,7 @@ impl Bars {
                     self.cancel_tray_drag();
                     Ok(())
                 }
-                Key::ConfirmPowerActions => Ok(()),
+                Key::ConfirmPowerActions | Key::AutoCheckUpdates => Ok(()),
                 Key::Theme | Key::SyncSystemTheme => {
                     retheme = true;
                     if self.settings.enabled(Key::SyncSystemTheme)

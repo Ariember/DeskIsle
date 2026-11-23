@@ -9,6 +9,7 @@ mod preview;
 mod settings;
 mod system;
 mod tray_drag;
+mod updates;
 
 use std::collections::BTreeSet;
 
@@ -105,6 +106,8 @@ struct Bars {
     overflow_open: bool,
     /// Restored after the bars are gone, on exit or when the user turns hiding off.
     native_taskbar: NativeTaskbar,
+    // Let the bars and native taskbar restore before waiting for an active install.
+    updates: updates::Updates,
 }
 
 fn applications(pins: &[Pin]) -> Result<(Vec<AppGroup>, Option<isize>)> {
@@ -266,6 +269,7 @@ pub(crate) fn run() -> Result<()> {
         open_flyout: None,
         overflow_open: false,
         native_taskbar,
+        updates: updates::Updates::default(),
     };
     if bars.settings.enabled(Key::ShowInputLanguageIcon)
         && let Err(error) = bars.sync_input_indicator()
@@ -279,6 +283,7 @@ pub(crate) fn run() -> Result<()> {
     bars.position()?;
     // Applications answer at once; the loop below receives their icons.
     bars.tray.request_icons()?;
+    bars.check_for_updates(false);
     loop {
         match platform::next_event()? {
             Event::Quit => return Ok(()),
@@ -312,6 +317,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh()?;
             }
             Event::Clock => {
+                bars.check_for_updates(false);
                 let time = platform::clock(bars.top.0)?;
                 let old_color = bars.top_window_color;
                 bars.refresh_top_window(true);
@@ -329,6 +335,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh_system()?;
             }
             Event::TrayNoticeExpired => bars.clear_tray_notice()?,
+            Event::UpdateProgress if bars.update_progress()? => return Ok(()),
             Event::InputLanguage => bars.refresh_input_indicator()?,
             Event::TaskbarShortcut(id) if id == bars.settings.get(Key::TaskbarShortcut) => {
                 bars.toggle_taskbar()?;

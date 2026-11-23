@@ -516,6 +516,10 @@ impl Bars {
                         && (flyout == updated || flyout == Some(SystemItem::Control));
                 }
                 Event::MenuDismiss => break None,
+                Event::UpdateProgress if self.updates.install_ready() => {
+                    held.push(Event::UpdateProgress);
+                    break None;
+                }
                 Event::DockShortcut if self.dock_shortcut.is_some() => {
                     held.push(Event::DockShortcut);
                     break None;
@@ -550,7 +554,10 @@ impl Bars {
                     }
                 }
                 // A dragged volume slider sends one per step; the latest state is enough.
-                event @ (Event::Audio | Event::Power | Event::InputLanguage)
+                event @ (Event::Audio
+                | Event::Power
+                | Event::InputLanguage
+                | Event::UpdateProgress)
                     if held.contains(&event) => {}
                 event => held.push(event),
             }

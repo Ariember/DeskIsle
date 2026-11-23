@@ -30,6 +30,7 @@ pub enum Key {
     HoverZoom,
     HideTaskbar,
     Autostart,
+    AutoCheckUpdates,
     TopBarBackground,
     TopBarHeight,
     ConfirmPowerActions,
@@ -334,6 +335,16 @@ pub const SCHEMA: &[Spec] = &[
         control: Control::Toggle,
         default: 0,
         store: Store::System,
+    },
+    Spec {
+        key: Key::AutoCheckUpdates,
+        id: "general.auto_check_updates",
+        section: Section::General,
+        label: "自动检查更新",
+        help: "发现新的稳定版本时提示，确认后下载并重启",
+        control: Control::Toggle,
+        default: 1,
+        store: Store::File,
     },
     Spec {
         key: Key::InterfaceScale,
@@ -1112,6 +1123,8 @@ mod tests {
     #[test]
     fn saved_text_is_validated_and_system_values_stay_out_of_the_file() {
         let mut settings = Settings::default();
+        assert!(settings.enabled(Key::AutoCheckUpdates));
+        assert!(settings.adjust(Key::AutoCheckUpdates, Adjust::Toggle));
         assert_eq!(settings.set_text("dock.icon_size", "40"), Ok(()));
         assert_eq!(settings.set_text("dock.hover_zoom", "subtle"), Ok(()));
         assert_eq!(settings.set_text("appearance.theme", "dark"), Ok(()));
@@ -1135,6 +1148,7 @@ mod tests {
             read.set_text(id, text).unwrap();
         }
         assert_eq!(read, settings);
+        assert!(!read.enabled(Key::AutoCheckUpdates));
     }
 
     #[test]

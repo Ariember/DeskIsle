@@ -81,6 +81,7 @@ pub enum Action {
     /// Restores the defaults of every setting on the current page.
     Reset,
     Open(&'static str),
+    CheckUpdates,
     Quit,
     OpenModes,
     DismissModes,
@@ -100,6 +101,8 @@ pub struct ProjectLink {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AboutPage {
     pub heading: Area,
+    pub check_button: Area,
+    pub check_label: &'static str,
     pub links: [ProjectLink; 2],
 }
 
@@ -136,15 +139,27 @@ impl AboutPage {
                 button,
             }
         });
-        Self { heading, links }
+        let check_button = Area::new(
+            heading.right - 108.,
+            heading.middle() - CONTROL_HEIGHT / 2.,
+            heading.right - CONTROL_INSET,
+            heading.middle() + CONTROL_HEIGHT / 2.,
+        );
+        Self {
+            heading,
+            check_button,
+            check_label: "检查更新",
+            links,
+        }
     }
 
-    fn action(&self, index: usize) -> Option<Action> {
-        if index == self.links.len() {
-            Some(Action::Quit)
-        } else {
-            self.links.get(index).map(|link| link.action)
-        }
+    /// Buttons in the same order in which Tab reaches them.
+    pub fn buttons(&self) -> impl Iterator<Item = (Area, &'static str, Action)> {
+        std::iter::once((self.check_button, self.check_label, Action::CheckUpdates)).chain(
+            self.links
+                .iter()
+                .map(|link| (link.button, "打开", link.action)),
+        )
     }
 }
 
@@ -287,7 +302,11 @@ impl PanelState {
             Nav::Decrease | Nav::Increase | Nav::Activate => {
                 if let Some(about) = &layout.about {
                     return if nav == Nav::Activate {
-                        about.action(focused?)
+                        about
+                            .buttons()
+                            .map(|(_, _, action)| action)
+                            .chain([Action::Quit])
+                            .nth(focused?)
                     } else {
                         None
                     };
@@ -375,7 +394,7 @@ impl PanelLayout {
     fn focus_count(&self) -> usize {
         self.about.as_ref().map_or_else(
             || self.rows.len() + usize::from(self.display_settings.is_some()),
-            |about| about.links.len() + 1,
+            |about| about.buttons().count() + 1,
         )
     }
 
@@ -657,10 +676,9 @@ impl PanelLayout {
         }
         if let Some(about) = &self.about {
             return about
-                .links
-                .iter()
-                .find(|link| link.button.contains(x, y))
-                .map(|link| link.action);
+                .buttons()
+                .find(|(area, _, _)| area.contains(x, y))
+                .map(|(_, _, action)| action);
         }
         if !self.view.contains(x, y) {
             return None;
@@ -977,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn about_links_and_quit_work_with_pointer_and_keyboard_on_short_panels() {
+    fn about_actions_work_with_pointer_and_keyboard_on_short_panels() {
         let settings = Settings::default();
         for dpi in [96, 120, 144, 192] {
             let work = work((MIN_HEIGHT * dpi as f32 / 96.) as i32);
@@ -996,6 +1014,7 @@ mod tests {
             let layout = PanelLayout::new(&mut state, &settings, dpi, work);
             let about = layout.about.as_ref().unwrap();
             for (area, expected) in [
+                (about.check_button, Action::CheckUpdates),
                 (
                     about.links[0].button,
                     Action::Open("https://github.com/Ariember/DeskIsle"),

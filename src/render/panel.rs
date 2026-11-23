@@ -602,7 +602,7 @@ impl Renderer {
         self.label(
             c,
             "DeskIsle",
-            Area::new(h.left + 58., h.top, h.right, mid + 3.),
+            Area::new(h.left + 58., h.top, about.check_button.left - 8., mid + 3.),
             20.,
             true,
             c.p.ink,
@@ -611,7 +611,12 @@ impl Renderer {
         self.label(
             c,
             concat!("版本 ", env!("CARGO_PKG_VERSION")),
-            Area::new(h.left + 58., mid + 2., h.right, h.bottom),
+            Area::new(
+                h.left + 58.,
+                mid + 2.,
+                about.check_button.left - 8.,
+                h.bottom,
+            ),
             13.,
             false,
             c.p.muted,
@@ -650,15 +655,16 @@ impl Renderer {
             c.p.line,
             t.separator,
         )?;
-        for (index, link) in about.links.iter().enumerate() {
-            let button = link.button;
+        for link in &about.links {
             let label = Area {
                 left: link.row.left + 16.,
-                right: button.left - 8.,
+                right: link.button.left - 8.,
                 ..link.row
             };
             self.label(c, link.title, label, 13., false, c.p.ink, 1.)?;
-            self.button_face(c, t, button, 6., layout.hover == Some(link.action))?;
+        }
+        for (index, (button, title, action)) in about.buttons().enumerate() {
+            self.button_face(c, t, button, 6., layout.hover == Some(action))?;
             if layout.focus == Some(index) {
                 c.stroke(
                     button.left,
@@ -672,7 +678,7 @@ impl Renderer {
             }
             self.label_aligned(
                 c,
-                "打开",
+                title,
                 button,
                 13.,
                 false,
@@ -688,7 +694,7 @@ impl Renderer {
             t.accent
         };
         c.round(q.left, q.top, q.right, q.bottom, 6., accent)?;
-        if layout.focus == Some(about.links.len()) {
+        if layout.focus == Some(about.buttons().count()) {
             c.stroke(
                 q.left - 2.,
                 q.top - 2.,
