@@ -145,7 +145,8 @@ impl Backdrop {
 pub fn wallpaper_tint(rect: Rect) -> Result<(u8, u8, u8)> {
     let image = Backdrop::sample(rect, 16, 16, true)?;
     let mut sums = [0u32; 3];
-    for pixel in image.pixels.chunks_exact(4) {
+    let (pixels, _) = image.pixels.as_chunks::<4>();
+    for pixel in pixels {
         for (sum, component) in sums.iter_mut().zip(pixel) {
             *sum += u32::from(*component);
         }
