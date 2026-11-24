@@ -124,6 +124,16 @@ pub fn save_tray_order(keys: &[String]) -> Result<()> {
 
 const SETTINGS_FILE: &str = "settings.ini";
 
+pub fn plugins_directory() -> Result<PathBuf> {
+    settings_path("plugins")
+}
+
+pub fn ensure_plugins_directory() -> Result<PathBuf> {
+    let path = plugins_directory()?;
+    std::fs::create_dir_all(&path).map_err(|e| io_error(&path, e))?;
+    Ok(path)
+}
+
 /// Settings the user saved, or `None` before the first change. Lines read
 /// `id = value`; `#` starts a comment. Invalid lines keep their defaults and are
 /// returned as messages for the caller to show.

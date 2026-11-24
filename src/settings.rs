@@ -32,6 +32,7 @@ pub enum Key {
     HideTaskbar,
     Autostart,
     AutoCheckUpdates,
+    DesktopCards,
     TopBarBackground,
     TopBarHeight,
     ConfirmPowerActions,
@@ -75,6 +76,7 @@ pub enum Section {
     TopBar,
     Clock,
     Monitor,
+    Cards,
     About,
 }
 
@@ -85,6 +87,7 @@ pub const SECTIONS: &[Section] = &[
     Section::TopBar,
     Section::Clock,
     Section::Monitor,
+    Section::Cards,
     Section::About,
 ];
 
@@ -97,6 +100,7 @@ impl Section {
             Section::TopBar => "顶部栏",
             Section::Clock => "时间",
             Section::Monitor => "监控",
+            Section::Cards => "桌面卡片",
             Section::About => "关于",
         }
     }
@@ -450,6 +454,16 @@ const fn appearance_toggle(
 use AppearanceKey as A;
 
 pub const SCHEMA: &[Spec] = &[
+    Spec {
+        key: Key::DesktopCards,
+        id: "cards.enabled",
+        section: Section::Cards,
+        label: "显示桌面卡片",
+        help: "在主屏桌面显示各插件发布的卡片",
+        control: Control::Toggle,
+        default: 1,
+        store: Store::File,
+    },
     Spec {
         key: Key::Autostart,
         id: "system.autostart",
@@ -1460,6 +1474,8 @@ mod tests {
         let mut settings = Settings::default();
         assert!(settings.enabled(Key::AutoCheckUpdates));
         assert!(settings.adjust(Key::AutoCheckUpdates, Adjust::Toggle));
+        assert!(settings.enabled(Key::DesktopCards));
+        assert!(settings.adjust(Key::DesktopCards, Adjust::Toggle));
         assert_eq!(settings.set_text("dock.icon_size", "40"), Ok(()));
         assert_eq!(settings.set_text("dock.hover_zoom", "subtle"), Ok(()));
         assert_eq!(settings.set_text("appearance.theme", "dark"), Ok(()));
@@ -1484,6 +1500,7 @@ mod tests {
         }
         assert_eq!(read, settings);
         assert!(!read.enabled(Key::AutoCheckUpdates));
+        assert!(!read.enabled(Key::DesktopCards));
     }
 
     #[test]

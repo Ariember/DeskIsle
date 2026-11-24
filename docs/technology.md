@@ -15,6 +15,10 @@ DeskIsle 是面向 Windows 的桌面美化工具。首个开发目标是常驻 D
 
 Dock 悬停预览通过现有的 `windows` 依赖调用 DWM 缩略图接口，由桌面合成器将源窗口内容绘制到预览窗口。预览窗口保留标准重定向位图以兼容 DWM 缩略图，卡片标题、悬停态与右上角关闭按钮由同一套 Direct2D/DirectWrite 管线离屏渲染后经 `WM_PAINT` 绘制到缩略图上方区域，不与缩略图重叠。DeskIsle 在显示期间持有注册句柄，关闭预览时释放。缩略图内容取决于 Windows 能为源窗口提供的画面。
 
+## 插件接入
+
+DeskIsle 采用进程外发布协议。插件通过命令行或本地文件提交 UTF-8 JSON，宿主使用已有的 serde 校验文档，并按扩展点名称和版本分派数据。插件可自行选择语言和第三方依赖。桌面卡片沿用 DirectComposition；主程序继续分发单个可执行文件。接入方式见[插件协议 v1](plugins.md)。
+
 ## 自动更新
 
 Windows x64 继续分发单个可执行文件。后台线程通过 `ureq` 和 TLS 访问 GitHub Releases API，用 `serde_json` 读取资产元数据、`semver` 比较标签、`sha2` 校验下载内容。程序将安装脚本嵌入可执行文件，由系统自带的 Windows PowerShell 在旧进程退出后调用 `File.Replace` 并保留备份，直到 Windows 成功创建新版进程。安装需要程序目录可写，且系统允许启动 Windows PowerShell。

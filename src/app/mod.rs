@@ -1,4 +1,5 @@
 mod about;
+mod cards;
 mod commands;
 mod drag;
 mod folder;
@@ -7,6 +8,7 @@ mod label;
 mod launchpad;
 mod menus;
 mod monitor;
+pub(crate) mod plugin_cli;
 mod preview;
 mod settings;
 mod system;
@@ -40,6 +42,9 @@ struct Bars {
     // Destroy the tray host before removing the AppBar so Shell32 addresses Explorer.
     events: shell::WindowEvents,
     renderer: Option<Renderer>,
+    desktop_cards: platform::cards::DesktopCards,
+    card_reader: Option<cards::CardReader>,
+    card_data: Vec<crate::cards::Card>,
     /// Released after the renderer, which drops the panel's composition target first.
     panel: Option<settings::Panel>,
     /// Released after the renderer, like the panel.
@@ -226,6 +231,9 @@ pub(crate) fn run() -> Result<()> {
     let mut worker = SystemWorker::new(top.0)?;
     worker.refresh_network()?;
     let mut bars = Bars {
+        desktop_cards: Default::default(),
+        card_reader: None,
+        card_data: Vec::new(),
         metrics_worker: MetricsWorker::new(top.0)?,
         indicators: Vec::new(),
         taskbar_shortcut,
@@ -297,6 +305,7 @@ pub(crate) fn run() -> Result<()> {
     bars.refresh_top_window(true);
     bars.apply_monitor_settings()?;
     bars.position()?;
+    bars.refresh_desktop_cards()?;
     // Applications answer at once; the loop below receives their icons.
     bars.tray.request_icons()?;
     bars.check_for_updates(false);
@@ -376,6 +385,11 @@ pub(crate) fn run() -> Result<()> {
                 Err(e) if is_device_lost(&e) => bars.rebuild_renderer()?,
                 result => result?,
             },
+            Event::CardsUpdated => bars.receive_cards()?,
+            Event::CardPage(delta) => {
+                bars.desktop_cards.change_page(delta);
+                bars.refresh_desktop_cards()?;
+            }
             Event::DefaultOutput => {
                 bars.watch_audio();
                 bars.refresh_audio()?;
@@ -595,10 +609,14 @@ impl Bars {
     fn sync_visibility(&mut self, foreground_changed: bool, layout_changed: bool) -> Result<()> {
         let fullscreen = self.shell_fullscreen && self.fullscreen_app();
         if fullscreen == self.fullscreen && !layout_changed {
+            if foreground_changed {
+                self.refresh_desktop_cards()?;
+            }
             let raise = foreground_changed && self.settings.dock_display_mode().reassert_topmost();
             return self.sync_dock_visibility(raise);
         }
         self.fullscreen = fullscreen;
+        self.refresh_desktop_cards()?;
         self.sync_sampling();
         self.publish_tray_rects();
         self.position()?;
@@ -956,6 +974,7 @@ impl Bars {
         self.paint_preview()?;
         self.paint_panel()?;
         self.paint_about()?;
+        self.paint_desktop_cards()?;
         self.paint_launchpad()
     }
 

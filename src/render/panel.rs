@@ -59,6 +59,7 @@ fn section_color(section: Section) -> Rgb {
         Section::TopBar => (94, 83, 166),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
+        Section::Cards => (33, 131, 109),
         Section::About => (114, 120, 130),
     }
 }
@@ -72,6 +73,7 @@ fn section_symbol(section: Section) -> Symbol {
         Section::TopBar => Symbol::Window,
         Section::Clock => Symbol::Clock,
         Section::Monitor => Symbol::Chip,
+        Section::Cards => Symbol::Apps,
         Section::About => Symbol::Info,
     }
 }
@@ -564,8 +566,8 @@ impl Renderer {
             };
             self.label(c, text, note, 11., false, c.p.muted, 1.)?;
         }
-        if let Some(button) = layout.display_settings {
-            self.button_face(c, &t, button, 6., hover(panel::DISPLAY_SETTINGS))?;
+        if let Some((button, label, action)) = layout.footer_link {
+            self.button_face(c, &t, button, 6., hover(action))?;
             if layout.focus == Some(layout.rows.len()) {
                 c.stroke(
                     button.left,
@@ -579,7 +581,7 @@ impl Renderer {
             }
             self.label_aligned(
                 c,
-                "屏幕刷新率…",
+                label,
                 button,
                 13.,
                 false,
@@ -1272,6 +1274,7 @@ mod render_tests {
                 Section::Appearance,
                 Section::Dock,
                 Section::TopBar,
+                Section::Cards,
                 Section::About,
             ] {
                 let mut state = PanelState {

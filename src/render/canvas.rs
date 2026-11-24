@@ -335,7 +335,7 @@ impl Canvas {
         }
     }
 
-    fn brush_alpha(&self, (r, g, b): Rgb, a: f32) -> Result<ID2D1SolidColorBrush> {
+    pub(super) fn brush_alpha(&self, (r, g, b): Rgb, a: f32) -> Result<ID2D1SolidColorBrush> {
         unsafe { self.ctx.CreateSolidColorBrush(&color(r, g, b, a), None) }
     }
 

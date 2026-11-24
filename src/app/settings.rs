@@ -186,6 +186,7 @@ impl Bars {
         if repalette {
             self.label = None;
             self.retheme_preview(dark)?;
+            self.refresh_desktop_cards()?;
             self.draw_launchpad()?;
         }
         let Some(panel) = self.panel.as_mut() else {
@@ -410,6 +411,14 @@ impl Bars {
             }
             Some(Action::Quit) => return Ok(true),
             Some(Action::CheckUpdates) => self.check_for_updates(true),
+            Some(Action::OpenPluginsDirectory) => {
+                let owner = panel.window.0;
+                if let Err(error) = storage::ensure_plugins_directory()
+                    .and_then(|path| platform::shell::execute(owner, path))
+                {
+                    platform::report_error(Some(owner), &error);
+                }
+            }
             Some(Action::Open(uri)) => {
                 let owner = panel.window.0;
                 if let Err(error) = platform::shell::execute(owner, uri) {
@@ -491,6 +500,7 @@ impl Bars {
                     Ok(())
                 }
                 Key::ConfirmPowerActions | Key::AutoCheckUpdates => Ok(()),
+                Key::DesktopCards => self.refresh_desktop_cards(),
                 Key::Theme | Key::SyncSystemTheme => {
                     retheme = true;
                     if self.settings.enabled(Key::SyncSystemTheme)

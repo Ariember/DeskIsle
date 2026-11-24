@@ -1,5 +1,6 @@
 pub mod about;
 pub mod calendar;
+pub mod cards;
 pub mod icon;
 pub mod launchpad;
 pub mod layout;

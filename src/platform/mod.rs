@@ -1,6 +1,7 @@
 pub mod about;
 pub mod audio;
 pub mod backdrop;
+pub mod cards;
 pub mod display;
 mod drop_files;
 pub mod input;
@@ -177,6 +178,7 @@ pub fn create_bars() -> Result<(Bar, Bar)> {
         launchpad::register_class(instance, wc.hCursor)?;
         about::register_class(instance, wc.hCursor)?;
         preview::register_class(instance, wc.hCursor)?;
+        cards::register_class(instance, wc.hCursor)?;
         let create = |title| {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -238,6 +240,7 @@ pub fn monitor() -> Result<Monitor> {
 
 pub const APPBAR_CHANGED: u32 = WM_APP + 2;
 const METRICS_UPDATED: u32 = WM_APP + 6;
+const CARDS_UPDATED: u32 = WM_APP + 7;
 const TRAY_NOTICE_TIMER: usize = 2;
 const DOCK_EDGE_TIMER: usize = 3;
 const PREVIEW_LEAVE_TIMER: usize = 5;
@@ -253,6 +256,10 @@ pub fn time_tray_notice(hwnd: HWND) {
 /// Wakes the UI thread. The worker holds the window's lifetime lock through this call.
 pub fn notify_metrics(hwnd: HWND) -> Result<()> {
     unsafe { PostMessageW(Some(hwnd), METRICS_UPDATED, WPARAM(0), LPARAM(0)) }
+}
+
+pub fn notify_cards(hwnd: HWND) -> Result<()> {
+    unsafe { PostMessageW(Some(hwnd), CARDS_UPDATED, WPARAM(0), LPARAM(0)) }
 }
 
 /// Poll only while a release check or a download is in flight.
@@ -575,6 +582,7 @@ pub enum Event {
     TaskbarShortcut(i32),
     DockShortcut,
     MetricsUpdate,
+    CardsUpdated,
     UpdateProgress,
     Move(HWND, i32, i32),
     Leave(HWND),
@@ -646,6 +654,7 @@ pub enum Event {
     Launchpad(launchpad::LaunchpadEvent),
     About(about::AboutEvent),
     Preview(preview::PreviewEvent),
+    CardPage(i32),
     Quit,
 }
 
@@ -710,6 +719,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         audio::AUDIO_CHANGED => Event::Audio,
         system_worker::UPDATED => Event::SystemUpdate,
         METRICS_UPDATED => Event::MetricsUpdate,
+        CARDS_UPDATED => Event::CardsUpdated,
         m if m != 0 && m == TASKBAR_CREATED.get() => Event::ShellRestart,
         APPBAR_CHANGED if wp.0 == ABN_POSCHANGED as usize => Event::AppBarMoved,
         APPBAR_CHANGED if wp.0 == ABN_FULLSCREENAPP as usize => Event::FullScreen(lp.0 != 0),
@@ -799,6 +809,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::Launchpad(_)
                     | Event::About(_)
                     | Event::Preview(_)
+                    | Event::CardPage(_)
             )
         {
             events.push_back(event);

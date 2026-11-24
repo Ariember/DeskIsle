@@ -29,6 +29,12 @@ Dock 首位的启动台按钮打开主屏状态栏与 Dock 之间的独立窗口
 
 `ui/launchpad.rs` 根据可用空间、DPI 和搜索文字计算可见图标及分页。绘制、点击、悬停和右键移除共用这份布局。启动台项目保存在 `%APPDATA%\DeskIsle\launchpad.txt`，按拖入顺序每行记录一个路径。首次打开时文件缺失对应空列表。保存成功后才更新界面，读取失败会提示并保留原文件。
 
+## 插件与桌面卡片
+
+`app/plugin_cli.rs` 在桌面单实例检查前分派能力查询、校验、发布或撤下命令。`plugins.rs` 负责插件元数据、扩展点注册、版本匹配和输入校验。每个新扩展点在此声明并交给对应模块处理。`integrations/plugins.rs` 按插件 ID 原子替换或移除发布文档。发布者的接口见[插件协议 v1](plugins.md)。
+
+开启桌面卡片时，`app/cards.rs` 在后台读取 `desktop.cards` 内容，仅在数据变化时通知界面线程。关闭显示时停止读取，退出时先撤销工作线程的窗口通知目标。`ui/cards.rs` 按主屏工作区和 DPI 计算卡片、分页和命中范围。`platform/cards.rs` 管理不激活的桌面窗口，`render/cards.rs` 使用已有图形设备绘制当前页。
+
 ## 资源监控
 
 `platform/metrics.rs` 读取 Windows 系统计数器、内存和显卡温度。`integrations/core_temp.rs` 以只读方式打开当前会话的 Core Temp 共享区，校验固定前缀、核心数量和温度单位，取最高有效核心温度。温差模式或缺少有效传感器时返回空值。

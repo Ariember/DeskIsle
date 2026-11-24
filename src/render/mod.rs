@@ -1,5 +1,6 @@
 mod about;
 mod canvas;
+mod cards;
 mod glass;
 mod label;
 mod launchpad;
@@ -114,6 +115,7 @@ pub struct Renderer {
     menu: Option<MenuView>,
     panel: Option<PanelView>,
     about: Option<AboutView>,
+    cards: Option<cards::CardView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
     appearance: Settings,
@@ -479,6 +481,7 @@ impl Renderer {
                 menu: None,
                 panel: None,
                 about: None,
+                cards: None,
                 launchpad: None,
                 palette: Palette::new(dark, settings),
                 appearance: settings.clone(),

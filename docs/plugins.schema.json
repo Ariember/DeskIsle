@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeskIsle 插件发布协议 v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "name",
+    "version",
+    "contributions"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "integer",
+      "const": 1
+    },
+    "name": {
+      "$ref": "#/$defs/label"
+    },
+    "version": {
+      "type": "string",
+      "description": "插件的 SemVer 版本号，由 plugins validate 检查。",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "contributions": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/contribution"
+      }
+    }
+  },
+  "$defs": {
+    "contribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point",
+        "version",
+        "data"
+      ],
+      "properties": {
+        "point": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "data": {}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "point": {
+                "const": "desktop.cards"
+              },
+              "version": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/desktopCardsV1"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "desktopCardsV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cards"
+      ],
+      "properties": {
+        "cards": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/card"
+          }
+        }
+      }
+    },
+    "line": {
+      "type": "string",
+      "not": {
+        "pattern": "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]"
+      }
+    },
+    "label": {
+      "$ref": "#/$defs/line",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "[^\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+    },
+    "card": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "value"
+      ],
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/label"
+        },
+        "value": {
+          "$ref": "#/$defs/label"
+        },
+        "detail": {
+          "$ref": "#/$defs/line",
+          "maxLength": 160,
+          "default": ""
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "ready",
+            "setup",
+            "error"
+          ],
+          "default": "ready"
+        }
+      }
+    }
+  }
+}

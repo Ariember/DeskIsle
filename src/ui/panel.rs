@@ -81,6 +81,7 @@ pub enum Action {
     /// Restores the defaults of every setting on the current page.
     Reset,
     Open(&'static str),
+    OpenPluginsDirectory,
     CheckUpdates,
     Quit,
     OpenModes,
@@ -315,11 +316,9 @@ impl PanelState {
                 }
                 let Some(row) = layout.rows.get(focused?) else {
                     return (nav == Nav::Activate).then_some(
-                        if layout.display_settings.is_some() {
-                            DISPLAY_SETTINGS
-                        } else {
-                            Action::Reset
-                        },
+                        layout
+                            .footer_link
+                            .map_or(Action::Reset, |(_, _, action)| action),
                     );
                 };
                 if matches!(row.part, Part::Dropdown { .. }) && nav == Nav::Activate {
@@ -367,7 +366,7 @@ pub struct PanelLayout {
     pub backdrop: i32,
     pub footer_button: Area,
     pub about: Option<AboutPage>,
-    pub display_settings: Option<Area>,
+    pub footer_link: Option<(Area, &'static str, Action)>,
     pub max_scroll: f32,
     pub scroll_thumb: Option<Area>,
     pub focus: Option<usize>,
@@ -404,8 +403,7 @@ impl PanelLayout {
             || {
                 self.rows.len()
                     + usize::from(
-                        self.display_settings.is_some()
-                            || SECTIONS[self.page] == Section::Appearance,
+                        self.footer_link.is_some() || SECTIONS[self.page] == Section::Appearance,
                     )
             },
             |about| about.buttons().count() + 1,
@@ -499,7 +497,6 @@ impl PanelLayout {
             let y = view.top + (track - thumb) * state.scroll / max_scroll;
             Area::new(view.right + 6., y, view.right + 10., y + thumb)
         });
-        let general = section == Section::General;
         for group in &mut groups {
             group.top -= state.scroll;
             group.bottom -= state.scroll;
@@ -569,13 +566,19 @@ impl PanelLayout {
             rows,
             groups,
             backdrop: settings.get(Key::Backdrop),
-            display_settings: general.then(|| {
-                Area::new(
+            footer_link: match section {
+                Section::General => Some(("屏幕刷新率…", DISPLAY_SETTINGS)),
+                Section::Cards => Some(("打开插件目录…", Action::OpenPluginsDirectory)),
+                _ => None,
+            }
+            .map(|(label, action)| {
+                let area = Area::new(
                     view.left,
                     reset_top,
                     view.left + 132.,
                     reset_top + CONTROL_HEIGHT,
-                )
+                );
+                (area, label, action)
             }),
             about: (section == Section::About).then(|| AboutPage::new(view)),
             footer_button: Area::new(
@@ -691,11 +694,10 @@ impl PanelLayout {
         if let Some(page) = self.nav.iter().position(|(area, _)| area.contains(x, y)) {
             return Some(Action::Page(page));
         }
-        if self
-            .display_settings
-            .is_some_and(|area| area.contains(x, y))
+        if let Some((area, _, action)) = self.footer_link
+            && area.contains(x, y)
         {
-            return Some(DISPLAY_SETTINGS);
+            return Some(action);
         }
         if self.footer_button.contains(x, y) {
             return Some(if self.about.is_some() {
@@ -1021,12 +1023,21 @@ mod tests {
                     }
                     assert!(text_area(row).right > text_area(row).left + 120.);
                 }
-                if let Some(button) = layout.display_settings {
+                let expected_link = match section {
+                    Section::General => Some(DISPLAY_SETTINGS),
+                    Section::Cards => Some(Action::OpenPluginsDirectory),
+                    _ => None,
+                };
+                assert_eq!(
+                    layout.footer_link.map(|(_, _, action)| action),
+                    expected_link
+                );
+                if let Some((button, _, action)) = layout.footer_link {
                     let (x, y) = center(button, s);
-                    assert_eq!(layout.hit(x, y), Some(DISPLAY_SETTINGS));
+                    assert_eq!(layout.hit(x, y), Some(action));
                     state.key(Nav::Next, &layout);
                     let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
-                    assert_eq!(state.key(Nav::Activate, &layout), Some(DISPLAY_SETTINGS));
+                    assert_eq!(state.key(Nav::Activate, &layout), Some(action));
                 }
                 // The window corner and the caption do nothing.
                 assert_eq!(layout.hit(1, 1), None);
