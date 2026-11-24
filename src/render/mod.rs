@@ -129,7 +129,7 @@ pub struct Renderer {
 struct TopState {
     layout: StatusLayout,
     background: TopBarBackground,
-    wallpaper_tint: Option<(u8, u8, u8)>,
+    palette: Palette,
     frosted: bool,
     color_tray_icons: bool,
     immersive_color: Option<u32>,
@@ -217,6 +217,36 @@ pub(super) fn top_bar_shadow(style: TopBarBackground, immersive_color: Option<u3
             style,
             TopBarBackground::Tinted | TopBarBackground::Frosted | TopBarBackground::Transparent
         )
+}
+
+/// A desktop glass bar uses the palette selected for its sampled strip. An opaque
+/// maximized caption and the gradient mask each supply their own foreground.
+fn top_bar_palette(
+    theme: Palette,
+    settings: &Settings,
+    light_ground: Option<bool>,
+    caption: Option<u32>,
+    wallpaper_tint: Option<canvas::Rgb>,
+) -> Palette {
+    let style = settings.top_bar_background();
+    if caption.is_some() {
+        return theme.for_top_bar(style, caption);
+    }
+    if let Some(light) = light_ground {
+        // The clear body takes no custom tint overlay while glass is active.
+        return Palette::new(!light, settings);
+    }
+    if !settings.enabled(Key::Appearance(AppearanceKey::TopCustom)) {
+        return theme.for_top_bar(style, None);
+    }
+    let Some((r, g, b)) = wallpaper_tint else {
+        return theme;
+    };
+    let tint = settings.get(Key::Appearance(AppearanceKey::TopTint)) as f32 / 100.;
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * tint).round() as u8;
+    let (br, bg, bb) = theme.bar;
+    let color = u32::from_le_bytes([mix(br, r), mix(bg, g), mix(bb, b), 0]);
+    theme.for_top_bar(style, Some(color))
 }
 
 /// Size of the icons on the status bar, in DIPs. The battery is drawn larger with the
@@ -644,25 +674,24 @@ impl Renderer {
         } else {
             0.
         };
-        let tint = level(A::TopTint) as f32 / 100.;
-        let mut palette = self
-            .palette
-            .for_top_bar(self.top_background, immersive_color);
-        if custom && immersive_color.is_none() {
-            palette = self.palette;
-            if let Some((r, g, b)) = self.wallpaper_tint {
-                let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * tint).round() as u8;
-                let (br, bg, bb) = palette.bar;
-                let color = u32::from_le_bytes([mix(br, r), mix(bg, g), mix(bb, b), 0]);
-                palette = palette.for_top_bar(self.top_background, Some(color));
-            }
-        }
+        let light_ground = self
+            .top_glass
+            .as_ref()
+            .filter(|_| live_top_glass)
+            .and_then(glass::GlassSurface::light_ground);
+        let palette = top_bar_palette(
+            self.palette,
+            &self.appearance,
+            light_ground,
+            immersive_color,
+            self.wallpaper_tint,
+        );
         let shadow = top_bar_shadow(self.top_background, immersive_color);
         let metrics_changed = self.update_metrics(layout, dpi, metrics, palette, shadow)?;
         let state = TopState {
             layout: layout.clone(),
             background: self.top_background,
-            wallpaper_tint: self.wallpaper_tint,
+            palette,
             frosted,
             color_tray_icons: self.color_tray_icons,
             immersive_color,
@@ -1369,6 +1398,23 @@ fn faint(pixels: &[u8], light_ground: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glass_top_bar_uses_the_sampled_strip_for_its_content() {
+        let mut settings = Settings::default();
+        for custom in [0, 1] {
+            settings.set(Key::Appearance(AppearanceKey::TopCustom), custom);
+            for light in [false, true] {
+                let theme = Palette::new(light, &settings);
+                let actual = top_bar_palette(theme, &settings, Some(light), None, None);
+                assert_eq!(actual, Palette::new(!light, &settings));
+                assert_eq!(top_bar_palette(theme, &settings, None, None, None), theme);
+                let caption = if light { 0 } else { 0xFF_FFFF };
+                let immersive = top_bar_palette(theme, &settings, Some(light), Some(caption), None);
+                assert_eq!(immersive.light_ground(), !light);
+            }
+        }
+    }
 
     #[test]
     fn dock_separators_draw_thin_inset_lines_in_both_themes() -> Result<()> {

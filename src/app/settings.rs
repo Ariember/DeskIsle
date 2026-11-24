@@ -21,6 +21,8 @@ pub(super) struct Panel {
     dpi: u32,
     /// Whether the sidebar is painted translucent over the acrylic backdrop.
     glass: bool,
+    /// Another window may have changed the scene while it had focus.
+    was_inactive: bool,
     pressed: Option<Action>,
 }
 
@@ -232,6 +234,7 @@ impl Bars {
         )?;
         self.panel = Some(Panel {
             glass: glass(&window, live_glass),
+            was_inactive: false,
             window,
             pressed: None,
             state,
@@ -311,6 +314,23 @@ impl Bars {
             return Ok(false);
         };
         let action = match *event {
+            Event::PanelActivation(active) => {
+                let reactivated = active && panel.was_inactive;
+                panel.was_inactive = !active;
+                if reactivated && panel.glass {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.invalidate_panel_scene();
+                    }
+                    self.draw_panel()?;
+                }
+                return Ok(false);
+            }
+            Event::PanelMoved => {
+                if panel.glass {
+                    self.draw_panel()?;
+                }
+                return Ok(false);
+            }
             Event::PanelPress(x, y) => {
                 panel.pressed = panel.layout.hit(x, y);
                 if let Some(key) = panel.layout.slider_at(x, y)

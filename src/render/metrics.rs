@@ -28,13 +28,12 @@ impl Renderer {
         dpi: u32,
         metrics: &[Indicator],
     ) -> Result<()> {
-        let caption = self
-            .top_state
-            .as_ref()
-            .and_then(|state| state.immersive_color);
-        let palette = self.palette.for_top_bar(self.top_background, caption);
-        let shadow = super::top_bar_shadow(self.top_background, caption);
-        if self.update_metrics(layout, dpi, metrics, palette, shadow)? {
+        // A full bar draw paints the latest readings along with its other content.
+        let Some(bar) = &self.top_state else {
+            return Ok(());
+        };
+        let shadow = super::top_bar_shadow(bar.background, bar.immersive_color);
+        if self.update_metrics(layout, dpi, metrics, bar.palette, shadow)? {
             unsafe { self.device.Commit()? };
         }
         Ok(())
@@ -329,6 +328,40 @@ mod tests {
             frosted,
             None,
         )?;
+        let ground = renderer
+            .top_glass
+            .as_ref()
+            .and_then(|surface| surface.light_ground())
+            .expect("the frosted bar sampled its desktop strip");
+        renderer.set_appearance(ground, &settings);
+        renderer.draw_top(
+            &bar,
+            144,
+            "DeskIsle",
+            "12:01",
+            &[],
+            &[],
+            None,
+            None,
+            &indicators,
+            frosted,
+            None,
+        )?;
+        assert_eq!(
+            renderer.top_state.as_ref().unwrap().palette.light_ground(),
+            ground
+        );
+        indicators[0].value = Some(7);
+        renderer.draw_metrics(&bar, 144, &indicators)?;
+        assert_eq!(
+            renderer
+                .metric_layer
+                .as_ref()
+                .unwrap()
+                .palette
+                .light_ground(),
+            ground
+        );
         settings.set(Key::TopBarBackground, 2);
         renderer.set_appearance(true, &settings);
         top.set_top_backdrop(false, true);

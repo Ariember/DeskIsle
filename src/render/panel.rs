@@ -13,7 +13,7 @@ use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
 use super::Renderer;
-use super::canvas::{Canvas, Rgb, Text, accent_color, paint};
+use super::canvas::{Canvas, Palette, Rgb, Text, accent_color, paint};
 
 const WHITE: Rgb = (255, 255, 255);
 const BLACK: Rgb = (0, 0, 0);
@@ -162,8 +162,6 @@ struct Tones {
     window: Rgb,
     sidebar_top: Rgb,
     sidebar_bottom: Rgb,
-    /// Laid over the acrylic backdrop, which already brings its own tint and noise.
-    sidebar_glass: (Rgb, f32),
     divider: (Rgb, f32),
     /// Alphas of `line` for the grouped list's fill and rim.
     group: f32,
@@ -188,7 +186,6 @@ impl Tones {
                 window: (30, 30, 31),
                 sidebar_top: (50, 49, 53),
                 sidebar_bottom: (40, 39, 43),
-                sidebar_glass: ((44, 43, 48), 0.3),
                 divider: (BLACK, 0.55),
                 group: 0.05,
                 group_rim: 0.07,
@@ -206,7 +203,6 @@ impl Tones {
                 window: (248, 248, 248),
                 sidebar_top: (237, 235, 241),
                 sidebar_bottom: (227, 225, 232),
-                sidebar_glass: ((236, 234, 240), 0.28),
                 divider: (BLACK, 0.1),
                 group: 0.035,
                 group_rim: 0.06,
@@ -236,7 +232,7 @@ pub(super) struct PanelView {
 impl Renderer {
     /// Paints `layout` into `hwnd`, the settings window, binding to it on first use and
     /// again after the device was rebuilt. With `glass` the sidebar renders translucent
-    /// Liquid Glass over the live desktop backdrop behind it.
+    /// Liquid Glass over the windows behind it.
     pub fn draw_panel(
         &mut self,
         hwnd: HWND,
@@ -261,14 +257,15 @@ impl Renderer {
         }
         let (width, height) = layout.pixels();
         let sidebar_px = layout.sidebar_pixels() as f32;
-        let mut live_sidebar_glass = false;
+        let enabled = glass && layout.backdrop > 0;
+        // The window can supply DWM acrylic when the composition engine is unavailable.
+        let mut sidebar_glass = (enabled && self.glass.is_none()).then_some(self.palette);
         if let (Some(engine), Some(panel_view)) = (&self.glass, self.panel.as_mut())
             && let Some(surface) = &mut panel_view.glass
         {
-            let strength = if glass { layout.backdrop } else { 0 };
-            live_sidebar_glass = strength > 0
+            if enabled
                 && surface
-                    .update(
+                    .update_behind(
                         engine,
                         super::glass::GlassSpec {
                             x: 0.,
@@ -276,18 +273,24 @@ impl Renderer {
                             width: sidebar_px,
                             height: height as f32,
                             radius: 0.,
-                            strength,
+                            strength: layout.backdrop,
                             rim: super::glass::rim::LABEL,
                         },
+                        super::glass::DEFAULT_FROST * layout.backdrop as f32 / 100.,
                     )
-                    .is_ok();
-            if !live_sidebar_glass {
+                    .is_ok()
+            {
+                sidebar_glass = Some(
+                    surface
+                        .light_ground()
+                        .map_or(self.palette, |light| Palette::new(!light, &self.appearance)),
+                );
+            } else {
                 let _ = surface.hide();
             }
         }
-        let use_glass = glass && (live_sidebar_glass || self.glass.is_none());
         let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-            self.paint_panel(c, layout, use_glass)
+            self.paint_panel(c, layout, sidebar_glass)
         })?;
         let view = self.panel.as_ref().expect("panel bound above");
         unsafe {
@@ -300,6 +303,12 @@ impl Renderer {
     pub fn close_panel(&mut self) {
         if self.panel.take().is_some() {
             let _ = unsafe { self.device.Commit() };
+        }
+    }
+
+    pub fn invalidate_panel_scene(&mut self) {
+        if let Some(glass) = self.panel.as_mut().and_then(|panel| panel.glass.as_mut()) {
+            glass.invalidate_scene();
         }
     }
 
@@ -375,7 +384,12 @@ impl Renderer {
         )
     }
 
-    fn paint_panel(&self, c: &Canvas, layout: &PanelLayout, glass: bool) -> Result<()> {
+    fn paint_panel(
+        &self,
+        c: &Canvas,
+        layout: &PanelLayout,
+        sidebar_glass: Option<Palette>,
+    ) -> Result<()> {
         let t = Tones::new(c.p.dark, c.p.accent);
         let (w, h) = (layout.width, layout.height);
         let hover = |action: Action| layout.hover == Some(action);
@@ -383,22 +397,7 @@ impl Renderer {
         c.round(side, 0., w, h, 0., t.window)?;
 
         // The sidebar runs the full height, under the window lights, as in macOS.
-        if glass {
-            let (tint, alpha) = t.sidebar_glass;
-            let glass_strength = layout.backdrop as f32 / 100.;
-            let eff_alpha = 1. - (1. - alpha * 0.72) * glass_strength;
-            c.liquid_glass_shell(
-                Area::new(0., 0., side, h),
-                0.,
-                super::glass::LiquidShell {
-                    top_tint: mix(tint, WHITE, if c.p.dark { 0.12 } else { 0.45 }),
-                    bottom_tint: tint,
-                    opacity: eff_alpha,
-                    rim: 0.45 * glass_strength,
-                    glass_active: true,
-                },
-            )?;
-        } else {
+        if sidebar_glass.is_none() {
             c.gradient(
                 0.,
                 0.,
@@ -435,12 +434,13 @@ impl Renderer {
             c.symbol_in(Symbol::Close, cross, 10., CLOSE_CROSS, 0.9)?;
         }
 
+        let nav_palette = sidebar_glass.unwrap_or(c.p);
         for (index, &(a, section)) in layout.nav.iter().enumerate() {
             let selected = index == layout.page;
             if selected {
                 c.round(a.left, a.top, a.right, a.bottom, 6., t.accent)?;
             } else if hover(Action::Page(index)) {
-                c.fill(a.left, a.top, a.right, a.bottom, 6., c.p.line, 0.06)?;
+                c.fill(a.left, a.top, a.right, a.bottom, 6., nav_palette.line, 0.06)?;
             }
             let tile = Area::new(
                 a.left + 8.,
@@ -473,7 +473,11 @@ impl Renderer {
                 right: a.right - 8.,
                 ..a
             };
-            let ink = if selected { WHITE } else { c.p.ink };
+            let ink = if selected {
+                c.p.on_accent
+            } else {
+                nav_palette.ink
+            };
             self.label(c, section.title(), text, 13., false, ink, 1.)?;
         }
 
@@ -1252,6 +1256,118 @@ mod render_tests {
         // All windows and graphics objects were owned by this test thread.
         unsafe { CoUninitialize() };
         result
+    }
+
+    #[test]
+    #[ignore = "shows a settings panel over a test window on an interactive Windows desktop"]
+    fn sidebar_shows_live_content_from_the_window_behind_the_panel() -> Result<()> {
+        use crate::platform::{Desktop, PanelWindow, backdrop::Backdrop, create_bars, monitor};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Dwm::DwmFlush;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, HWND_TOPMOST, MSG, PM_REMOVE, PeekMessageW, SWP_NOACTIVATE,
+            SWP_SHOWWINDOW, SetWindowPos,
+        };
+
+        let _desktop = Desktop::init()?;
+        let (top, bottom) = create_bars()?;
+        let settings = Settings::default();
+        let work = monitor()?.work;
+        let layout = PanelLayout::new(&mut PanelState::default(), &settings, 96, work);
+        let area = layout.place(work);
+        let background = HiddenWindow::create()?;
+        let panel = PanelWindow::create(
+            area,
+            layout.caption_pixels(),
+            layout.sidebar_pixels(),
+            false,
+            false,
+        )?;
+        let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
+        let layer = super::super::Bar::new(&renderer.device, background.0)?;
+        let device = renderer.device.clone();
+        let palette = renderer.palette;
+        let set_background = |rgb| -> Result<()> {
+            let surface = paint(&device, palette, area.width, area.height, 96, |c| {
+                c.round(0., 0., layout.width, layout.height, 0., rgb)
+            })?;
+            unsafe {
+                layer.root.SetContent(&surface)?;
+                device.Commit()?;
+                device.WaitForCommitCompletion()
+            }
+        };
+        let show = |hwnd| unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                area.x,
+                area.y,
+                area.width,
+                area.height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+        };
+        // Sample an unselected navigation label, the empty glass beside it, and
+        // the opaque gutter between the sidebar and the scrollable page.
+        let row = layout.nav[1].0;
+        let strip = Rect {
+            x: area.x + row.left as i32 + 37,
+            y: area.y + row.top as i32,
+            width: layout.sidebar_pixels() + 10 - (row.left as i32 + 37),
+            height: (row.bottom - row.top) as i32,
+        };
+        let wait_for = |description: &str, matches: &dyn Fn(u8, u8, u8) -> bool| -> Result<()> {
+            let start = Instant::now();
+            loop {
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&msg);
+                    }
+                    DwmFlush()?;
+                }
+                let frame = Backdrop::capture(strip, 0, false)?;
+                let rows = frame.pixels.chunks_exact(4 * strip.width as usize);
+                let middle = rows.clone().nth(strip.height as usize / 2).unwrap();
+                let red_at = |x| middle[(x - strip.x) as usize * 4 + 2];
+                let sidebar = red_at(area.x + layout.sidebar_pixels() - 36);
+                let page = red_at(area.x + layout.sidebar_pixels() + 8);
+                let ink = rows
+                    .flat_map(|row| row[..32 * 4].chunks_exact(4))
+                    .map(|pixel| pixel[2])
+                    .max_by_key(|value| value.abs_diff(sidebar))
+                    .unwrap();
+                if matches(sidebar, page, ink) {
+                    return Ok(());
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "{description}: sidebar={sidebar}, page={page}, label={ink}",
+                );
+            }
+        };
+        set_background(BLACK)?;
+        show(background.0)?;
+        wait_for("test window visible", &|side, page, _| {
+            side < 20 && page < 20
+        })?;
+        renderer.draw_panel(panel.0, &layout, 96, true)?;
+        show(panel.0)?;
+        wait_for(
+            "light label on dark content behind the glass",
+            &|side, page, ink| side < 60 && page > 200 && ink > 210,
+        )?;
+        set_background(WHITE)?;
+        wait_for(
+            "glass follows the background without repainting the panel",
+            &|side, page, _| side > 200 && page > 200,
+        )?;
+        renderer.invalidate_panel_scene();
+        renderer.draw_panel(panel.0, &layout, 96, true)?;
+        wait_for("dark label on light content", &|side, page, ink| {
+            side > 200 && page > 200 && ink < 60
+        })
     }
 
     fn paint_pages() -> Result<()> {

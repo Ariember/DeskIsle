@@ -648,6 +648,8 @@ pub enum Event {
     PanelClick(i32, i32),
     PanelScroll(i16),
     PanelKey(PanelKey),
+    PanelMoved,
+    PanelActivation(bool),
     /// The panel moved to a monitor with this DPI and already took the suggested size.
     PanelDpi,
     PanelClose,
@@ -683,6 +685,8 @@ impl Event {
                 | Event::PanelClick(..)
                 | Event::PanelScroll(_)
                 | Event::PanelKey(_)
+                | Event::PanelMoved
+                | Event::PanelActivation(_)
                 | Event::PanelDpi
                 | Event::PanelClose
         )
@@ -1123,12 +1127,14 @@ impl PanelWindow {
         self.1
     }
 
-    /// DWM draws the backdrop only where the frame extends into the client area. It
-    /// extends under the sidebar alone: across the whole window DWM would also draw its
-    /// own caption buttons over the top right corner.
+    /// Extend the frame only for DWM acrylic. With composition glass, even a one-pixel
+    /// extension introduces an opaque frame fill underneath the clear sidebar.
     fn extend_frame(&self, sidebar: i32) {
+        if !self.1 {
+            return;
+        }
         let margins = MARGINS {
-            cxLeftWidth: if self.1 { sidebar.max(1) } else { 1 },
+            cxLeftWidth: sidebar.max(1),
             cxRightWidth: 1,
             cyTopHeight: 1,
             cyBottomHeight: 1,
@@ -1217,6 +1223,14 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         // Both forms must keep the window rectangle: CreateWindowEx sends the one without
         // `wParam`, and the system caption would stay until the next frame change.
         WM_NCCALCSIZE => return LRESULT(0),
+        WM_MOVE if unsafe { IsWindowVisible(hwnd) }.as_bool() => Event::PanelMoved,
+        WM_ACTIVATE => {
+            queue(
+                hwnd,
+                Event::PanelActivation(wp.0 & 0xffff != WA_INACTIVE as usize),
+            );
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
         WM_NCHITTEST => {
             let mut point = POINT { x, y };
             let _ = unsafe { ScreenToClient(hwnd, &mut point) };

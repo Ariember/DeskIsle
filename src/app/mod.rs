@@ -543,6 +543,8 @@ pub(crate) fn run() -> Result<()> {
             | Event::PanelClick(..)
             | Event::PanelScroll(_)
             | Event::PanelKey(_)
+            | Event::PanelMoved
+            | Event::PanelActivation(_)
             | Event::PanelDpi
             | Event::PanelClose)
                 if bars.panel_event(&event)? =>
