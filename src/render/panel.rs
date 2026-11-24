@@ -1320,7 +1320,7 @@ mod render_tests {
             let sidebar = red_at(area.x + sidebar_width - 36);
             let page = red_at(area.x + sidebar_width + 8);
             let ink = rows
-                .flat_map(|row| row[..32 * 4].chunks_exact(4))
+                .flat_map(|row| row[..32 * 4].as_chunks::<4>().0)
                 .map(|pixel| pixel[2])
                 .max_by_key(|value| value.abs_diff(sidebar))
                 .unwrap();
