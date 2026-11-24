@@ -6,6 +6,7 @@ mod folder;
 mod immersion;
 mod label;
 mod launchpad;
+mod market;
 mod menus;
 mod monitor;
 pub(crate) mod plugin_cli;
@@ -121,6 +122,7 @@ struct Bars {
     native_taskbar: NativeTaskbar,
     // Let the bars and native taskbar restore before waiting for an active install.
     updates: updates::Updates,
+    market: market::PluginMarket,
 }
 
 fn applications(pins: &[Pin]) -> Result<(Vec<AppGroup>, Option<isize>)> {
@@ -294,6 +296,7 @@ pub(crate) fn run() -> Result<()> {
         overflow_open: false,
         native_taskbar,
         updates: updates::Updates::default(),
+        market: market::PluginMarket::default(),
     };
     if bars.settings.enabled(Key::ShowInputLanguageIcon)
         && let Err(error) = bars.sync_input_indicator()
@@ -364,6 +367,7 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::TrayNoticeExpired => bars.clear_tray_notice()?,
             Event::UpdateProgress if bars.update_progress()? => return Ok(()),
+            Event::MarketProgress => bars.market_progress()?,
             Event::InputLanguage => bars.refresh_input_indicator()?,
             Event::TaskbarShortcut(id) if id == bars.settings.get(Key::TaskbarShortcut) => {
                 bars.toggle_taskbar()?;

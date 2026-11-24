@@ -12,6 +12,7 @@ fn run(profile: &Path, args: &[&str], stdin: &[u8]) -> Output {
         .arg("plugins")
         .args(args)
         .env("APPDATA", profile)
+        .env("DESKISLE_MARKET_INDEX", profile.join("market/index.json"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -19,6 +20,70 @@ fn run(profile: &Path, args: &[&str], stdin: &[u8]) -> Output {
         .unwrap();
     child.stdin.take().unwrap().write_all(stdin).unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn market_list_and_install_share_the_hosts_plugin_directory() {
+    use sha2::{Digest, Sha256};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let profile = std::env::temp_dir().join(format!(
+        "deskisle-market-cli-{}-{nonce}",
+        std::process::id()
+    ));
+    let market = profile.join("market");
+    fs::create_dir_all(market.join("packages")).unwrap();
+    let package = serde_json::to_vec(&json!({
+        "protocol":1, "name":"快捷键", "version":"1.0.0", "contributions":[{
+            "point":"desktop.cards","version":1,"data":{"cards":[{"title":"显示桌面","value":"Win + D"}]}
+        }]
+    })).unwrap();
+    let entry =
+        json!({"id":"shortcuts","name":"快捷键","version":"1.0.0","description":"常用快捷键"});
+    let mut indexed = entry.clone();
+    indexed["sha256"] = json!(format!("{:x}", Sha256::digest(&package)));
+    let source = market.join("packages/shortcuts.json");
+    fs::write(&source, &package).unwrap();
+    fs::write(
+        market.join("index.json"),
+        json!({"schema":1,"plugins":[indexed]}).to_string(),
+    )
+    .unwrap();
+
+    let listed = run(&profile, &["list"], &[]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
+        json!([entry])
+    );
+    assert!(!profile.join("DeskIsle").exists());
+
+    let target = profile.join("DeskIsle/plugins/shortcuts.json");
+    let install = run(&profile, &["install", "shortcuts"], &[]);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(fs::read(&target).unwrap(), package);
+    fs::write(&source, b"broken download").unwrap();
+    let failure = run(&profile, &["install", "shortcuts"], &[]);
+    assert_eq!(failure.status.code(), Some(1));
+    assert!(!failure.stderr.is_empty());
+    assert_eq!(fs::read(&target).unwrap(), package);
+    assert!(
+        run(&profile, &["remove", "shortcuts"], &[])
+            .status
+            .success()
+    );
+    assert!(!target.exists());
+    fs::remove_dir_all(profile).unwrap();
 }
 
 #[test]

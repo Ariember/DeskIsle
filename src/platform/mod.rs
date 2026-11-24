@@ -245,6 +245,7 @@ const TRAY_NOTICE_TIMER: usize = 2;
 const DOCK_EDGE_TIMER: usize = 3;
 const PREVIEW_LEAVE_TIMER: usize = 5;
 const UPDATE_TIMER: usize = 6;
+const MARKET_TIMER: usize = 7;
 const MK_LBUTTON: usize = 0x0001;
 
 /// Reset the one-shot status hint whenever another delivery fails.
@@ -264,13 +265,21 @@ pub fn notify_cards(hwnd: HWND) -> Result<()> {
 
 /// Poll only while a release check or a download is in flight.
 pub fn update_timer(hwnd: HWND, enabled: bool) -> Result<()> {
+    background_job_timer(hwnd, UPDATE_TIMER, enabled)
+}
+
+pub fn market_timer(hwnd: HWND, enabled: bool) -> Result<()> {
+    background_job_timer(hwnd, MARKET_TIMER, enabled)
+}
+
+fn background_job_timer(hwnd: HWND, id: usize, enabled: bool) -> Result<()> {
     unsafe {
         if enabled {
-            if SetTimer(Some(hwnd), UPDATE_TIMER, 300, None) == 0 {
+            if SetTimer(Some(hwnd), id, 300, None) == 0 {
                 return Err(Error::from_thread());
             }
         } else {
-            KillTimer(Some(hwnd), UPDATE_TIMER)?;
+            KillTimer(Some(hwnd), id)?;
         }
     }
     Ok(())
@@ -584,6 +593,7 @@ pub enum Event {
     MetricsUpdate,
     CardsUpdated,
     UpdateProgress,
+    MarketProgress,
     Move(HWND, i32, i32),
     Leave(HWND),
     CancelPress(HWND),
@@ -742,6 +752,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_TIMER if wp.0 == input::TIMER => Event::InputLanguage,
         WM_TIMER if wp.0 == UPDATE_TIMER => Event::UpdateProgress,
+        WM_TIMER if wp.0 == MARKET_TIMER => Event::MarketProgress,
         WM_TIMER | WM_TIMECHANGE => Event::Clock,
         WM_MOUSEMOVE => {
             // A non-activating bar may miss a release outside its visible area.

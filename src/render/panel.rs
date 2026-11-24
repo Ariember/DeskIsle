@@ -59,7 +59,7 @@ fn section_color(section: Section) -> Rgb {
         Section::TopBar => (94, 83, 166),
         Section::Clock => (15, 128, 138),
         Section::Monitor => (198, 64, 78),
-        Section::Cards => (33, 131, 109),
+        Section::Plugins => (33, 131, 109),
         Section::About => (114, 120, 130),
     }
 }
@@ -73,7 +73,7 @@ fn section_symbol(section: Section) -> Symbol {
         Section::TopBar => Symbol::Window,
         Section::Clock => Symbol::Clock,
         Section::Monitor => Symbol::Chip,
-        Section::Cards => Symbol::Apps,
+        Section::Plugins => Symbol::Apps,
         Section::About => Symbol::Info,
     }
 }
@@ -536,6 +536,58 @@ impl Renderer {
                     }
                 }
             }
+            if let Some(market) = &layout.market {
+                for index in market.visible(view) {
+                    let row = market.row(index);
+                    let button = market.button(index);
+                    let (title, detail, label) = market.labels(index);
+                    let action = market.action(index);
+                    c.fill(
+                        row.left,
+                        row.top + 1.,
+                        row.right,
+                        row.bottom - 1.,
+                        GROUP_RADIUS,
+                        c.p.line,
+                        t.group,
+                    )?;
+                    let title_area = Area::new(
+                        row.left + 16.,
+                        row.top + 6.,
+                        button.left - 10.,
+                        row.middle(),
+                    );
+                    let detail_area = Area {
+                        top: row.middle(),
+                        bottom: row.bottom - 6.,
+                        ..title_area
+                    };
+                    self.label(c, title, title_area, 13., true, c.p.ink, 1.)?;
+                    self.label(c, detail, detail_area, 11., false, c.p.muted, 1.)?;
+                    self.button_face(c, &t, button, 6., action.is_some_and(hover))?;
+                    if layout.focus == Some(layout.rows.len() + index) {
+                        c.stroke(
+                            button.left,
+                            button.top,
+                            button.right,
+                            button.bottom,
+                            6.,
+                            t.accent,
+                            1.,
+                        )?;
+                    }
+                    self.label_aligned(
+                        c,
+                        label,
+                        button,
+                        13.,
+                        false,
+                        if action.is_some() { c.p.ink } else { c.p.muted },
+                        1.,
+                        DWRITE_TEXT_ALIGNMENT_CENTER,
+                    )?;
+                }
+            }
             Ok(())
         })?;
 
@@ -570,7 +622,7 @@ impl Renderer {
         }
         if let Some((button, label, action)) = layout.footer_link {
             self.button_face(c, &t, button, 6., hover(action))?;
-            if layout.focus == Some(layout.rows.len()) {
+            if layout.focus == Some(layout.footer_focus()) {
                 c.stroke(
                     button.left,
                     button.top,
@@ -1208,7 +1260,7 @@ mod render_tests {
     use super::*;
     use crate::geometry::Rect;
     use crate::settings::Settings;
-    use crate::ui::panel::PanelState;
+    use crate::ui::panel::{MarketItem, MarketView, PanelState};
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
@@ -1452,6 +1504,16 @@ mod render_tests {
         let mut settings = Settings::default();
         settings.set(Key::FontScale, 120);
         let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
+        let market = MarketView {
+            loaded: true,
+            items: [MarketItem {
+                title: "快捷键速查 · 1.0.0".into(),
+                description: "常用 Windows 快捷键".into(),
+                installed: false,
+            }]
+            .into(),
+            ..Default::default()
+        };
         for dark in [false, true] {
             renderer.set_appearance(dark, &settings);
             for section in [
@@ -1459,7 +1521,7 @@ mod render_tests {
                 Section::Appearance,
                 Section::Dock,
                 Section::TopBar,
-                Section::Cards,
+                Section::Plugins,
                 Section::About,
             ] {
                 let mut state = PanelState {
@@ -1467,7 +1529,8 @@ mod render_tests {
                     ..Default::default()
                 };
                 loop {
-                    let layout = PanelLayout::new(&mut state, &settings, 120, work);
+                    let layout =
+                        PanelLayout::with_market(&mut state, &settings, 120, work, &market);
                     renderer.draw_panel(panel.0, &layout, 120, dark)?;
                     if state.scroll >= layout.max_scroll {
                         break;

@@ -76,7 +76,7 @@ pub enum Section {
     TopBar,
     Clock,
     Monitor,
-    Cards,
+    Plugins,
     About,
 }
 
@@ -87,7 +87,7 @@ pub const SECTIONS: &[Section] = &[
     Section::TopBar,
     Section::Clock,
     Section::Monitor,
-    Section::Cards,
+    Section::Plugins,
     Section::About,
 ];
 
@@ -100,7 +100,7 @@ impl Section {
             Section::TopBar => "顶部栏",
             Section::Clock => "时间",
             Section::Monitor => "监控",
-            Section::Cards => "桌面卡片",
+            Section::Plugins => "插件",
             Section::About => "关于",
         }
     }
@@ -450,7 +450,7 @@ pub const SCHEMA: &[Spec] = &[
     Spec {
         key: Key::DesktopCards,
         id: "cards.enabled",
-        section: Section::Cards,
+        section: Section::Plugins,
         label: "显示桌面卡片",
         help: "在主屏桌面显示各插件发布的卡片",
         control: Control::Toggle,

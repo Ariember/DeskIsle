@@ -288,7 +288,13 @@ impl Bars {
             self.settings.ui_dpi(platform::window_dpi(panel.window.0)),
             work,
         );
-        let mut layout = PanelLayout::new(&mut panel.state, &self.settings, panel.dpi, work);
+        let mut layout = PanelLayout::with_market(
+            &mut panel.state,
+            &self.settings,
+            panel.dpi,
+            work,
+            &self.market.view,
+        );
         if let (Some(about), Some(label)) = (&mut layout.about, update_status) {
             about.check_label = label;
         }
@@ -432,6 +438,10 @@ impl Bars {
             }
             Some(Action::Quit) => return Ok(true),
             Some(Action::CheckUpdates) => self.check_for_updates(true),
+            Some(action @ (Action::BrowseMarket | Action::InstallPlugin(_))) => {
+                panel.pressed = None;
+                self.start_market(action)
+            }
             Some(Action::OpenPluginsDirectory) => {
                 let owner = panel.window.0;
                 if let Err(error) = storage::ensure_plugins_directory()

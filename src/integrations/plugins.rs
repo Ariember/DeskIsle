@@ -84,7 +84,16 @@ pub(crate) fn validate(id: &str, bytes: &[u8]) -> io::Result<Publication> {
 }
 
 pub(crate) fn publish(dir: &Path, id: &str, bytes: &[u8]) -> io::Result<()> {
-    validate(id, bytes)?;
+    publish_checked(dir, id, bytes, |_| Ok(()))
+}
+
+pub(super) fn publish_checked(
+    dir: &Path,
+    id: &str,
+    bytes: &[u8],
+    check: impl FnOnce(&Publication) -> io::Result<()>,
+) -> io::Result<()> {
+    check(&validate(id, bytes)?)?;
     let target = dir.join(format!("{id}.json"));
     fs::create_dir_all(dir)?;
     let (temp, mut file) = create_temp(dir, id)?;

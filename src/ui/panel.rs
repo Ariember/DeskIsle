@@ -7,6 +7,7 @@ use crate::settings::{
     self, Adjust, Control, DOCK_DISPLAY_MODES, Key, MonitorKey, SCHEMA, SECTIONS, Section, Settings,
 };
 use crate::visibility::DockDisplayMode;
+use std::sync::Arc;
 
 pub const WIDTH: f32 = 720.;
 pub const HEIGHT: f32 = 560.;
@@ -82,6 +83,8 @@ pub enum Action {
     Reset,
     Open(&'static str),
     OpenPluginsDirectory,
+    BrowseMarket,
+    InstallPlugin(usize),
     CheckUpdates,
     Quit,
     OpenModes,
@@ -90,6 +93,96 @@ pub enum Action {
 }
 
 pub const DISPLAY_SETTINGS: Action = Action::Open("ms-settings:display-advanced");
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarketItem {
+    pub title: String,
+    pub description: String,
+    pub installed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MarketView {
+    pub items: Arc<[MarketItem]>,
+    pub loaded: bool,
+    pub busy: Option<Action>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarketList {
+    area: Area,
+    view: MarketView,
+}
+
+impl MarketList {
+    fn len(&self) -> usize {
+        1 + self.view.items.len()
+    }
+
+    pub fn row(&self, index: usize) -> Area {
+        let top = self.area.top + CARD * index as f32;
+        Area {
+            top,
+            bottom: top + CARD,
+            ..self.area
+        }
+    }
+
+    pub fn visible(&self, viewport: Area) -> std::ops::Range<usize> {
+        let first = ((viewport.top - self.area.top) / CARD).floor() as usize;
+        let end = ((viewport.bottom - self.area.top) / CARD).ceil() as usize;
+        first.min(self.len())..end.min(self.len())
+    }
+
+    pub fn button(&self, index: usize) -> Area {
+        let row = self.row(index);
+        Area::new(
+            row.right - 94.,
+            row.middle() - CONTROL_HEIGHT / 2.,
+            row.right - CONTROL_INSET,
+            row.middle() + CONTROL_HEIGHT / 2.,
+        )
+    }
+
+    pub fn labels(&self, index: usize) -> (&str, &str, &'static str) {
+        if index == 0 {
+            let help = if self.view.loaded && self.view.items.is_empty() {
+                "市场中暂无插件"
+            } else {
+                "浏览和安装桌面卡片插件"
+            };
+            let button = if self.view.busy == Some(Action::BrowseMarket) {
+                "读取中…"
+            } else if self.view.loaded {
+                "刷新"
+            } else {
+                "浏览"
+            };
+            ("插件市场", help, button)
+        } else {
+            let item = &self.view.items[index - 1];
+            let button = if self.view.busy == Some(Action::InstallPlugin(index - 1)) {
+                "安装中…"
+            } else if item.installed {
+                "已安装"
+            } else {
+                "安装"
+            };
+            (&item.title, &item.description, button)
+        }
+    }
+
+    pub fn action(&self, index: usize) -> Option<Action> {
+        if self.view.busy.is_some() || index >= self.len() {
+            return None;
+        }
+        if index == 0 {
+            Some(Action::BrowseMarket)
+        } else {
+            (!self.view.items[index - 1].installed).then_some(Action::InstallPlugin(index - 1))
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectLink {
@@ -279,7 +372,7 @@ impl PanelState {
             return None;
         }
         let count = layout.focus_count();
-        let focusable = |i: usize| i < count && layout.rows.get(i).is_none_or(|row| row.enabled);
+        let focusable = |i: usize| layout.focusable(i);
         let focused = self.focus.filter(|&i| focusable(i));
         match nav {
             Nav::Close => Some(Action::Close),
@@ -292,7 +385,11 @@ impl PanelState {
                     .find(|&i| focusable(i))?;
                 self.focus = Some(next);
                 // Bring the focused card fully into view.
-                let card = layout.rows.get(next)?.card;
+                let card = layout.rows.get(next).map(|r| r.card).or_else(|| {
+                    let market = layout.market.as_ref()?;
+                    let i = next.checked_sub(layout.rows.len())?;
+                    (i < market.len()).then(|| market.row(i))
+                })?;
                 let view = layout.view;
                 if card.top < view.top {
                     self.scroll -= view.top - card.top;
@@ -315,6 +412,14 @@ impl PanelState {
                     };
                 }
                 let Some(row) = layout.rows.get(focused?) else {
+                    let index = focused? - layout.rows.len();
+                    if let Some(market) = &layout.market
+                        && index < market.len()
+                    {
+                        return (nav == Nav::Activate)
+                            .then(|| market.action(index))
+                            .flatten();
+                    }
                     return (nav == Nav::Activate).then_some(
                         layout
                             .footer_link
@@ -362,6 +467,7 @@ pub struct PanelLayout {
     /// Content scrolls inside this area and is clipped to it.
     pub view: Area,
     pub rows: Vec<Row>,
+    pub market: Option<MarketList>,
     pub groups: Vec<Area>,
     pub footer_button: Area,
     pub about: Option<AboutPage>,
@@ -400,7 +506,7 @@ impl PanelLayout {
     fn focus_count(&self) -> usize {
         self.about.as_ref().map_or_else(
             || {
-                self.rows.len()
+                self.footer_focus()
                     + usize::from(
                         self.footer_link.is_some() || SECTIONS[self.page] == Section::Appearance,
                     )
@@ -409,8 +515,35 @@ impl PanelLayout {
         )
     }
 
+    pub fn footer_focus(&self) -> usize {
+        self.rows.len() + self.market.as_ref().map_or(0, MarketList::len)
+    }
+
+    fn focusable(&self, index: usize) -> bool {
+        if let Some(row) = self.rows.get(index) {
+            return row.enabled;
+        }
+        let i = index - self.rows.len();
+        if let Some(market) = &self.market
+            && i < market.len()
+        {
+            return market.action(i).is_some();
+        }
+        index < self.focus_count()
+    }
+
     /// Fits the window to its monitor's work area and clamps the current page's scroll.
     pub fn new(state: &mut PanelState, settings: &Settings, dpi: u32, work: Rect) -> Self {
+        Self::with_market(state, settings, dpi, work, &MarketView::default())
+    }
+
+    pub fn with_market(
+        state: &mut PanelState,
+        settings: &Settings,
+        dpi: u32,
+        work: Rect,
+        market_view: &MarketView,
+    ) -> Self {
         let scale = dpi as f32 / 96.;
         let width = (work.width as f32 / scale).clamp(MIN_WIDTH, WIDTH).floor();
         let height = (work.height as f32 / scale)
@@ -487,9 +620,22 @@ impl PanelLayout {
             rows.push((spec, detail, card));
             top = card.bottom;
         }
+        let market = (section == Section::Plugins).then(|| {
+            let start = top + GROUP_GAP;
+            top = start + (1 + market_view.items.len()) as f32 * CARD;
+            MarketList {
+                area: Area::new(view.left, start, view.right, top),
+                view: market_view.clone(),
+            }
+        });
         let content = top - view.top;
         let max_scroll = (content - (view.bottom - view.top)).max(0.);
         state.scroll = state.scroll.clamp(0., max_scroll);
+        let market = market.map(|mut list| {
+            list.area.top -= state.scroll;
+            list.area.bottom -= state.scroll;
+            list
+        });
         let scroll_thumb = (max_scroll > 0.).then(|| {
             let track = view.bottom - view.top;
             let thumb = (track * track / content).max(18.);
@@ -563,10 +709,11 @@ impl PanelLayout {
             title: Area::new(view.left, 0., view.right, CAPTION),
             view,
             rows,
+            market,
             groups,
             footer_link: match section {
                 Section::General => Some(("屏幕刷新率…", DISPLAY_SETTINGS)),
-                Section::Cards => Some(("打开插件目录…", Action::OpenPluginsDirectory)),
+                Section::Plugins => Some(("打开插件目录…", Action::OpenPluginsDirectory)),
                 _ => None,
             }
             .map(|(label, action)| {
@@ -595,9 +742,7 @@ impl PanelLayout {
             hover: state.hover,
             modes,
         };
-        state.focus = state.focus.filter(|&i| {
-            i < layout.focus_count() && layout.rows.get(i).is_none_or(|row| row.enabled)
-        });
+        state.focus = state.focus.filter(|&i| layout.focusable(i));
         layout.focus = state.focus;
         layout
     }
@@ -712,6 +857,16 @@ impl PanelLayout {
         }
         if !self.view.contains(x, y) {
             return None;
+        }
+        if let Some(market) = &self.market
+            && market.area.contains(x, y)
+        {
+            let index = ((y - market.area.top) / CARD) as usize;
+            return market
+                .button(index)
+                .contains(x, y)
+                .then(|| market.action(index))
+                .flatten();
         }
         let row = self.rows.iter().find(|row| row.card.contains(x, y))?;
         if !row.enabled {
@@ -1023,7 +1178,7 @@ mod tests {
                 }
                 let expected_link = match section {
                     Section::General => Some(DISPLAY_SETTINGS),
-                    Section::Cards => Some(Action::OpenPluginsDirectory),
+                    Section::Plugins => Some(Action::OpenPluginsDirectory),
                     _ => None,
                 };
                 assert_eq!(
@@ -1033,6 +1188,15 @@ mod tests {
                 if let Some((button, _, action)) = layout.footer_link {
                     let (x, y) = center(button, s);
                     assert_eq!(layout.hit(x, y), Some(action));
+                    if let Some(market) = &layout.market {
+                        let (x, y) = center(market.button(0), s);
+                        assert_eq!(layout.hit(x, y), Some(Action::BrowseMarket));
+                        state.key(Nav::Next, &layout);
+                        assert_eq!(
+                            state.key(Nav::Activate, &layout),
+                            Some(Action::BrowseMarket)
+                        );
+                    }
                     state.key(Nav::Next, &layout);
                     let layout = PanelLayout::new(&mut state, &settings, dpi, work(4000));
                     assert_eq!(state.key(Nav::Activate, &layout), Some(action));
@@ -1041,6 +1205,53 @@ mod tests {
                 assert_eq!(layout.hit(1, 1), None);
             }
         }
+    }
+
+    #[test]
+    fn market_install_buttons_scroll_into_view_and_skip_installed_items() {
+        let mut state = PanelState {
+            page: SECTIONS
+                .iter()
+                .position(|s| *s == Section::Plugins)
+                .unwrap(),
+            ..Default::default()
+        };
+        let mut market = MarketView {
+            loaded: true,
+            items: (0..18)
+                .map(|i| MarketItem {
+                    title: format!("插件 {i}"),
+                    description: String::new(),
+                    installed: i == 7,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let settings = Settings::default();
+        let mut layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
+        for expected in [
+            Action::Change(Key::DesktopCards, Adjust::Toggle),
+            Action::BrowseMarket,
+        ]
+        .into_iter()
+        .chain((0..18).filter(|i| *i != 7).map(Action::InstallPlugin))
+        {
+            state.key(Nav::Next, &layout);
+            layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
+            assert_eq!(state.key(Nav::Activate, &layout), Some(expected));
+            if let Action::InstallPlugin(index) = expected {
+                let button = layout.market.as_ref().unwrap().button(index + 1);
+                let (x, y) = center(button, layout.scale);
+                assert_eq!(layout.hit(x, y), Some(expected));
+            }
+        }
+        market.busy = Some(Action::InstallPlugin(17));
+        layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
+        let list = layout.market.as_ref().unwrap();
+        assert_eq!(list.labels(18).2, "安装中…");
+        let (x, y) = center(list.button(18), layout.scale);
+        assert_eq!(layout.hit(x, y), None);
+        assert_eq!(state.key(Nav::Activate, &layout), None);
     }
 
     #[test]

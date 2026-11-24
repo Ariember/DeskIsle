@@ -8,6 +8,8 @@
 
 | 调用 | 行为 | 成功返回 |
 | --- | --- | --- |
+| `plugins list` | 列出所选市场提供的插件 | 标准输出为 JSON 数组，每项含 `id`、`name`、`version`、`description` |
+| `plugins install <id>` | 从同一市场取包、校验并安装，已有同 ID 内容时替换 | 退出码 0 |
 | `plugins capabilities` | 查询这个可执行文件支持的协议和扩展点版本 | 标准输出为能力表 JSON |
 | `plugins validate <id> [文件路径]` | 按当前宿主能力校验完整发布文档，不写文件 | 标准输出为含 `name`、`version` 的 JSON 对象 |
 | `plugins publish <id> [文件路径]` | 注册或更新一个插件，原子替换该 ID 的整份发布文档 | 退出码 0 |
@@ -85,4 +87,19 @@ ID 由命令参数指定，在文件接口中对应文件名。选用稳定的�
 
 发布命令与文件接口共用 `%APPDATA%\DeskIsle\plugins\<id>.json`。直接写文件的工具应按需创建目录，在**同一目录**用唯一的 `.tmp` 文件写完并关闭，再通过系统的原子替换操作发布到最终文件名。撤下时删除对应 JSON 文件。宿主只扫描扩展名为小写 `.json` 的普通文件。目录是当前用户数据，不提供同一用户下不同进程间的访问隔离；发布文档只应包含准备交给宿主展示或处理的数据。
 
-开启桌面卡片后，宿主立即读取一次，此后在每轮读取结束约三秒后再读。直接写入的损坏文件按插件单独显示错误，其余发布者继续展示。桌面为空时没有占位卡，关闭「管理面板 → 桌面卡片」的显示开关会停止读取并隐藏磁贴；已经发布的数据仍会保留。
+开启桌面卡片后，宿主立即读取一次，此后在每轮读取结束约三秒后再读。直接写入的损坏文件按插件单独显示错误，其余发布者继续展示。桌面为空时没有占位卡，关闭「管理面板 → 插件」的“显示桌面卡片”会停止读取并隐藏磁贴；已经发布的数据仍会保留。
+
+## 从插件市场安装
+
+在「管理面板 → 插件」打开插件市场，选择需要的卡片并安装。开启卡片显示时通常在三秒左右可见，重新启动 DeskIsle 后也会加载。安装与外部发布共用同一 ID 和文件，后一次成功写入的内容生效。可用 `deskisle.exe plugins remove <id>` 卸载。
+
+市场使用 `index.json` 列出包，每个条目对应索引旁的 `packages/<id>.json`。宿主先校验索引，再按条目的 SHA-256、名称、版本和当前宿主支持的扩展点校验包。校验或下载失败时会返回错误，已有卡片可继续使用。
+
+管理面板和命令行默认向 GitHub 查询 `Ariember/DeskIsle-PluginMarket` 的最新稳定 Release，按其 `v<SemVer>` 标签读取仓库根目录的索引。点击安装时，宿主从刚才浏览的标签读取卡片包，因此市场在浏览后发布新版也不会改变这次安装的内容。[市场发布页](https://github.com/Ariember/DeskIsle-PluginMarket/releases)
+
+要测试本地改动或使用自建市场，在启动 DeskIsle 前将 `DESKISLE_MARKET_INDEX` 设为本地索引文件路径或完整的 HTTPS 索引 URL。设置后直接读取指定索引。在线托管时，索引和包的地址均需直接返回文件内容及 HTTP 200。下面的 PowerShell 示例从两个项目的父目录运行。
+
+```powershell
+$env:DESKISLE_MARKET_INDEX = (Resolve-Path '.\DeskIsle-PluginMarket\index.json').Path
+.\DeskIsle\target\release\deskisle.exe plugins list | ConvertFrom-Json
+```
