@@ -24,7 +24,7 @@ use windows::core::{HSTRING, Result};
 use super::canvas::{Canvas, Palette, Text, paint};
 use super::{Bar, DURATION, Renderer, Tween};
 use crate::platform::backdrop::Backdrop;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{AppearanceKey::*, Key, Key::Appearance};
 use crate::ui::{icon::Symbol, launchpad::LaunchpadLayout, panel::Area};
 
 const WHITE: (u8, u8, u8) = (255, 255, 255);
@@ -163,13 +163,8 @@ impl Renderer {
             view.veil_key = Some(key);
         }
         let custom = self.appearance.enabled(Appearance(LaunchpadCustom));
-        let strength = if custom {
-            self.appearance.get(Appearance(LaunchpadBlur))
-        } else {
-            68
-        };
-        let want_live =
-            self.transparency && backdrop.is_none() && (!custom || (acrylic && strength > 0));
+        let strength = self.appearance.get(Key::Backdrop);
+        let want_live = self.transparency && backdrop.is_none() && (!custom || acrylic);
         let mut live_glass = false;
         if let (Some(engine), Some(surface)) = (&self.glass, &mut view.glass) {
             live_glass = want_live
@@ -206,6 +201,7 @@ impl Renderer {
                         Area::new(0., 0., w, h),
                         0.,
                         super::glass::rim::PANEL,
+                        blur_f,
                     )?;
                     (0.28, 0.34)
                 } else if live_glass || acrylic {

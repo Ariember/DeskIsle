@@ -336,7 +336,6 @@ const fn top_bar_toggle(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppearanceKey {
     DockCustom,
-    DockBlur,
     DockOpacity,
     Reflection,
     ReflectionBlur,
@@ -344,31 +343,25 @@ pub enum AppearanceKey {
     ReflectionDistance,
     ReflectionFade,
     LabelCustom,
-    LabelBlur,
     LabelOpacity,
     LabelBorder,
     MenuCustom,
-    MenuBlur,
     MenuOpacity,
     MenuBorder,
     FolderCustom,
-    FolderBlur,
     FolderOpacity,
     FolderBorder,
     FolderIconCustom,
     FolderIconSize,
     WindowCustom,
-    WindowBlur,
     WindowOpacity,
     WindowBorder,
     TopCustom,
-    TopBlur,
     TopOpacity,
     TopTint,
     LaunchpadCustom,
     LaunchpadWallpaper,
     LaunchpadDynamic,
-    LaunchpadBlur,
     IconTheme,
     DockSkin,
 }
@@ -378,17 +371,17 @@ impl AppearanceKey {
     pub fn parent(self) -> Option<Self> {
         use AppearanceKey::*;
         match self {
-            DockBlur | DockOpacity => Some(DockCustom),
+            DockOpacity => Some(DockCustom),
             ReflectionBlur | ReflectionOpacity | ReflectionDistance | ReflectionFade => {
                 Some(Reflection)
             }
-            LabelBlur | LabelOpacity | LabelBorder => Some(LabelCustom),
-            MenuBlur | MenuOpacity | MenuBorder => Some(MenuCustom),
-            FolderBlur | FolderOpacity | FolderBorder => Some(FolderCustom),
+            LabelOpacity | LabelBorder => Some(LabelCustom),
+            MenuOpacity | MenuBorder => Some(MenuCustom),
+            FolderOpacity | FolderBorder => Some(FolderCustom),
             FolderIconSize => Some(FolderIconCustom),
-            WindowBlur | WindowOpacity | WindowBorder => Some(WindowCustom),
-            TopBlur | TopOpacity | TopTint => Some(TopCustom),
-            LaunchpadWallpaper | LaunchpadDynamic | LaunchpadBlur => Some(LaunchpadCustom),
+            WindowOpacity | WindowBorder => Some(WindowCustom),
+            TopOpacity | TopTint => Some(TopCustom),
+            LaunchpadWallpaper | LaunchpadDynamic => Some(LaunchpadCustom),
             _ => None,
         }
     }
@@ -503,15 +496,15 @@ pub const SCHEMA: &[Spec] = &[
         key: Key::Backdrop,
         id: "general.backdrop",
         section: Section::General,
-        label: "液态玻璃效果强度",
-        help: "调整设置侧栏和关于本机的折射与透视强度",
+        label: "玻璃背景模糊",
+        help: "统一调整 Dock、顶部栏和各玻璃面板背后的模糊强度",
         control: Control::Slider {
             min: 0,
             max: 100,
             step: 5,
             unit: "%",
         },
-        default: 100,
+        default: 80,
         store: Store::File,
     },
     Spec {
@@ -991,9 +984,8 @@ pub const SCHEMA: &[Spec] = &[
         A::DockCustom,
         "appearance.dock.custom",
         "自定义 Dock 背景",
-        "调整 Dock 底板的毛玻璃与不透明度",
+        "调整 Dock 底板的不透明度",
     ),
-    appearance_percent(A::DockBlur, "appearance.dock.blur", "模糊强度", 30),
     appearance_percent(
         A::DockOpacity,
         "appearance.dock.opacity",
@@ -1043,7 +1035,6 @@ pub const SCHEMA: &[Spec] = &[
         "显示 Dock 图标标签",
         "悬停时显示名称，可调整背景与边框",
     ),
-    appearance_percent(A::LabelBlur, "appearance.label.blur", "模糊强度", 30),
     appearance_percent(
         A::LabelOpacity,
         "appearance.label.opacity",
@@ -1062,7 +1053,6 @@ pub const SCHEMA: &[Spec] = &[
         "自定义菜单背景",
         "调整 DeskIsle 菜单和下拉面板",
     ),
-    appearance_percent(A::MenuBlur, "appearance.menu.blur", "模糊强度", 30),
     appearance_percent(
         A::MenuOpacity,
         "appearance.menu.opacity",
@@ -1076,7 +1066,6 @@ pub const SCHEMA: &[Spec] = &[
         "自定义文件夹背景",
         "调整文件夹面板的背景与边框",
     ),
-    appearance_percent(A::FolderBlur, "appearance.folder.blur", "模糊强度", 30),
     appearance_percent(
         A::FolderOpacity,
         "appearance.folder.opacity",
@@ -1114,7 +1103,6 @@ pub const SCHEMA: &[Spec] = &[
         "自定义窗口预览背景",
         "调整 Dock 上方的窗口预览卡片",
     ),
-    appearance_percent(A::WindowBlur, "appearance.window.blur", "模糊强度", 30),
     appearance_percent(
         A::WindowOpacity,
         "appearance.window.opacity",
@@ -1133,14 +1121,13 @@ pub const SCHEMA: &[Spec] = &[
         "自定义顶部栏背景",
         "调整顶部状态栏外观，沉浸模式优先使用窗口配色",
     ),
-    appearance_percent(A::TopBlur, "appearance.top.blur", "模糊强度", 30),
     appearance_percent(A::TopOpacity, "appearance.top.opacity", "背景不透明度", 50),
     appearance_percent(A::TopTint, "appearance.top.tint", "壁纸调色浓度", 0),
     appearance_toggle(
         A::LaunchpadCustom,
         "appearance.launchpad.custom",
         "自定义启动台背景",
-        "调整启动台打开时的背景与模糊效果",
+        "选择启动台背景来源和更新方式",
     ),
     appearance_toggle(
         A::LaunchpadWallpaper,
@@ -1153,12 +1140,6 @@ pub const SCHEMA: &[Spec] = &[
         "appearance.launchpad.dynamic",
         "使用动态模糊",
         "使用屏幕后景时随窗口变化更新毛玻璃",
-    ),
-    appearance_percent(
-        A::LaunchpadBlur,
-        "appearance.launchpad.blur",
-        "模糊强度",
-        30,
     ),
     appearance(
         A::IconTheme,

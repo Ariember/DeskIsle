@@ -574,7 +574,10 @@ impl Renderer {
         let mut icons_changed = palette_changed;
         let mut dock_changed = palette_changed;
         for change in self.appearance.changed(settings) {
-            if let Key::Appearance(key) = change.key {
+            if change.key == Key::Backdrop {
+                theme_changed = true;
+                dock_changed = true;
+            } else if let Key::Appearance(key) = change.key {
                 theme_changed = true;
                 match key.parent().unwrap_or(key) {
                     AppearanceKey::DockSkin => {
@@ -634,22 +637,17 @@ impl Renderer {
         let level = |key| self.appearance.get(Key::Appearance(key));
         let custom = level(A::TopCustom) != 0;
         let opacity = level(A::TopOpacity) as f32 / 100.;
-        let top_strength = if immersive_color.is_some() || !self.transparency {
-            0
-        } else if custom {
-            if level(A::TopOpacity) >= 100 {
-                0
+        let glass_enabled = self.transparency
+            && immersive_color.is_none()
+            && if custom {
+                opacity < 1.
             } else {
-                level(A::TopBlur)
-            }
-        } else if self.top_background == TopBarBackground::Frosted {
-            68
-        } else {
-            0
-        };
+                self.top_background == TopBarBackground::Frosted
+            };
+        let strength = self.appearance.get(Key::Backdrop);
         let mut live_top_glass = false;
         if let (Some(engine), Some(surface)) = (&self.glass, &mut self.top_glass) {
-            live_top_glass = top_strength > 0
+            live_top_glass = glass_enabled
                 && surface
                     .update(
                         engine,
@@ -659,7 +657,7 @@ impl Renderer {
                             width: layout.width as f32,
                             height: layout.height as f32,
                             radius: 0.,
-                            strength: top_strength,
+                            strength,
                             rim: glass::rim::TOP,
                         },
                     )
@@ -669,11 +667,7 @@ impl Renderer {
             }
         }
         let frosted = frosted || live_top_glass;
-        let glass_mix = if frosted {
-            (if custom { level(A::TopBlur) } else { 68 }) as f32 / 100.
-        } else {
-            0.
-        };
+        let glass_mix = if frosted { strength as f32 / 100. } else { 0. };
         let light_ground = self
             .top_glass
             .as_ref()
@@ -1091,37 +1085,16 @@ impl Renderer {
         let dock_custom = self
             .appearance
             .enabled(Key::Appearance(AppearanceKey::DockCustom));
-        let dock_strength = if !self.transparency {
-            0
-        } else if dock_custom {
-            if self
-                .appearance
-                .get(Key::Appearance(AppearanceKey::DockOpacity))
-                >= 100
-            {
-                0
-            } else {
-                self.appearance
-                    .get(Key::Appearance(AppearanceKey::DockBlur))
-            }
-        } else {
-            match skin {
-                1 => 82,
-                2 => 58,
-                _ => 70,
-            }
-        };
-        let frost = if dock_custom {
-            self.appearance
-                .get(Key::Appearance(AppearanceKey::DockBlur)) as f32
-                / 100.
-        } else {
-            glass::DEFAULT_FROST
-        };
+        let glass_enabled = self.transparency
+            && (!dock_custom
+                || self
+                    .appearance
+                    .get(Key::Appearance(AppearanceKey::DockOpacity))
+                    < 100);
         let radius_px = Canvas::dock_radius(width as f32 / s, height as f32 / s, skin) * s;
         let mut dock_glass_active = false;
         if let (Some(engine), Some(surface)) = (&self.glass, &mut self.bottom_glass) {
-            dock_glass_active = dock_strength > 0
+            dock_glass_active = glass_enabled
                 && surface
                     .update_behind(
                         engine,
@@ -1131,10 +1104,9 @@ impl Renderer {
                             width: width as f32,
                             height: height as f32,
                             radius: radius_px,
-                            strength: dock_strength,
+                            strength: self.appearance.get(Key::Backdrop),
                             rim: glass::rim::DOCK,
                         },
-                        frost,
                     )
                     .is_ok();
             if !dock_glass_active {

@@ -24,16 +24,12 @@ impl Renderer {
     ) -> Result<LabelView> {
         let bar = Bar::new(&self.device, hwnd)?;
         let scale = dpi as f32 / 96.;
-        let blur = self.appearance.get(Key::Appearance(A::LabelBlur));
+        let strength = self.appearance.get(Key::Backdrop);
         let opacity = self.appearance.get(Key::Appearance(A::LabelOpacity)) as f32 / 100.;
         let border = self.appearance.get(Key::Appearance(A::LabelBorder)) as f32 / 100.;
-        let strength = if !self.transparency || opacity >= 1. {
-            0
-        } else {
-            blur
-        };
+        let glass_enabled = self.transparency && opacity < 1.;
         let mut glass_surface = None;
-        if strength > 0
+        if glass_enabled
             && let Some(engine) = &self.glass
             && let Ok(mut surface) = engine.attach(hwnd)
         {
@@ -50,7 +46,7 @@ impl Renderer {
                 glass_surface = Some(surface);
             }
         }
-        let glass_active = glass_surface.is_some() || (strength > 0 && image.is_some());
+        let glass_active = glass_surface.is_some() || (glass_enabled && image.is_some());
         let (top_tint, bottom_tint) = if self.palette.dark {
             ((38, 46, 62), (18, 22, 32))
         } else {
@@ -67,10 +63,16 @@ impl Renderer {
                 let h = rect.height as f32 / c.scale;
                 let area = Area::new(0., 0., w, h);
                 if glass_surface.is_none()
-                    && strength > 0
+                    && glass_enabled
                     && let Some(image) = image
                 {
-                    c.liquid_backdrop(image, area, LABEL_RADIUS, super::glass::rim::LABEL)?;
+                    c.liquid_backdrop(
+                        image,
+                        area,
+                        LABEL_RADIUS,
+                        super::glass::rim::LABEL,
+                        strength as f32 / 100.,
+                    )?;
                 }
                 let eff_opacity = if glass_active {
                     opacity * (1. - 0.50 * (strength as f32 / 100.) * (1. - opacity))

@@ -85,16 +85,7 @@ impl Bars {
         let (Some(about), Some(renderer)) = (&self.about, self.renderer.as_mut()) else {
             return Ok(());
         };
-        renderer.draw_about(
-            about.window.0,
-            &about.layout,
-            about.dpi,
-            if about.glass {
-                self.settings.get(crate::settings::Key::Backdrop)
-            } else {
-                0
-            },
-        )
+        renderer.draw_about(about.window.0, &about.layout, about.dpi, about.glass)
     }
 
     fn draw_about(&mut self) -> Result<()> {

@@ -125,7 +125,7 @@ impl Bars {
         }
 
         let frosted = if custom {
-            level(A::TopBlur) > 0 && level(A::TopOpacity) < 100
+            level(A::TopOpacity) < 100
         } else {
             self.settings.top_bar_background() == TopBarBackground::Frosted
         };
@@ -141,12 +141,9 @@ impl Bars {
             return;
         }
 
-        let dock_frosted = if level(A::DockCustom) != 0 {
-            level(A::DockBlur) > 0 && level(A::DockOpacity) < 100
-        } else {
-            true
-        };
-        let glass = (frosted || dock_frosted) && transparency;
+        let dock_frosted = level(A::DockCustom) == 0 || level(A::DockOpacity) < 100;
+        let blur = self.settings.get(Key::Backdrop) > 0;
+        let glass = (frosted || dock_frosted) && transparency && blur;
         let dark = glass.then(|| self.dark());
         let theme = dark.filter(|_| frosted);
         self.dock_glass_requested = dark.filter(|_| dock_frosted);
@@ -156,6 +153,10 @@ impl Bars {
                 .top
                 .set_top_backdrop(theme.is_some(), theme.unwrap_or(false));
             self.top_glass_theme = theme;
+        }
+        if theme.is_none() {
+            // At zero blur a translucent bar can show the desktop directly.
+            self.top_glass = frosted && transparency && !blur;
         }
     }
 
@@ -484,7 +485,6 @@ impl Bars {
         let (mut relayout, mut redisplay, mut save, mut retheme) = (false, false, false, false);
         let mut monitor_changed = false;
         let mut dock_visibility_changed = false;
-        let mut backdrop_changed = false;
         let mut top_height_changed = false;
         let mut status_changed = false;
         let mut window_style_changed = false;
@@ -499,7 +499,10 @@ impl Bars {
                     top_height_changed = true;
                     Ok(())
                 }
-                Key::Appearance(_) | Key::TopBarBackground | Key::ColorTrayIcons => {
+                Key::Appearance(_)
+                | Key::Backdrop
+                | Key::TopBarBackground
+                | Key::ColorTrayIcons => {
                     retheme = true;
                     Ok(())
                 }
@@ -530,10 +533,6 @@ impl Bars {
                     } else {
                         Ok(())
                     }
-                }
-                Key::Backdrop => {
-                    backdrop_changed = true;
-                    Ok(())
                 }
                 Key::Accent | Key::Language | Key::SmoothText => {
                     retheme = true;
@@ -603,9 +602,7 @@ impl Bars {
         if retheme {
             self.apply_theme()?;
         }
-        if backdrop_changed
-            || self.settings.get(Key::InterfaceScale) != previous.get(Key::InterfaceScale)
-        {
+        if self.settings.get(Key::InterfaceScale) != previous.get(Key::InterfaceScale) {
             self.refresh_about_appearance()?;
         }
         if dock_visibility_changed {

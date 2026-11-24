@@ -63,11 +63,10 @@ impl Bars {
             width,
             height,
         };
-        let blur = self.settings.get(Key::Appearance(A::LabelBlur));
         let image = (!renderer.has_live_glass()
-            && blur > 0
+            && crate::platform::display::transparency().unwrap_or(false)
             && self.settings.get(Key::Appearance(A::LabelOpacity)) < 100)
-            .then(|| Backdrop::capture(rect, blur, false).ok())
+            .then(|| Backdrop::capture(rect, self.settings.get(Key::Backdrop), false).ok())
             .flatten();
         let window = LabelWindow::create(self.bottom.0, rect)?;
         let view = renderer.draw_label(window.0, rect, dpi, text, image.as_ref())?;

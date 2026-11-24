@@ -363,7 +363,6 @@ pub struct PanelLayout {
     pub view: Area,
     pub rows: Vec<Row>,
     pub groups: Vec<Area>,
-    pub backdrop: i32,
     pub footer_button: Area,
     pub about: Option<AboutPage>,
     pub footer_link: Option<(Area, &'static str, Action)>,
@@ -565,7 +564,6 @@ impl PanelLayout {
             view,
             rows,
             groups,
-            backdrop: settings.get(Key::Backdrop),
             footer_link: match section {
                 Section::General => Some(("屏幕刷新率…", DISPLAY_SETTINGS)),
                 Section::Cards => Some(("打开插件目录…", Action::OpenPluginsDirectory)),
@@ -1047,7 +1045,7 @@ mod tests {
 
     #[test]
     fn appearance_controls_follow_their_switch_for_pointer_and_keyboard() {
-        use crate::settings::AppearanceKey::{DockBlur, DockCustom, Reflection};
+        use crate::settings::AppearanceKey::{DockCustom, DockOpacity, Reflection};
         let mut settings = Settings::default();
         let mut state = PanelState {
             page: SECTIONS
@@ -1057,13 +1055,13 @@ mod tests {
             ..Default::default()
         };
         let layout = PanelLayout::new(&mut state, &settings, 96, work(800));
-        let blur = layout
+        let opacity = layout
             .rows
             .iter()
-            .find(|r| r.key == Key::Appearance(DockBlur))
+            .find(|r| r.key == Key::Appearance(DockOpacity))
             .unwrap();
-        let Part::Slider { area, .. } = blur.part else {
-            panic!("expected blur slider")
+        let Part::Slider { area, .. } = opacity.part else {
+            panic!("expected opacity slider")
         };
         let (x, y) = center(area, layout.scale);
         assert_eq!(layout.hit(x, y), None);
@@ -1080,11 +1078,14 @@ mod tests {
         );
         settings.adjust(Key::Appearance(DockCustom), Adjust::Toggle);
         let layout = PanelLayout::new(&mut state, &settings, 96, work(800));
-        assert_eq!(layout.slider_at(x, y), Some(Key::Appearance(DockBlur)));
+        assert_eq!(layout.slider_at(x, y), Some(Key::Appearance(DockOpacity)));
         state.key(Nav::Next, &layout);
         assert_eq!(
             state.key(Nav::Increase, &layout),
-            Some(Action::Change(Key::Appearance(DockBlur), Adjust::Step(1)))
+            Some(Action::Change(
+                Key::Appearance(DockOpacity),
+                Adjust::Step(1)
+            ))
         );
         state.focus = None;
         state.key(Nav::Previous, &layout);

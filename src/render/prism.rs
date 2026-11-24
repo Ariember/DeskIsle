@@ -20,6 +20,37 @@ pub(super) struct Scene<'a> {
 }
 
 impl Scene<'_> {
+    /// Filter before sampling any transmitted or reflected ray, including those
+    /// at the bevel. Decimate after filtering to avoid aliasing narrow stripes.
+    fn softened<'a>(&'a self, sigma: f32, pixels: &'a mut Vec<u8>) -> Scene<'a> {
+        if sigma == 0. {
+            return Scene { ..*self };
+        }
+        let mut horizontal = Vec::new();
+        let (width, step_x) = blur_rows(
+            self.pixels,
+            self.width,
+            self.height,
+            sigma * self.scale_x,
+            &mut horizontal,
+        );
+        let (height, step_y) = blur_rows(
+            &horizontal,
+            self.height,
+            width,
+            sigma * self.scale_y,
+            pixels,
+        );
+        Scene {
+            width,
+            height,
+            pixels,
+            scale_x: self.scale_x / step_x as f32,
+            scale_y: self.scale_y / step_y as f32,
+            ..*self
+        }
+    }
+
     fn valid(&self) -> bool {
         self.width > 0
             && self.height > 0
@@ -59,6 +90,42 @@ impl Scene<'_> {
             top + (bottom - top) * fy
         })
     }
+}
+
+/// One separable Gaussian pass. Store the result transposed so the same row
+/// filter can run vertically; the second pass restores the original orientation.
+fn blur_rows(src: &[u8], width: u32, height: u32, sigma: f32, dest: &mut Vec<u8>) -> (u32, u32) {
+    let step = sigma.floor().max(1.) as u32;
+    let columns = width.div_ceil(step);
+    // Match Scene::sample's half-texel convention on the reduced grid.
+    let center = (step - 1) as f32 * 0.5;
+    let first = (center - 3. * sigma).ceil() as i32;
+    let last = (center + 3. * sigma).floor() as i32;
+    let weights: Vec<f32> = (first..=last)
+        .map(|i| (-0.5 * ((i as f32 - center) / sigma).powi(2)).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    dest.resize(columns as usize * height as usize * 4, 255);
+    for (y, row) in src
+        .as_chunks::<4>()
+        .0
+        .chunks_exact(width as usize)
+        .enumerate()
+    {
+        for x in 0..columns {
+            let start = (x * step) as i32 + first;
+            let mut sum = [0.; 3];
+            for (i, weight) in weights.iter().enumerate() {
+                let sample = row[(start + i as i32).clamp(0, width as i32 - 1) as usize];
+                for (channel, v) in sum.iter_mut().zip(sample) {
+                    *channel += weight * f32::from(v);
+                }
+            }
+            let offset = (x as usize * height as usize + y) * 4;
+            dest[offset..offset + 3].copy_from_slice(&sum.map(|v| (v / total).round() as u8));
+        }
+    }
+    (columns, step)
 }
 
 /// One glass card in output pixels.
@@ -157,13 +224,10 @@ impl Tone {
         self.luminance > crossover
     }
 
-    /// Opacity of the system-blurred layer under a clear body whose user frost is `base`:
-    /// busy scenes get up to a quarter more, never so much that the glass turns milky.
+    /// Busy scenes fade out the remaining sharp detail faster. Both slider
+    /// endpoints still give exactly clear or fully system-blurred transmission.
     pub fn frost(self, base: f32) -> f32 {
-        if base <= 0. {
-            return 0.;
-        }
-        (base + 0.25 * smoothstep(0.10, 0.24, self.busy)).min(0.85)
+        base + base * (1. - base) * smoothstep(0.10, 0.24, self.busy)
     }
 }
 
@@ -212,17 +276,30 @@ fn sd(px: f32, py: f32, bx: f32, by: f32, r: f32) -> f32 {
 }
 
 /// Renders `card` over `scene` into a premultiplied BGRA image of `width` x `height`.
-pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<u8> {
-    render_card(scene, width, height, card, false)
+pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card, blur_px: f32) -> Vec<u8> {
+    render_card(scene, width, height, card, blur_px, false)
 }
 
 /// Renders the curved glass edge over a live desktop. The flat body is transparent
 /// so changes in the windows underneath show through between bevel samples.
-pub(super) fn render_bevel(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<u8> {
-    render_card(scene, width, height, card, true)
+pub(super) fn render_bevel(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    card: Card,
+    blur_px: f32,
+) -> Vec<u8> {
+    render_card(scene, width, height, card, blur_px, true)
 }
 
-fn render_card(scene: &Scene, width: u32, height: u32, card: Card, bevel_only: bool) -> Vec<u8> {
+fn render_card(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    card: Card,
+    blur_px: f32,
+    bevel_only: bool,
+) -> Vec<u8> {
     let mut out = vec![0u8; width as usize * height as usize * 4];
     if !scene.valid() || width == 0 || height == 0 {
         return out;
@@ -233,6 +310,9 @@ fn render_card(scene: &Scene, width: u32, height: u32, card: Card, bevel_only: b
         .clamp(1, 8)
         .min(rows);
     let band = rows.div_ceil(threads);
+    let mut samples = Vec::new();
+    let filtered = scene.softened(blur_px, &mut samples);
+    let scene = &filtered;
     let ambient = scene.sample(card.center_x, card.center_y);
     std::thread::scope(|s| {
         for (index, chunk) in out.chunks_mut(band * width as usize * 4).enumerate() {
@@ -317,25 +397,28 @@ fn shade(
             scene.sample(px + bx_ * strength, py + by_ * strength)[2],
         ];
 
-        // The body diffuses background detail; the bevel keeps a sharper image.
-        let f = mix(2.2, 0.65, rim);
-        let mut diffusion = scene.sample(ax, ay).map(|v| v * 4.);
-        for (ox, oy, w) in [
-            (f, 0., 2.),
-            (-f, 0., 2.),
-            (0., f, 2.),
-            (0., -f, 2.),
-            (f, f, 1.),
-            (-f, -f, 1.),
-            (f, -f, 1.),
-            (-f, f, 1.),
-        ] {
-            let s = scene.sample(ax + ox, ay + oy);
-            for k in 0..3 {
-                diffusion[k] += s[k] * w;
+        // The bevel diffuses bent rays as it flattens into the body.
+        if t < 1. {
+            let f = mix(2.2, 0.65, rim);
+            let mut diffusion = scene.sample(ax, ay).map(|v| v * 4.);
+            for (ox, oy, w) in [
+                (f, 0., 2.),
+                (-f, 0., 2.),
+                (0., f, 2.),
+                (0., -f, 2.),
+                (f, f, 1.),
+                (-f, -f, 1.),
+                (f, -f, 1.),
+                (-f, f, 1.),
+            ] {
+                let s = scene.sample(ax + ox, ay + oy);
+                for k in 0..3 {
+                    diffusion[k] += s[k] * w;
+                }
             }
+            let amount = mix(0.5, 0.18, rim) * (1. - smoothstep(0.6, 1., t));
+            c = mix3(c, diffusion.map(|v| v / 16.), amount);
         }
-        c = mix3(c, diffusion.map(|v| v / 16.), mix(0.5, 0.18, rim));
 
         let luminance = dot3(c, LUMA);
         c = mix3([luminance; 3], c, 1.16);
@@ -467,8 +550,57 @@ mod tests {
         let busy = Tone::measure(&scene_of(&stripes, w, h), w, h).unwrap();
         assert!((flat.frost(0.3) - 0.3).abs() < 1e-3);
         assert!(busy.frost(0.3) > 0.5);
-        assert!(busy.frost(0.8) <= 0.85);
+        assert!(busy.frost(0.8) > 0.9);
         assert_eq!(busy.frost(0.), 0.);
+        assert_eq!(busy.frost(1.), 1.);
+    }
+
+    #[test]
+    fn blur_softens_stripes_across_the_body_straight_edges_and_rounded_corners() {
+        let (w, h) = (137, 73);
+        // Include the wallpaper outside the card that the curved bevel refracts.
+        let pad = 64;
+        let (sw, sh) = (w + 2 * pad, h + 2 * pad);
+        let stripes: Vec<_> = (0..sw * sh)
+            .flat_map(|i| {
+                let v = if (i % sw + i / sw) % 6 < 3 { 48 } else { 208 };
+                [v, v, v, 255]
+            })
+            .collect();
+        let flat = uniform([128, 128, 128, 255], sw, sh);
+        let card = Card::filling(0., 0., w as f32, h as f32, 18., 1.);
+        for draw in [render, render_bevel] {
+            let paint = |pixels| {
+                let scene = Scene {
+                    offset_x: pad as f32,
+                    offset_y: pad as f32,
+                    ..scene_of(pixels, sw, sh)
+                };
+                draw(&scene, w, h, card, 12.8)
+            };
+            let soft = paint(&stripes);
+            let reference = paint(&flat);
+            let over_gray = |image: &[u8], x, y, channel: usize| {
+                let i = ((y * w + x) * 4) as usize;
+                f32::from(image[i + channel]) + 128. * (1. - f32::from(image[i + 3]) / 255.)
+            };
+            // A system-blurred background for these stripes is midgray. The foreground
+            // bevel must retain its highlights without reintroducing the sharp stripes.
+            for (x0, y, width) in [(48, 36, 36), (48, 3, 36), (3, 32, 12), (6, 7, 11)] {
+                for x in x0..x0 + width {
+                    for channel in 0..3 {
+                        let delta =
+                            over_gray(&soft, x, y, channel) - over_gray(&reference, x, y, channel);
+                        assert!(
+                            delta.abs() < 6.,
+                            "at ({x}, {y}), channel {channel}: {delta}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(soft[..4], [0; 4]);
+            assert!(over_gray(&soft, 40, 1, 0) > over_gray(&soft, 40, 20, 0) + 4.);
+        }
     }
 
     #[test]
@@ -485,7 +617,7 @@ mod tests {
             offset_y: 0.,
         };
         let card = Card::filling(0., 0., w as f32, h as f32, 18., 1.);
-        let out = render(&scene, w, h, card);
+        let out = render(&scene, w, h, card, 16.);
         let at = |x: u32, y: u32| {
             let i = ((y * w + x) * 4) as usize;
             [out[i], out[i + 1], out[i + 2], out[i + 3]]
@@ -498,6 +630,12 @@ mod tests {
         let right = at(130, 30);
         assert!(left[0] > left[2], "left={left:?}");
         assert!(right[2] > right[0], "right={right:?}");
+        // A wider blur spreads the red/blue transition further into each side,
+        // while the two broad fields above still transmit their original hues.
+        let narrow = render(&scene, w, h, card, 3.);
+        let red = |image: &[u8], x| image[((30 * w + x) * 4 + 2) as usize];
+        assert!(red(&out, 74) > red(&narrow, 74) + 20);
+        assert!(red(&narrow, 86) > red(&out, 86) + 20);
         // The lit top-left rim is brighter than the body just inside it.
         let luma = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
         assert!(luma(at(40, 1)) > luma(at(40, 20)));
@@ -526,13 +664,13 @@ mod tests {
             offset_y: 0.,
         };
         let card = Card::filling(0., 0., w as f32, h as f32, 20., 1.);
-        let out = render(&scene, w, h, card);
+        let out = render(&scene, w, h, card, 0.);
         let red = |x: u32| out[((40 * w + x) * 4 + 2) as usize];
         let brightest = (1..24).map(red).max().unwrap();
         assert!(brightest > 120, "bevel did not refract the band");
         assert!(red(60) < 80, "center={}", red(60));
 
-        let edge = render_bevel(&scene, w, h, card);
+        let edge = render_bevel(&scene, w, h, card, 0.);
         let pixel = |x: u32| ((40 * w + x) * 4) as usize;
         for x in [1, 10] {
             let i = pixel(x);
@@ -564,8 +702,8 @@ mod tests {
             offset_y: 0.,
         };
         let card = Card::filling(0., 0., w as f32, h as f32, 8., 1.);
-        let prism = render(&scene, w, h, card);
-        let edge = render_bevel(&scene, w, h, card);
+        let prism = render(&scene, w, h, card, 12.8);
+        let edge = render_bevel(&scene, w, h, card, 0.);
         let i = ((w + w / 2) * 4) as usize; // Middle of the lit top edge, 1.5 px in.
         let transmission = 1. - f32::from(edge[i + 3]) / 255.;
         for (channel, updated) in [200., 50., 40.].into_iter().enumerate() {

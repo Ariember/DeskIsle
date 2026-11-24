@@ -257,13 +257,12 @@ impl Renderer {
         }
         let (width, height) = layout.pixels();
         let sidebar_px = layout.sidebar_pixels() as f32;
-        let enabled = glass && layout.backdrop > 0;
         // The window can supply DWM acrylic when the composition engine is unavailable.
-        let mut sidebar_glass = (enabled && self.glass.is_none()).then_some(self.palette);
+        let mut sidebar_glass = (glass && self.glass.is_none()).then_some(self.palette);
         if let (Some(engine), Some(panel_view)) = (&self.glass, self.panel.as_mut())
             && let Some(surface) = &mut panel_view.glass
         {
-            if enabled
+            if glass
                 && surface
                     .update_behind(
                         engine,
@@ -273,10 +272,9 @@ impl Renderer {
                             width: sidebar_px,
                             height: height as f32,
                             radius: 0.,
-                            strength: layout.backdrop,
+                            strength: self.appearance.get(Key::Backdrop),
                             rim: super::glass::rim::LABEL,
                         },
-                        super::glass::DEFAULT_FROST * layout.backdrop as f32 / 100.,
                     )
                     .is_ok()
             {
@@ -1271,7 +1269,7 @@ mod render_tests {
 
         let _desktop = Desktop::init()?;
         let (top, bottom) = create_bars()?;
-        let settings = Settings::default();
+        let mut settings = Settings::default();
         let work = monitor()?.work;
         let layout = PanelLayout::new(&mut PanelState::default(), &settings, 96, work);
         let area = layout.place(work);
@@ -1287,9 +1285,30 @@ mod render_tests {
         let layer = super::super::Bar::new(&renderer.device, background.0)?;
         let device = renderer.device.clone();
         let palette = renderer.palette;
-        let set_background = |rgb| -> Result<()> {
-            let surface = paint(&device, palette, area.width, area.height, 96, |c| {
-                c.round(0., 0., layout.width, layout.height, 0., rgb)
+        // Cover the scene beyond the bevel as well; a refracted ray may land there.
+        let underlay = Rect {
+            x: area.x - 64,
+            y: area.y - 64,
+            width: area.width + 128,
+            height: area.height + 128,
+        };
+        let set_background = |color: Option<Rgb>| -> Result<()> {
+            let (w, h) = (underlay.width, underlay.height);
+            let surface = paint(&device, palette, w, h, 96, |c| {
+                if let Some(rgb) = color {
+                    return c.round(0., 0., w as f32, h as f32, 0., rgb);
+                }
+                let stripes = Backdrop {
+                    width: w as u32,
+                    height: h as u32,
+                    pixels: (0..w * h)
+                        .flat_map(|i| {
+                            let value = if (i % w + i / w) % 6 < 3 { 20 } else { 235 };
+                            [value, value, value, 255]
+                        })
+                        .collect(),
+                };
+                c.backdrop(&stripes, Area::new(0., 0., w as f32, h as f32), 0.)
             })?;
             unsafe {
                 layer.root.SetContent(&surface)?;
@@ -1297,14 +1316,14 @@ mod render_tests {
                 device.WaitForCommitCompletion()
             }
         };
-        let show = |hwnd| unsafe {
+        let show = |hwnd, r: Rect| unsafe {
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                area.x,
-                area.y,
-                area.width,
-                area.height,
+                r.x,
+                r.y,
+                r.width,
+                r.height,
                 SWP_SHOWWINDOW | SWP_NOACTIVATE,
             )
         };
@@ -1317,7 +1336,24 @@ mod render_tests {
             width: layout.sidebar_pixels() + 10 - (row.left as i32 + 37),
             height: (row.bottom - row.top) as i32,
         };
-        let wait_for = |description: &str, matches: &dyn Fn(u8, u8, u8) -> bool| -> Result<()> {
+        let label_samples = |frame: &Backdrop| {
+            let rows = frame.pixels.chunks_exact(4 * strip.width as usize);
+            let middle = rows.clone().nth(strip.height as usize / 2).unwrap();
+            let red_at = |x| middle[(x - strip.x) as usize * 4 + 2];
+            let sidebar = red_at(area.x + layout.sidebar_pixels() - 36);
+            let page = red_at(area.x + layout.sidebar_pixels() + 8);
+            let ink = rows
+                .flat_map(|row| row[..32 * 4].chunks_exact(4))
+                .map(|pixel| pixel[2])
+                .max_by_key(|value| value.abs_diff(sidebar))
+                .unwrap();
+            [sidebar, page, ink]
+        };
+        let wait_for = |description: &str,
+                        rect: Rect,
+                        sample: &dyn Fn(&Backdrop) -> [u8; 3],
+                        matches: &dyn Fn([u8; 3]) -> bool|
+         -> Result<()> {
             let start = Instant::now();
             loop {
                 let mut msg = MSG::default();
@@ -1327,47 +1363,80 @@ mod render_tests {
                     }
                     DwmFlush()?;
                 }
-                let frame = Backdrop::capture(strip, 0, false)?;
-                let rows = frame.pixels.chunks_exact(4 * strip.width as usize);
-                let middle = rows.clone().nth(strip.height as usize / 2).unwrap();
-                let red_at = |x| middle[(x - strip.x) as usize * 4 + 2];
-                let sidebar = red_at(area.x + layout.sidebar_pixels() - 36);
-                let page = red_at(area.x + layout.sidebar_pixels() + 8);
-                let ink = rows
-                    .flat_map(|row| row[..32 * 4].chunks_exact(4))
-                    .map(|pixel| pixel[2])
-                    .max_by_key(|value| value.abs_diff(sidebar))
-                    .unwrap();
-                if matches(sidebar, page, ink) {
+                let values = sample(&Backdrop::capture(rect, 0, false)?);
+                if matches(values) {
                     return Ok(());
                 }
                 assert!(
                     start.elapsed() < Duration::from_secs(3),
-                    "{description}: sidebar={sidebar}, page={page}, label={ink}",
+                    "{description}: {values:?}",
                 );
             }
         };
-        set_background(BLACK)?;
-        show(background.0)?;
-        wait_for("test window visible", &|side, page, _| {
+        let wait_labels = |description: &str, matches: &dyn Fn([u8; 3]) -> bool| {
+            wait_for(description, strip, &label_samples, matches)
+        };
+        set_background(Some(BLACK))?;
+        show(background.0, underlay)?;
+        wait_labels("test window visible", &|[side, page, _]| {
             side < 20 && page < 20
         })?;
         renderer.draw_panel(panel.0, &layout, 96, true)?;
-        show(panel.0)?;
-        wait_for(
-            "light label on dark content behind the glass",
-            &|side, page, ink| side < 60 && page > 200 && ink > 210,
-        )?;
-        set_background(WHITE)?;
-        wait_for(
+        show(panel.0, area)?;
+        wait_labels("light label on dark content behind the glass", &|[
+            side,
+            page,
+            ink,
+        ]| {
+            side < 60 && page > 200 && ink > 210
+        })?;
+        set_background(Some(WHITE))?;
+        wait_labels(
             "glass follows the background without repainting the panel",
-            &|side, page, _| side > 200 && page > 200,
+            &|[side, page, _]| side > 200 && page > 200,
         )?;
         renderer.invalidate_panel_scene();
         renderer.draw_panel(panel.0, &layout, 96, true)?;
-        wait_for("dark label on light content", &|side, page, ink| {
+        wait_labels("dark label on light content", &|[side, page, ink]| {
             side > 200 && page > 200 && ink < 60
-        })
+        })?;
+
+        set_background(None)?;
+        let probe = Rect {
+            width: layout.sidebar_pixels(),
+            height: 64,
+            ..area
+        };
+        let stripe_contrast = |frame: &Backdrop| {
+            // Probe inside the native outer corner, beside the page divider, and in
+            // the center of the glass caption. All three strips avoid panel controls.
+            [(8, 9), (probe.width - 5, 40), (probe.width / 2, 20)].map(|(x, y)| {
+                let reds =
+                    (y..y + 12).map(|row| frame.pixels[((row * probe.width + x) * 4 + 2) as usize]);
+                reds.clone().max().unwrap() - reds.min().unwrap()
+            })
+        };
+        for blur in [0, 100] {
+            settings.set(Key::Backdrop, blur);
+            renderer.set_appearance(false, &settings);
+            renderer.draw_panel(panel.0, &layout, 96, true)?;
+            if blur == 0 {
+                wait_for(
+                    "clear corner, edge and center show fine stripes",
+                    probe,
+                    &stripe_contrast,
+                    &|c| c.into_iter().all(|v| v > 65),
+                )?;
+            } else {
+                wait_for(
+                    "frost covers the corner, edge and center",
+                    probe,
+                    &stripe_contrast,
+                    &|c| c.into_iter().all(|v| v < 40),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn paint_pages() -> Result<()> {

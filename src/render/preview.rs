@@ -3,7 +3,7 @@ use windows::core::Result;
 
 use crate::dock::WindowInfo;
 use crate::platform::backdrop::Backdrop;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{AppearanceKey::*, Key, Key::Appearance};
 use crate::ui::icon::Symbol;
 use crate::ui::panel::Area;
 use crate::ui::preview::{PreviewHit, PreviewLayout};
@@ -34,11 +34,7 @@ impl Renderer {
         let w = dip(layout.bounds.width);
         let h = dip(layout.bounds.height);
         let custom = self.appearance.enabled(Appearance(WindowCustom));
-        let blur_strength = if custom {
-            self.appearance.get(Appearance(WindowBlur)) as f32 / 100.
-        } else {
-            0.70
-        };
+        let blur_strength = self.appearance.get(Key::Backdrop) as f32 / 100.;
         let user_opacity = if custom {
             self.appearance.get(Appearance(WindowOpacity)) as f32 / 100.
         } else if self.is_dark() {
@@ -58,7 +54,7 @@ impl Renderer {
             layout.bounds.height,
             dpi,
             |c| {
-                let glass_active = backdrop.is_some() && blur_strength > 0. && user_opacity < 1.;
+                let glass_active = self.transparency && backdrop.is_some() && user_opacity < 1.;
                 let opacity = if glass_active { user_opacity } else { 1. };
                 if let Some(image) = backdrop {
                     if glass_active {
@@ -67,6 +63,7 @@ impl Renderer {
                             Area::new(0., 0., w, h),
                             8.,
                             super::glass::rim::DOCK,
+                            blur_strength,
                         )?;
                     } else {
                         c.backdrop(image, Area::new(0., 0., w, h), 0.)?;
@@ -217,5 +214,59 @@ impl Renderer {
                 Ok(())
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Rect;
+    use crate::platform::{Desktop, create_bars};
+    use crate::settings::Settings;
+
+    #[test]
+    #[ignore = "requires a Windows desktop with DirectComposition"]
+    fn global_blur_softens_preview_in_default_and_custom_appearance() -> Result<()> {
+        let _desktop = Desktop::init()?;
+        let (top, bottom) = create_bars()?;
+        let mut settings = Settings::default();
+        let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
+        let work = Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 200,
+        };
+        let layout = PreviewLayout::new(160, 200, work, 96, 1).unwrap();
+        let (w, h) = (layout.bounds.width as u32, layout.bounds.height as u32);
+        let backdrop = Backdrop {
+            width: w,
+            height: h,
+            pixels: (0..w * h)
+                .flat_map(|i| {
+                    let v = if i % w % 12 < 6 { 32 } else { 224 };
+                    [v, v, v, 255]
+                })
+                .collect(),
+        };
+        for custom in [0, 1] {
+            settings.set(Appearance(WindowCustom), custom);
+            let mut contrast = |blur| -> Result<u8> {
+                settings.set(Key::Backdrop, blur);
+                renderer.set_appearance(false, &settings);
+                let pixels = renderer.paint_preview(&layout, &[], 96, None, Some(&backdrop))?;
+                let start = ((h / 2 * w + w / 2) * 4) as usize;
+                let values = pixels[start..start + 48]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[0]);
+                Ok(values.clone().max().unwrap() - values.min().unwrap())
+            };
+            let clear = contrast(0)?;
+            assert!(clear > 60, "clear preview contrast: {clear}");
+            assert!(contrast(100)? < clear / 2);
+        }
+        Ok(())
     }
 }

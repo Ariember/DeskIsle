@@ -10,7 +10,10 @@ use crate::platform::backdrop::Backdrop;
 use crate::platform::preview::{PreviewEvent, PreviewWindow};
 use crate::platform::{self, shell};
 use crate::render::is_device_lost;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{
+    AppearanceKey::*,
+    Key::{self, Appearance},
+};
 use crate::ui::layout::DockHit;
 use crate::ui::preview::PreviewHit;
 use windows::Win32::Foundation::POINT;
@@ -201,15 +204,10 @@ impl Bars {
         let (Some(preview), Some(renderer)) = (&mut self.preview, self.renderer.as_mut()) else {
             return Ok(());
         };
-        let blur = if !platform::display::transparency().unwrap_or(false) {
-            None
-        } else if self.settings.enabled(Appearance(WindowCustom)) {
-            (self.settings.get(Appearance(WindowOpacity)) < 100
-                && self.settings.get(Appearance(WindowBlur)) > 0)
-                .then(|| self.settings.get(Appearance(WindowBlur)))
-        } else {
-            Some(70)
-        };
+        let blur = (platform::display::transparency().unwrap_or(false)
+            && (!self.settings.enabled(Appearance(WindowCustom))
+                || self.settings.get(Appearance(WindowOpacity)) < 100))
+            .then(|| self.settings.get(Key::Backdrop));
         if preview.blur != blur {
             // GDI presents the chrome as opaque pixels, so even clear glass needs
             // the pixels under the preview. A denied capture keeps the opaque fill.

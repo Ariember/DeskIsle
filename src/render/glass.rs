@@ -69,10 +69,8 @@ const SCENE_MARGIN: f32 = 64.;
 /// show a bevel, as a pane tucked under the screen frame would.
 const OFFSCREEN: f32 = 48.;
 
-/// Opacity of the system-blurred layer under the clear body of the Dock and menus when
-/// the user has not set a blur strength: detail behind the glass softens enough for
-/// its content to stand out while the scene stays plainly visible.
-pub(super) const DEFAULT_FROST: f32 = 0.3;
+/// Filtering scale at maximum blur for wallpaper and captured backgrounds, in DIPs.
+const MAX_BLUR_DIP: f32 = 16.;
 
 /// PrismGlass `rimStrength` presets, named by the PrismGlass surface each mirrors.
 pub(super) mod rim {
@@ -94,8 +92,7 @@ pub(super) struct GlassSpec {
     pub width: f32,
     pub height: f32,
     pub radius: f32,
-    /// User glass strength in `0..=100`. `0` hides the glass; PrismGlass's clear
-    /// material has no blur to scale, so other values look the same.
+    /// Shared background blur in `0..=100`. At zero the bevel frames a clear body.
     pub strength: i32,
     /// PrismGlass `rimStrength`; see [`rim`].
     pub rim: f32,
@@ -104,10 +101,7 @@ pub(super) struct GlassSpec {
 #[derive(Clone, Copy, PartialEq)]
 enum Background {
     Wallpaper(u64),
-    /// The live composite behind the window, its clear body frosted by `frost`.
-    BehindWindow {
-        frost: f32,
-    },
+    BehindWindow,
 }
 
 /// Placement and source used to render the current surface.
@@ -313,22 +307,10 @@ impl GlassSurface {
     }
 
     /// Refract the composite behind this HWND at its final screen position. The flat
-    /// center shows the live scene, so scrolling and video stay current between samples;
-    /// `frost` (`0..=1`) lays the system-blurred scene over it at that opacity, raised a
-    /// little where the sampled scene is busy.
-    pub fn update_behind(
-        &mut self,
-        engine: &GlassEngine,
-        spec: GlassSpec,
-        frost: f32,
-    ) -> Result<()> {
-        self.show(
-            engine,
-            spec,
-            Background::BehindWindow {
-                frost: frost.clamp(0., 1.),
-            },
-        )
+    /// center shows the live scene at the configured blur, so scrolling and video stay
+    /// current between bevel samples.
+    pub fn update_behind(&mut self, engine: &GlassEngine, spec: GlassSpec) -> Result<()> {
+        self.show(engine, spec, Background::BehindWindow)
     }
 
     fn show(
@@ -337,7 +319,7 @@ impl GlassSurface {
         spec: GlassSpec,
         background: Background,
     ) -> Result<()> {
-        if spec.strength <= 0 || spec.width < 1. || spec.height < 1. {
+        if spec.width < 1. || spec.height < 1. {
             return self.hide();
         }
         let (ox, oy, monitor) = backdrop::placement(self.hwnd)?;
@@ -358,16 +340,20 @@ impl GlassSurface {
         let width = spec.width.round().max(1.) as u32;
         let height = spec.height.round().max(1.) as u32;
 
-        // Include pixels outside the rectangle for rays bent outwards at the bevel.
+        // A bevel ray can reach outside the rectangle. Include its Gaussian
+        // support (three sigma) and the next filtered texel for interpolation.
+        let scale = crate::platform::window_dpi(self.hwnd) as f32 / 96.;
+        let blur_px = MAX_BLUR_DIP * scale * (spec.strength as f32 / 100.);
+        let margin = SCENE_MARGIN + 4. * blur_px;
         let gx = ox as f32 + spec.x;
         let gy = oy as f32 + spec.y;
         let (gr, gb) = (gx + width as f32, gy + height as f32);
         let (ml, mt) = (monitor.x as f32, monitor.y as f32);
         let (mr, mb) = (ml + monitor.width as f32, mt + monitor.height as f32);
-        let scene_l = (gx - SCENE_MARGIN).max(ml).floor();
-        let scene_t = (gy - SCENE_MARGIN).max(mt).floor();
-        let scene_r = (gr + SCENE_MARGIN).min(mr).ceil();
-        let scene_b = (gb + SCENE_MARGIN).min(mb).ceil();
+        let scene_l = (gx - margin).max(ml).floor();
+        let scene_t = (gy - margin).max(mt).floor();
+        let scene_r = (gr + margin).min(mr).ceil();
+        let scene_b = (gb + margin).min(mb).ceil();
         let mut tone = None;
         let pixels = if scene_r > scene_l && scene_b > scene_t {
             let rect = Rect {
@@ -378,7 +364,7 @@ impl GlassSurface {
             };
             let image = match background {
                 Background::Wallpaper(_) => Backdrop::wallpaper(rect)?,
-                Background::BehindWindow { .. } => Backdrop::behind(self.hwnd, rect, 0, false)?,
+                Background::BehindWindow => Backdrop::behind(self.hwnd, rect, 0, false)?,
             };
             let scene = Scene {
                 width: image.width,
@@ -398,8 +384,10 @@ impl GlassSurface {
             card.bevel_half_h = height as f32 * 0.5;
             tone = Tone::measure(&scene, width, height);
             match background {
-                Background::Wallpaper(_) => prism::render(&scene, width, height, card),
-                Background::BehindWindow { .. } => prism::render_bevel(&scene, width, height, card),
+                Background::Wallpaper(_) => prism::render(&scene, width, height, card, blur_px),
+                Background::BehindWindow => {
+                    prism::render_bevel(&scene, width, height, card, blur_px)
+                }
             }
         } else {
             // Off every monitor: nothing to refract and nothing visible.
@@ -442,10 +430,12 @@ impl GlassSurface {
         self.core.SetOffset(plane.Normal)?;
         self.core.SetSize(size)?;
         if let Some(frost) = &self.frost {
-            let opacity = match (background, tone) {
-                (Background::BehindWindow { frost }, Some(tone)) => tone.frost(frost),
-                (Background::BehindWindow { frost }, None) => frost,
-                (Background::Wallpaper(_), _) => 0.,
+            let opacity = match background {
+                Background::BehindWindow => {
+                    let base = spec.strength as f32 / 100.;
+                    tone.map_or(base, |tone| tone.frost(base))
+                }
+                Background::Wallpaper(_) => 0.,
             };
             frost.SetOffset(plane.Normal)?;
             frost.SetSize(size)?;
@@ -552,8 +542,9 @@ impl Canvas {
         area: Area,
         radius: f32,
         rim: f32,
+        strength: f32,
     ) -> Result<()> {
-        self.paint_prism(image, area, radius, rim, prism::render)
+        self.paint_prism(image, area, radius, rim, strength, prism::render)
     }
 
     pub(super) fn liquid_bevel(
@@ -562,8 +553,9 @@ impl Canvas {
         area: Area,
         radius: f32,
         rim: f32,
+        strength: f32,
     ) -> Result<()> {
-        self.paint_prism(image, area, radius, rim, prism::render_bevel)
+        self.paint_prism(image, area, radius, rim, strength, prism::render_bevel)
     }
 
     fn paint_prism(
@@ -572,7 +564,8 @@ impl Canvas {
         area: Area,
         radius: f32,
         rim: f32,
-        render: fn(&Scene, u32, u32, Card) -> Vec<u8>,
+        strength: f32,
+        render: fn(&Scene, u32, u32, Card, f32) -> Vec<u8>,
     ) -> Result<()> {
         let dest = self.rect(area.left, area.top, area.right, area.bottom);
         let left = dest.left.round();
@@ -596,7 +589,13 @@ impl Canvas {
             radius * self.scale,
             rim,
         );
-        let pixels = render(&scene, width, height, card);
+        let pixels = render(
+            &scene,
+            width,
+            height,
+            card,
+            MAX_BLUR_DIP * self.scale * strength,
+        );
         let bitmap = premultiplied_bitmap(&self.ctx, width, height, &pixels)?;
         let at = D2D_RECT_F {
             left,
@@ -958,7 +957,7 @@ mod tests {
         let palette = Palette::new(true, &Settings::default());
         let pixels = paint_pixels(&device, palette, 96, 48, 96, |c| {
             let area = Area::new(4., 4., 92., 44.);
-            c.liquid_backdrop(&backdrop, area, 20., rim::DOCK)?;
+            c.liquid_backdrop(&backdrop, area, 20., rim::DOCK, 0.7)?;
             c.liquid_glass_shell(
                 area,
                 20.,
@@ -1079,7 +1078,7 @@ mod tests {
             width: 128.,
             height: 64.,
             radius: 16.,
-            strength: 65,
+            strength: 0,
             rim: rim::DOCK,
         };
         let area = RECT {
@@ -1134,7 +1133,7 @@ mod tests {
         }
         paint(BLACK_BRUSH, area)?;
         wait("underlay should be black", &|| sample(170, 230) < 10)?;
-        surface.update_behind(&engine, spec, 0.)?;
+        surface.update_behind(&engine, spec)?;
         unsafe {
             let _ = ShowWindow(overlay.0, SW_SHOWNOACTIVATE);
         }
@@ -1147,6 +1146,31 @@ mod tests {
             "the clear center should reveal the new white background",
             &|| sample(170, 230) > 235 && sample(264, 232) > 215,
         )?;
+        if backdrop::use_host_backdrop(overlay.0).is_ok() {
+            paint(
+                BLACK_BRUSH,
+                RECT {
+                    left: 103,
+                    right: 106,
+                    ..area
+                },
+            )?;
+            wait(
+                "a narrow dark line should show through clear glass",
+                &|| sample(264, 232) < 20,
+            )?;
+            let strength = Settings::default().get(crate::settings::Key::Backdrop);
+            surface.update_behind(&engine, GlassSpec { strength, ..spec })?;
+            wait(
+                "frost should soften the line while transmitting the white background",
+                &|| sample(264, 232) > 175 && sample(284, 232) > 220,
+            )?;
+            eprintln!(
+                "Frosted line and surrounding white: {}, {}",
+                sample(264, 232),
+                sample(284, 232)
+            );
+        }
         // Cover the surface and its sampling margin with a black visual, then draw
         // a white stripe on the underlay just outside the glass's left edge.
         let marker = engine.compositor.CreateSpriteVisual()?;
@@ -1177,7 +1201,7 @@ mod tests {
             },
         )?;
         surface.invalidate_scene();
-        surface.update_behind(&engine, spec, 0.)?;
+        surface.update_behind(&engine, spec)?;
         surface.root.Children()?.Remove(&marker)?;
         wait(
             "the bevel should refract the stripe through the previously covered area",
@@ -1192,7 +1216,7 @@ mod tests {
             &|| bevel() < 10,
         )?;
         surface.invalidate_scene();
-        surface.update_behind(&engine, spec, 0.)?;
+        surface.update_behind(&engine, spec)?;
         unsafe {
             let _ = ShowWindow(overlay.0, SW_SHOWNOACTIVATE);
         }
@@ -1200,5 +1224,50 @@ mod tests {
             "visible refresh and capture-before-show should produce the same bevel",
             &|| bevel().abs_diff(refreshed) < 6,
         )
+    }
+
+    #[test]
+    #[ignore = "requires Windows desktop composition and wallpaper sampling"]
+    fn both_bars_follow_the_global_glass_blur() -> Result<()> {
+        use crate::render::Renderer;
+        use crate::settings::{AppearanceKey, Key};
+        use crate::ui::layout::StatusLayout;
+
+        let _winrt = WinRtGuard::init()?;
+        let top = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 0, 0, 480, 40)?;
+        let dock = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 40, 160, 180, 56)?;
+        let mut settings = Settings::default();
+        let mut renderer = Renderer::new(top.0, dock.0, false, &settings)?;
+        let layout = StatusLayout::new((480, 40), 96, 0, 0, &[], &[], false, |text, size, bold| {
+            renderer.measure(text, size, bold)
+        });
+        for (strength, custom) in [(0, 0), (80, 0), (80, 1), (0, 1)] {
+            settings.set(Key::Backdrop, strength);
+            settings.set(Key::Appearance(AppearanceKey::TopCustom), custom);
+            settings.set(Key::Appearance(AppearanceKey::DockCustom), custom);
+            renderer.set_appearance(false, &settings);
+            renderer.draw_top(
+                &layout,
+                96,
+                "",
+                "12:00",
+                &[],
+                &[],
+                None,
+                None,
+                &[],
+                true,
+                None,
+            )?;
+            renderer.draw_dock(180, 56, 96, &[], &[], None, None, 1., 1.)?;
+            for surface in [&renderer.top_glass, &renderer.bottom_glass] {
+                let shown = surface
+                    .as_ref()
+                    .and_then(|s| s.current)
+                    .expect("visible glass");
+                assert_eq!(shown.spec.strength, strength);
+            }
+        }
+        Ok(())
     }
 }

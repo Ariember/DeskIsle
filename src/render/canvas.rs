@@ -580,7 +580,7 @@ impl Canvas {
         };
         if get(AppearanceKey::DockCustom) != 0 {
             let user_opacity = get(AppearanceKey::DockOpacity) as f32 / 100.;
-            let user_glass = get(AppearanceKey::DockBlur) as f32 / 100.;
+            let user_glass = settings.get(Key::Backdrop) as f32 / 100.;
             if user_opacity <= 0. {
                 opacity = 0.;
                 rim = 0.;

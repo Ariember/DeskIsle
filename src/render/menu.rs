@@ -8,7 +8,7 @@ use windows::Win32::{
 use windows::core::Result;
 
 use crate::platform::backdrop::Backdrop;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{AppearanceKey::*, Key, Key::Appearance};
 use crate::ui::calendar::{self, Note};
 use crate::ui::icon::Symbol;
 use crate::ui::menu::{self, Calendar, Entry, Icon, Menu, MenuLayout, Slider};
@@ -139,29 +139,25 @@ impl Renderer {
         self.close_menu();
         let (width, height) = layout.pixels();
         let (left, top, right, bottom) = layout.panel();
-        let (custom_key, blur_key, opacity_key, border_key) = if menu.folder_icon_size.is_some() {
-            (FolderCustom, FolderBlur, FolderOpacity, FolderBorder)
+        let (custom_key, opacity_key, border_key) = if menu.folder_icon_size.is_some() {
+            (FolderCustom, FolderOpacity, FolderBorder)
         } else {
-            (MenuCustom, MenuBlur, MenuOpacity, MenuBorder)
+            (MenuCustom, MenuOpacity, MenuBorder)
         };
         let custom = self.appearance.enabled(Appearance(custom_key));
-        let (blur_strength, mut opacity, mut rim) = if !self.transparency {
-            (0, 0.96, 0.55)
+        let (mut opacity, mut rim) = if !self.transparency {
+            (0.96, 0.55)
         } else if custom {
             let op = self.appearance.get(Appearance(opacity_key)) as f32 / 100.;
             let br = self.appearance.get(Appearance(border_key)) as f32 / 100.;
-            let blur = if op >= 1. {
-                0
-            } else {
-                self.appearance.get(Appearance(blur_key))
-            };
-            (blur, op, 0.35 + 1.15 * br)
+            (op, 0.35 + 1.15 * br)
         } else {
-            (74, if self.palette.dark { 0.24 } else { 0.22 }, 1.08)
+            (if self.palette.dark { 0.24 } else { 0.22 }, 1.08)
         };
-
+        let glass_enabled = self.transparency && opacity < 1.;
+        let strength = self.appearance.get(Key::Backdrop);
         let mut glass_surface = None;
-        if blur_strength > 0
+        if glass_enabled
             && let Some(engine) = &self.glass
             && let Some(mut surface) = previous_glass
                 .filter(|surface| surface.hwnd() == hwnd)
@@ -173,22 +169,17 @@ impl Renderer {
                 width: (right - left) * layout.scale,
                 height: (bottom - top) * layout.scale,
                 radius: MENU_RADIUS * layout.scale,
-                strength: blur_strength,
+                strength,
                 rim: super::glass::rim::DOCK,
             };
-            let frost = if custom {
-                blur_strength as f32 / 100.
-            } else {
-                super::glass::DEFAULT_FROST
-            };
-            if surface.update_behind(engine, spec, frost).is_ok() {
+            if surface.update_behind(engine, spec).is_ok() {
                 if animate {
                     let _ = surface.animate_open(engine, width, height, OPEN_DURATION);
                 }
                 glass_surface = Some(surface);
             }
         }
-        let glass_active = glass_surface.is_some() || (blur_strength > 0 && backdrop.is_some());
+        let glass_active = glass_surface.is_some() || (glass_enabled && backdrop.is_some());
         if !glass_active && !custom {
             opacity = 0.96;
             rim = 0.62;
@@ -219,10 +210,16 @@ impl Renderer {
                 if custom { opacity.max(0.35) } else { 0.85 },
             )?;
             if glass_surface.is_none()
-                && blur_strength > 0
+                && glass_enabled
                 && let Some(image) = backdrop
             {
-                c.liquid_bevel(image, area, MENU_RADIUS, super::glass::rim::DOCK)?;
+                c.liquid_bevel(
+                    image,
+                    area,
+                    MENU_RADIUS,
+                    super::glass::rim::DOCK,
+                    strength as f32 / 100.,
+                )?;
             }
             c.liquid_glass_shell(
                 area,

@@ -10,7 +10,10 @@ use crate::platform::launchpad::{
 };
 use crate::platform::{self, shell};
 use crate::render::is_device_lost;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{
+    AppearanceKey::*,
+    Key::{self, Appearance},
+};
 use crate::storage;
 use crate::ui::launchpad::{LaunchpadHit, LaunchpadLayout};
 use crate::ui::layout::DockDrop;
@@ -43,6 +46,7 @@ struct LaunchpadBackground {
     blur: i32,
     wallpaper: bool,
     dynamic: bool,
+    transparency: bool,
 }
 
 impl Launchpad {
@@ -200,33 +204,27 @@ impl Bars {
             let live_glass = renderer.has_live_glass();
             let custom = self.settings.enabled(Appearance(LaunchpadCustom));
             let wallpaper = custom && self.settings.enabled(Appearance(LaunchpadWallpaper));
-            let blur = if custom {
-                self.settings.get(Appearance(LaunchpadBlur))
-            } else {
-                68
-            };
+            let blur = self.settings.get(Key::Backdrop);
+            let transparency = platform::display::transparency().unwrap_or(false);
             let dynamic = !wallpaper
                 && (!custom || self.settings.enabled(Appearance(LaunchpadDynamic)))
-                && platform::display::transparency().unwrap_or(false);
-            let background = Some(LaunchpadBackground {
+                && transparency;
+            let background = LaunchpadBackground {
                 rect: pad.rect,
                 blur,
                 wallpaper,
                 dynamic,
-            });
-            if pad.background != background {
+                transparency,
+            };
+            if pad.background != Some(background) {
                 let want_dwm = !live_glass && dynamic && blur > 0;
                 pad.acrylic = platform::set_window_backdrop(pad.window.0, want_dwm, true);
-                pad.snapshot = background.and_then(|bg| {
-                    if (live_glass && bg.dynamic) || pad.acrylic || (bg.dynamic && bg.blur == 0) {
-                        return None;
-                    }
-                    if !custom && !platform::display::transparency().unwrap_or(false) {
-                        return None;
-                    }
-                    Backdrop::behind(pad.window.0, pad.rect, bg.blur, bg.wallpaper).ok()
-                });
-                pad.background = background;
+                pad.snapshot = if transparency && !(live_glass && dynamic || pad.acrylic) {
+                    Backdrop::behind(pad.window.0, pad.rect, blur, wallpaper).ok()
+                } else {
+                    None
+                };
+                pad.background = Some(background);
             }
             renderer.draw_launchpad(
                 pad.window.0,
@@ -234,7 +232,7 @@ impl Bars {
                 &pad.paths,
                 &pad.query,
                 pad.snapshot.as_ref(),
-                pad.acrylic || (live_glass && dynamic && blur > 0),
+                pad.acrylic || (live_glass && dynamic),
             )?;
             if pad.hover.is_some() {
                 renderer.hover_launchpad(&pad.layout, pad.hover)?;

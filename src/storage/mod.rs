@@ -233,6 +233,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_global_blur_is_restored_from_old_appearance_settings() {
+        for (saved, expected) in [(None, 80), (Some("0"), 0), (Some("65"), 65)] {
+            let mut lines = vec!["appearance.dock.blur=15".to_string()];
+            if let Some(value) = saved {
+                lines.push(format!("general.backdrop={value}"));
+            }
+            lines.extend([
+                "appearance.top.blur=90".into(),
+                "appearance.reflection.blur=27".into(),
+            ]);
+            let (settings, problems) = parse_settings(&lines);
+            assert!(problems.is_empty());
+            assert_eq!(settings.get(Key::Backdrop), expected);
+            let blur_entries: Vec<_> = settings
+                .file_entries()
+                .filter(|(id, _)| *id == "general.backdrop" || id.ends_with(".blur"))
+                .collect();
+            assert_eq!(
+                blur_entries,
+                [
+                    ("general.backdrop", expected.to_string()),
+                    ("appearance.reflection.blur", "27".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn old_immersive_setting_yields_to_explicit_display_mode() {
         use crate::visibility::DockDisplayMode::*;
         for (lines, expected) in [

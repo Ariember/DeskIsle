@@ -4,7 +4,10 @@ use crate::platform::backdrop::Backdrop;
 use crate::platform::tray::TrayInput;
 use crate::platform::{self, Event, MenuKey, MenuWindow, audio, display};
 use crate::render::is_device_lost;
-use crate::settings::{AppearanceKey::*, Key::Appearance};
+use crate::settings::{
+    AppearanceKey::*,
+    Key::{self, Appearance},
+};
 use crate::ui::layout::{DockDrop, DockHit, StatusHit, SystemItem};
 use crate::ui::menu::{
     self, Anchor, Command, Focus, Hit, Menu, MenuLayout, Slider, SliderTarget, TrayEntry,
@@ -275,21 +278,14 @@ impl Bars {
         {
             return None;
         }
-        let (custom, blur, opacity) = if folder {
-            (FolderCustom, FolderBlur, FolderOpacity)
+        let (custom, opacity) = if folder {
+            (FolderCustom, FolderOpacity)
         } else {
-            (MenuCustom, MenuBlur, MenuOpacity)
+            (MenuCustom, MenuOpacity)
         };
-        let strength = if self.settings.enabled(Appearance(custom)) {
-            if self.settings.get(Appearance(opacity)) >= 100 {
-                0
-            } else {
-                self.settings.get(Appearance(blur))
-            }
-        } else {
-            74
-        };
-        if strength == 0 {
+        if self.settings.enabled(Appearance(custom))
+            && self.settings.get(Appearance(opacity)) >= 100
+        {
             return None;
         }
         let (l, t, r, b) = layout.panel();
@@ -302,7 +298,7 @@ impl Bars {
         };
         // A restricted desktop may refuse capture. Its ordinary translucent tint
         // still shows live content beneath the menu.
-        Backdrop::behind(hwnd, rect, strength, false).ok()
+        Backdrop::behind(hwnd, rect, self.settings.get(Key::Backdrop), false).ok()
     }
 
     /// Binds and paints `menu` into its window; a failed paint releases the target.
