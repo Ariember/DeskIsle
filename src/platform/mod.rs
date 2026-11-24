@@ -265,17 +265,17 @@ pub fn notify_cards(hwnd: HWND) -> Result<()> {
 
 /// Poll only while a release check or a download is in flight.
 pub fn update_timer(hwnd: HWND, enabled: bool) -> Result<()> {
-    background_job_timer(hwnd, UPDATE_TIMER, enabled)
+    background_job_timer(hwnd, UPDATE_TIMER, 300, enabled)
 }
 
 pub fn market_timer(hwnd: HWND, enabled: bool) -> Result<()> {
-    background_job_timer(hwnd, MARKET_TIMER, enabled)
+    background_job_timer(hwnd, MARKET_TIMER, 60, enabled)
 }
 
-fn background_job_timer(hwnd: HWND, id: usize, enabled: bool) -> Result<()> {
+fn background_job_timer(hwnd: HWND, id: usize, interval_ms: u32, enabled: bool) -> Result<()> {
     unsafe {
         if enabled {
-            if SetTimer(Some(hwnd), id, 300, None) == 0 {
+            if SetTimer(Some(hwnd), id, interval_ms, None) == 0 {
                 return Err(Error::from_thread());
             }
         } else {

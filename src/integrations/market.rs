@@ -63,19 +63,43 @@ impl MarketEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct Market {
     source: Source,
+    pub label: String,
     pub entries: Vec<MarketEntry>,
+}
+
+#[cfg(test)]
+impl Market {
+    pub(crate) fn test_with_entries(path: PathBuf, entries: Vec<MarketEntry>) -> Self {
+        Self {
+            source: Source::File(path),
+            label: "官方市场 v1.0.0".into(),
+            entries,
+        }
+    }
 }
 
 impl Market {
     pub fn load() -> io::Result<Self> {
-        let source = match std::env::var_os("DESKISLE_MARKET_INDEX") {
-            Some(value) => Source::configured(value)?,
+        let (source, label) = match std::env::var_os("DESKISLE_MARKET_INDEX") {
+            Some(value) => {
+                let source = Source::configured(value)?;
+                let label = match &source {
+                    Source::File(_) => "本地市场索引".into(),
+                    Source::Https(_) => "自定义市场源".into(),
+                };
+                (source, label)
+            }
             None => Source::latest_release()?,
         };
-        Self::from_source(source)
+        Self::from_labeled_source(source, label)
     }
 
+    #[cfg(test)]
     fn from_source(source: Source) -> io::Result<Self> {
+        Self::from_labeled_source(source, "测试市场".into())
+    }
+
+    fn from_labeled_source(source: Source, label: String) -> io::Result<Self> {
         let bytes = source.read(MAX_INDEX_BYTES)?;
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
         let index: Index =
@@ -102,6 +126,7 @@ impl Market {
         }
         Ok(Self {
             entries: index.plugins,
+            label,
             source,
         })
     }
@@ -156,13 +181,13 @@ impl Source {
         Ok(Self::Https(uri))
     }
 
-    fn latest_release() -> io::Result<Self> {
+    fn latest_release() -> io::Result<(Self, String)> {
         let api = format!("https://api.github.com/repos/{MARKET_REPOSITORY}/releases/latest");
         let bytes = fetch_json(&api, MAX_INDEX_BYTES, "application/vnd.github+json")?;
         Self::release_index(&bytes)
     }
 
-    fn release_index(bytes: &[u8]) -> io::Result<Self> {
+    fn release_index(bytes: &[u8]) -> io::Result<(Self, String)> {
         #[derive(Deserialize)]
         struct Release {
             tag_name: String,
@@ -181,7 +206,10 @@ impl Source {
         }
         let url =
             format!("https://raw.githubusercontent.com/{MARKET_REPOSITORY}/v{version}/index.json");
-        Self::configured(url.into())
+        Ok((
+            Self::configured(url.into())?,
+            format!("官方市场 v{version}"),
+        ))
     }
 
     fn package(&self, id: &str) -> io::Result<Self> {
@@ -313,7 +341,8 @@ mod tests {
                 .unwrap(),
             )
         };
-        let source = release("v2.0.1", false, false).unwrap();
+        let (source, label) = release("v2.0.1", false, false).unwrap();
+        assert_eq!(label, "官方市场 v2.0.1");
         let Source::Https(ref index) = source else {
             panic!()
         };

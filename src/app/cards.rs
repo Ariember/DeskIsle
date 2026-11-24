@@ -14,6 +14,7 @@ use windows::core::{Error, Result};
 
 struct Snapshot {
     owner: Option<usize>,
+    dirty: bool,
     cards: Vec<Card>,
 }
 
@@ -29,6 +30,7 @@ impl CardReader {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Snapshot {
                 owner: Some(hwnd.0 as usize),
+                dirty: false,
                 cards: Vec::new(),
             }),
             stop: Condvar::new(),
@@ -38,6 +40,7 @@ impl CardReader {
             .name("DeskIsle desktop cards".into())
             .spawn(move || {
                 loop {
+                    reader.snapshot.lock().expect("card reader").dirty = false;
                     let cards = match storage::plugins_directory() {
                         Ok(directory) => load_cards(&directory),
                         Err(_) => vec![Card {
@@ -55,7 +58,9 @@ impl CardReader {
                     }
                     let (snapshot, _) = reader
                         .stop
-                        .wait_timeout_while(snapshot, Duration::from_secs(3), |s| s.owner.is_some())
+                        .wait_timeout_while(snapshot, Duration::from_secs(3), |s| {
+                            s.owner.is_some() && !s.dirty
+                        })
                         .expect("card reader");
                     if snapshot.owner.is_none() {
                         return;
@@ -64,6 +69,11 @@ impl CardReader {
             })
             .map_err(|e| Error::new(E_FAIL, format!("无法启动桌面卡片读取线程：{e}")))?;
         Ok(Self(shared))
+    }
+
+    pub(super) fn wake(&self) {
+        self.0.snapshot.lock().expect("card reader").dirty = true;
+        self.0.stop.notify_one();
     }
 }
 
@@ -88,11 +98,18 @@ impl Bars {
         }
     }
 
+    pub(super) fn wake_card_reader(&self) {
+        if let Some(reader) = &self.card_reader {
+            reader.wake();
+        }
+    }
+
     pub(super) fn receive_cards(&mut self) -> Result<()> {
         if let Some(reader) = &self.card_reader {
             self.card_data
                 .clone_from(&reader.0.snapshot.lock().expect("card reader").cards);
         }
+        self.sync_plugins_if_open();
         self.refresh_desktop_cards()
     }
 

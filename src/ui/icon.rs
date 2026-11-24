@@ -64,6 +64,8 @@ pub enum Symbol {
     Close,
     Check,
     Apps,
+    Cards,
+    Puzzle,
     Search,
     Activity,
     Desktop,
@@ -533,6 +535,50 @@ pub fn sketch(symbol: Symbol) -> Vec<Shape> {
             for (left, top) in [(3.5, 3.5), (13.5, 3.5), (3.5, 13.5), (13.5, 13.5)] {
                 s.rect(left, top, left + 7., top + 7., 2., Stroke);
             }
+        }
+        Symbol::Cards => {
+            s.polyline(
+                &[(7., 5.5), (7., 3.5), (20.5, 3.5), (20.5, 16.), (18.5, 16.)],
+                2.,
+                false,
+                Stroke,
+            );
+            s.rect(3.5, 7.5, 17.5, 20.5, 2.5, Stroke);
+            s.line(&[(7., 12.), (14., 12.)]);
+            s.line(&[(7., 16.), (11.5, 16.)]);
+        }
+        Symbol::Puzzle => {
+            s.push(
+                (6., 6.5),
+                vec![
+                    Step::Line((8.75, 6.5)),
+                    arc_to((12.75, 6.5), 2., true, false),
+                    Step::Line((15.5, 6.5)),
+                    Step::Quad {
+                        control: (17.5, 6.5),
+                        to: (17.5, 8.5),
+                    },
+                    Step::Line((17.5, 11.25)),
+                    arc_to((17.5, 15.25), 2., true, false),
+                    Step::Line((17.5, 18.)),
+                    Step::Quad {
+                        control: (17.5, 20.),
+                        to: (15.5, 20.),
+                    },
+                    Step::Line((6., 20.)),
+                    Step::Quad {
+                        control: (4., 20.),
+                        to: (4., 18.),
+                    },
+                    Step::Line((4., 8.5)),
+                    Step::Quad {
+                        control: (4., 6.5),
+                        to: (6., 6.5),
+                    },
+                ],
+                true,
+                Stroke,
+            );
         }
         Symbol::Activity => {
             s.line(&[
@@ -1014,6 +1060,8 @@ mod tests {
         Symbol::Close,
         Symbol::Check,
         Symbol::Apps,
+        Symbol::Cards,
+        Symbol::Puzzle,
         Symbol::Search,
         Symbol::Keyboard,
         Symbol::Activity,

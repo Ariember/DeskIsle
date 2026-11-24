@@ -5,7 +5,8 @@ use super::Bars;
 use crate::platform::{self, Event, PanelKey, PanelWindow, display, startup};
 use crate::render::is_device_lost;
 use crate::settings::{
-    Adjust, AppearanceKey as A, Key, SCHEMA, SECTIONS, Settings, Store, Theme, TopBarBackground,
+    Adjust, AppearanceKey as A, Key, SCHEMA, SECTIONS, Section, Settings, Store, Theme,
+    TopBarBackground,
 };
 use crate::storage;
 use crate::ui::layout::DockStyle;
@@ -21,6 +22,12 @@ pub(super) struct Panel {
     dpi: u32,
     translucent: bool,
     pressed: Option<Action>,
+}
+
+impl Panel {
+    pub(super) fn page(&self) -> usize {
+        self.state.page
+    }
 }
 
 /// Settings saved by the user, falling back to defaults with a message when the file
@@ -207,6 +214,7 @@ impl Bars {
     pub(super) fn open_settings(&mut self) -> Result<()> {
         if let Some(panel) = &self.panel {
             panel.window.show();
+            self.sync_plugins_if_open();
             return Ok(());
         }
         let dpi = panel_dpi(self.monitor.dpi, self.monitor.work);
@@ -400,7 +408,11 @@ impl Bars {
             }
             Some(Action::Quit) => return Ok(true),
             Some(Action::CheckUpdates) => self.check_for_updates(true),
-            Some(action @ (Action::BrowseMarket | Action::InstallPlugin(_))) => {
+            Some(Action::PluginTab(tab)) => panel.state.set_plugin_tab(tab),
+            Some(
+                action
+                @ (Action::BrowseMarket | Action::InstallPlugin(_) | Action::RemovePlugin(_)),
+            ) => {
                 panel.pressed = None;
                 self.start_market(action)
             }
@@ -418,7 +430,12 @@ impl Bars {
                     platform::report_error(Some(owner), &error);
                 }
             }
-            Some(Action::Page(page)) => panel.state.open_page(page),
+            Some(Action::Page(page)) => {
+                panel.state.open_page(page);
+                if SECTIONS.get(page) == Some(&Section::Plugins) {
+                    self.enter_plugins_page();
+                }
+            }
             Some(Action::Reset) => {
                 let section = SECTIONS[panel.state.page];
                 let mut next = self.settings.clone();

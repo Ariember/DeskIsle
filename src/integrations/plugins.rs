@@ -6,6 +6,121 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::cards::{Card, CardState};
 use crate::plugins::{self, Contribution, MAX_DOCUMENT_BYTES, Publication, valid_plugin_id};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LocalPluginStatus {
+    Ready {
+        cards: usize,
+        setup_cards: usize,
+        error_cards: usize,
+    },
+    Invalid(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalPlugin {
+    pub id: String,
+    pub removable: bool,
+    pub name: String,
+    pub version: Option<semver::Version>,
+    pub card_titles: Vec<String>,
+    pub status: LocalPluginStatus,
+}
+
+/// Inspects every `.json` publication in `dir` in plugin ID order for the management panel.
+pub(crate) fn list_installed(dir: &Path) -> io::Result<Vec<LocalPlugin>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(ty) if ty.is_file() => paths.push(path),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+    let mut installed = Vec::new();
+    for path in paths {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let valid_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(valid_plugin_id);
+        if !valid_id {
+            installed.push(LocalPlugin {
+                name: stem.clone(),
+                id: stem,
+                removable: false,
+                version: None,
+                card_titles: Vec::new(),
+                status: LocalPluginStatus::Invalid(
+                    "文件名不符合插件 ID 规范，请在插件目录中处理".into(),
+                ),
+            });
+            continue;
+        }
+        match read_document(&path) {
+            Ok(plugin) => {
+                let mut cards = 0;
+                let mut setup_cards = 0;
+                let mut error_cards = 0;
+                let mut card_titles = Vec::new();
+                for contribution in plugin.contributions {
+                    match contribution {
+                        Contribution::DesktopCards(entries) => {
+                            for card in entries {
+                                cards += 1;
+                                match card.state {
+                                    CardState::Ready => {}
+                                    CardState::Setup => setup_cards += 1,
+                                    CardState::Error => error_cards += 1,
+                                }
+                                if card_titles.len() < 3 {
+                                    card_titles.push(card.title);
+                                }
+                            }
+                        }
+                    }
+                }
+                installed.push(LocalPlugin {
+                    id: stem,
+                    removable: true,
+                    name: plugin.name,
+                    version: Some(plugin.version),
+                    card_titles,
+                    status: LocalPluginStatus::Ready {
+                        cards,
+                        setup_cards,
+                        error_cards,
+                    },
+                });
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => installed.push(LocalPlugin {
+                name: stem.clone(),
+                id: stem,
+                removable: true,
+                version: None,
+                card_titles: Vec::new(),
+                status: LocalPluginStatus::Invalid(e.to_string()),
+            }),
+        }
+    }
+    Ok(installed)
+}
+
 /// Load completed publications in plugin ID order, preserving each author's card order.
 pub(crate) fn load_cards(dir: &Path) -> Vec<Card> {
     let entries = match fs::read_dir(dir) {
@@ -169,6 +284,21 @@ mod tests {
             ["first", "a-b", "one", "two"]
         );
         assert_eq!(cards[1].state, CardState::Error);
+        let listed = list_installed(&dir).unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["a", "a-b", "b"]
+        );
+        assert_eq!(
+            listed[0].status,
+            LocalPluginStatus::Ready {
+                cards: 1,
+                setup_cards: 0,
+                error_cards: 0,
+            }
+        );
+        assert!(matches!(listed[1].status, LocalPluginStatus::Invalid(_)));
+        assert!(listed[1].removable);
         assert!(publish(&dir, "../outside", empty).is_err());
         assert!(remove(&dir, "../outside").is_err());
         remove(&dir, "b").unwrap();

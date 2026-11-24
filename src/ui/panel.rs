@@ -7,6 +7,8 @@ use crate::settings::{
     self, Adjust, Control, DOCK_DISPLAY_MODES, Key, MonitorKey, SCHEMA, SECTIONS, Section, Settings,
 };
 use crate::visibility::DockDisplayMode;
+use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
 pub const WIDTH: f32 = 720.;
@@ -44,6 +46,9 @@ const SEGMENT: f32 = 56.;
 const CONTROL_HEIGHT: f32 = 28.;
 const MODE_ROW_HEIGHT: f32 = 24.;
 const RESET_WIDTH: f32 = 112.;
+const PLUGIN_HERO_CARD: f32 = 68.;
+const INSTALLED_ROW: f32 = 68.;
+const MARKET_ROW: f32 = 76.;
 /// Content moved per wheel notch, in DIPs.
 const SCROLL_STEP: f32 = 48.;
 
@@ -83,8 +88,10 @@ pub enum Action {
     Reset,
     Open(&'static str),
     OpenPluginsDirectory,
+    PluginTab(PluginTab),
     BrowseMarket,
     InstallPlugin(usize),
+    RemovePlugin(usize),
     CheckUpdates,
     Quit,
     OpenModes,
@@ -94,92 +101,591 @@ pub enum Action {
 
 pub const DISPLAY_SETTINGS: Action = Action::Open("ms-settings:display-advanced");
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct MarketItem {
-    pub title: String,
-    pub description: String,
-    pub installed: bool,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PluginTab {
+    #[default]
+    All,
+    Market,
+    Installed,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+impl PluginTab {
+    pub const ALL: [Self; 3] = [Self::All, Self::Market, Self::Installed];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::All => 0,
+            Self::Market => 1,
+            Self::Installed => 2,
+        }
+    }
+
+    pub fn step(self, delta: isize) -> Self {
+        let count = Self::ALL.len() as isize;
+        Self::ALL[(self.index() as isize + delta).rem_euclid(count) as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarketState {
+    #[default]
+    Install,
+    Update,
+    Reinstall,
+    Installed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketItem {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub installed_version: Option<String>,
+    pub description: String,
+    pub state: MarketState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstalledHealth {
+    #[default]
+    Ready,
+    Setup,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledItem {
+    pub id: String,
+    pub title: String,
+    pub version: Option<String>,
+    pub market_update: Option<(usize, String)>,
+    pub summary: String,
+    pub cards: usize,
+    pub health: InstalledHealth,
+    pub removable: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarketView {
+    pub installed: Arc<[InstalledItem]>,
     pub items: Arc<[MarketItem]>,
+    pub source: Option<String>,
+    pub error: Option<String>,
     pub loaded: bool,
     pub busy: Option<Action>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginFocus {
+    Tabs,
+    Refresh,
+    EmptyBrowseMarket,
+    InstalledUpdate(usize),
+    InstalledRemove(usize),
+    MarketItem(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PluginStop {
+    pub kind: PluginFocus,
+    pub scroll_area: Area,
+    pub ring_area: Area,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct MarketList {
-    area: Area,
+pub struct InstalledRow {
+    pub index: usize,
+    pub area: Area,
+    pub update_button: Option<(Area, usize)>,
+    pub remove_button: Option<Area>,
+    pub remove_action: Option<Action>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledSection {
+    pub header: Area,
+    pub meta: String,
+    pub meta_accent: bool,
+    pub group: Area,
+    pub empty_button: Option<Area>,
+    pub rows: Vec<InstalledRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarketSection {
+    pub header: Area,
+    pub source_label: String,
+    pub error_banner: Option<(Area, Area)>,
+    pub group: Area,
+    pub state_button: Option<(Area, &'static str)>,
     view: MarketView,
 }
 
-impl MarketList {
-    fn len(&self) -> usize {
-        1 + self.view.items.len()
+impl MarketSection {
+    pub fn visible(&self, viewport: Area) -> Range<usize> {
+        if self.view.items.is_empty() {
+            return 0..0;
+        }
+        let first = ((viewport.top - self.group.top) / MARKET_ROW)
+            .floor()
+            .max(0.) as usize;
+        let end = ((viewport.bottom - self.group.top) / MARKET_ROW)
+            .ceil()
+            .max(0.) as usize;
+        first.min(self.view.items.len())..end.min(self.view.items.len())
     }
 
     pub fn row(&self, index: usize) -> Area {
-        let top = self.area.top + CARD * index as f32;
+        let top = self.group.top + MARKET_ROW * index as f32;
         Area {
             top,
-            bottom: top + CARD,
-            ..self.area
+            bottom: top + MARKET_ROW,
+            ..self.group
         }
-    }
-
-    pub fn visible(&self, viewport: Area) -> std::ops::Range<usize> {
-        let first = ((viewport.top - self.area.top) / CARD).floor() as usize;
-        let end = ((viewport.bottom - self.area.top) / CARD).ceil() as usize;
-        first.min(self.len())..end.min(self.len())
     }
 
     pub fn button(&self, index: usize) -> Area {
         let row = self.row(index);
         Area::new(
-            row.right - 94.,
+            row.right - 90.,
             row.middle() - CONTROL_HEIGHT / 2.,
             row.right - CONTROL_INSET,
             row.middle() + CONTROL_HEIGHT / 2.,
         )
     }
 
-    pub fn labels(&self, index: usize) -> (&str, &str, &'static str) {
-        if index == 0 {
-            let help = if self.view.loaded && self.view.items.is_empty() {
-                "市场中暂无插件"
+    pub fn button_label(&self, index: usize) -> &'static str {
+        let item = &self.view.items[index];
+        if self.view.busy == Some(Action::InstallPlugin(index)) {
+            if item.state == MarketState::Update {
+                "更新中…"
             } else {
-                "浏览和安装桌面卡片插件"
-            };
-            let button = if self.view.busy == Some(Action::BrowseMarket) {
-                "读取中…"
-            } else if self.view.loaded {
-                "刷新"
-            } else {
-                "浏览"
-            };
-            ("插件市场", help, button)
-        } else {
-            let item = &self.view.items[index - 1];
-            let button = if self.view.busy == Some(Action::InstallPlugin(index - 1)) {
                 "安装中…"
-            } else if item.installed {
-                "已安装"
-            } else {
-                "安装"
-            };
-            (&item.title, &item.description, button)
+            }
+        } else {
+            match item.state {
+                MarketState::Install => "安装",
+                MarketState::Update => "更新",
+                MarketState::Reinstall => "重装",
+                MarketState::Installed => "已安装",
+            }
         }
     }
 
     pub fn action(&self, index: usize) -> Option<Action> {
-        if self.view.busy.is_some() || index >= self.len() {
+        if self.view.busy.is_some() || index >= self.view.items.len() {
             return None;
         }
-        if index == 0 {
-            Some(Action::BrowseMarket)
+        (self.view.items[index].state != MarketState::Installed)
+            .then_some(Action::InstallPlugin(index))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginsPage {
+    pub tab: PluginTab,
+    pub tabs_track: Area,
+    pub tabs: [(Area, PluginTab); 3],
+    pub refresh_button: Area,
+    pub refresh_label: &'static str,
+    pub refresh_action: Option<Action>,
+    pub installed: Option<InstalledSection>,
+    pub market: Option<MarketSection>,
+    pub stops: Vec<PluginStop>,
+    pub view: MarketView,
+}
+
+impl PluginsPage {
+    fn build(viewport: Area, start_top: f32, tab: PluginTab, view: &MarketView) -> (Self, f32) {
+        let bar_top = start_top + 10.;
+        let track_width = 228_f32.min((viewport.right - viewport.left - 110.).max(168.));
+        let tabs_track = Area::new(
+            viewport.left,
+            bar_top,
+            viewport.left + track_width,
+            bar_top + CONTROL_HEIGHT,
+        );
+        let seg_w = track_width / PluginTab::ALL.len() as f32;
+        let tabs = std::array::from_fn(|i| {
+            let left = tabs_track.left + i as f32 * seg_w;
+            (
+                Area::new(left, bar_top, left + seg_w, bar_top + CONTROL_HEIGHT),
+                PluginTab::ALL[i],
+            )
+        });
+        let refresh_button = Area::new(
+            viewport.right - 98.,
+            bar_top,
+            viewport.right,
+            bar_top + CONTROL_HEIGHT,
+        );
+        let refresh_label = if view.busy == Some(Action::BrowseMarket) {
+            "读取中…"
+        } else if view.error.is_some() {
+            "重试"
+        } else if view.loaded {
+            "刷新市场"
         } else {
-            (!self.view.items[index - 1].installed).then_some(Action::InstallPlugin(index - 1))
+            "浏览市场"
+        };
+        let refresh_action = view.busy.is_none().then_some(Action::BrowseMarket);
+        let mut cur = bar_top + CONTROL_HEIGHT;
+        let mut stops = vec![
+            PluginStop {
+                kind: PluginFocus::Tabs,
+                scroll_area: Area::new(viewport.left, bar_top, viewport.right, cur),
+                ring_area: tabs_track,
+                enabled: true,
+            },
+            PluginStop {
+                kind: PluginFocus::Refresh,
+                scroll_area: Area::new(viewport.left, bar_top, viewport.right, cur),
+                ring_area: refresh_button,
+                enabled: refresh_action.is_some(),
+            },
+        ];
+
+        let show_installed =
+            tab == PluginTab::Installed || (tab == PluginTab::All && !view.installed.is_empty());
+        let installed = show_installed.then(|| {
+            let header = Area::new(
+                viewport.left + 2.,
+                cur + 10.,
+                viewport.right - 2.,
+                cur + 28.,
+            );
+            let group_top = header.bottom + 4.;
+            let updates = view
+                .installed
+                .iter()
+                .filter(|item| item.market_update.is_some())
+                .count();
+            let total_cards: usize = view.installed.iter().map(|item| item.cards).sum();
+            let (meta, meta_accent) = if updates > 0 {
+                (format!("{updates} 款可更新"), true)
+            } else if view.installed.is_empty() {
+                ("暂无本地插件".into(), false)
+            } else {
+                (
+                    format!("{} 款插件 · {total_cards} 张卡片", view.installed.len()),
+                    false,
+                )
+            };
+            if view.installed.is_empty() {
+                let group = Area::new(viewport.left, group_top, viewport.right, group_top + 86.);
+                let mid_x = (group.left + group.right) / 2.;
+                let btn = Area::new(
+                    mid_x - 58.,
+                    group.bottom - 35.,
+                    mid_x + 58.,
+                    group.bottom - 7.,
+                );
+                stops.push(PluginStop {
+                    kind: PluginFocus::EmptyBrowseMarket,
+                    scroll_area: group,
+                    ring_area: btn,
+                    enabled: true,
+                });
+                cur = group.bottom;
+                InstalledSection {
+                    header,
+                    meta,
+                    meta_accent,
+                    group,
+                    empty_button: Some(btn),
+                    rows: Vec::new(),
+                }
+            } else {
+                let group = Area::new(
+                    viewport.left,
+                    group_top,
+                    viewport.right,
+                    group_top + INSTALLED_ROW * view.installed.len() as f32,
+                );
+                let mut rows = Vec::with_capacity(view.installed.len());
+                for (i, item) in view.installed.iter().enumerate() {
+                    let row_top = group_top + i as f32 * INSTALLED_ROW;
+                    let area = Area::new(
+                        viewport.left,
+                        row_top,
+                        viewport.right,
+                        row_top + INSTALLED_ROW,
+                    );
+                    let right = area.right - CONTROL_INSET;
+                    let mid = area.middle();
+                    let remove_button = item.removable.then(|| {
+                        let width = if view.busy == Some(Action::RemovePlugin(i)) {
+                            70.
+                        } else {
+                            58.
+                        };
+                        Area::new(right - width, mid - 14., right, mid + 14.)
+                    });
+                    let remove_action =
+                        (item.removable && view.busy.is_none()).then_some(Action::RemovePlugin(i));
+                    let update_button = item.market_update.as_ref().map(|&(market_idx, _)| {
+                        let upd_right = remove_button.map_or(right, |btn| btn.left - 8.);
+                        let width = if view.busy == Some(Action::InstallPlugin(market_idx)) {
+                            70.
+                        } else {
+                            58.
+                        };
+                        (
+                            Area::new(upd_right - width, mid - 14., upd_right, mid + 14.),
+                            market_idx,
+                        )
+                    });
+                    if let Some((btn, market_idx)) = update_button {
+                        stops.push(PluginStop {
+                            kind: PluginFocus::InstalledUpdate(market_idx),
+                            scroll_area: area,
+                            ring_area: btn,
+                            enabled: view.busy.is_none(),
+                        });
+                    }
+                    if let Some(btn) = remove_button {
+                        stops.push(PluginStop {
+                            kind: PluginFocus::InstalledRemove(i),
+                            scroll_area: area,
+                            ring_area: btn,
+                            enabled: remove_action.is_some(),
+                        });
+                    }
+                    rows.push(InstalledRow {
+                        index: i,
+                        area,
+                        update_button,
+                        remove_button,
+                        remove_action,
+                    });
+                }
+                cur = group.bottom;
+                InstalledSection {
+                    header,
+                    meta,
+                    meta_accent,
+                    group,
+                    empty_button: None,
+                    rows,
+                }
+            }
+        });
+
+        let show_market = tab == PluginTab::Market || tab == PluginTab::All;
+        let market = show_market.then(|| {
+            let header = Area::new(
+                viewport.left + 2.,
+                cur + 12.,
+                viewport.right - 2.,
+                cur + 30.,
+            );
+            let mut body_top = header.bottom + 4.;
+            let source_label = if view.busy == Some(Action::BrowseMarket) {
+                "正在同步最新稳定版索引…".into()
+            } else if let Some(source) = &view.source {
+                format!("{source} · SHA-256 校验")
+            } else {
+                "GitHub 稳定版索引".into()
+            };
+            let error_banner = (view.error.is_some() && !view.items.is_empty()).then(|| {
+                let banner = Area::new(viewport.left, body_top, viewport.right, body_top + 42.);
+                let retry = Area::new(
+                    banner.right - 72.,
+                    banner.middle() - 13.,
+                    banner.right - 12.,
+                    banner.middle() + 13.,
+                );
+                body_top = banner.bottom + 8.;
+                (banner, retry)
+            });
+            let (group, state_button) = if view.items.is_empty() {
+                let group = Area::new(viewport.left, body_top, viewport.right, body_top + 84.);
+                let state_button = (view.busy != Some(Action::BrowseMarket)
+                    && (!view.loaded || view.error.is_some()))
+                .then(|| {
+                    let btn = Area::new(
+                        group.right - 92.,
+                        group.middle() - 14.,
+                        group.right - 16.,
+                        group.middle() + 14.,
+                    );
+                    let label = if view.error.is_some() {
+                        "重试"
+                    } else {
+                        "浏览"
+                    };
+                    (btn, label)
+                });
+                (group, state_button)
+            } else {
+                let group = Area::new(
+                    viewport.left,
+                    body_top,
+                    viewport.right,
+                    body_top + MARKET_ROW * view.items.len() as f32,
+                );
+                (group, None)
+            };
+            let section = MarketSection {
+                header,
+                source_label,
+                error_banner,
+                group,
+                state_button,
+                view: view.clone(),
+            };
+            for i in 0..view.items.len() {
+                stops.push(PluginStop {
+                    kind: PluginFocus::MarketItem(i),
+                    scroll_area: section.row(i),
+                    ring_area: section.button(i),
+                    enabled: section.action(i).is_some(),
+                });
+            }
+            cur = group.bottom;
+            section
+        });
+
+        (
+            Self {
+                tab,
+                tabs_track,
+                tabs,
+                refresh_button,
+                refresh_label,
+                refresh_action,
+                installed,
+                market,
+                stops,
+                view: view.clone(),
+            },
+            cur,
+        )
+    }
+
+    fn shift(&mut self, scroll: f32) {
+        let move_y = |a: &mut Area| {
+            a.top -= scroll;
+            a.bottom -= scroll;
+        };
+        move_y(&mut self.tabs_track);
+        for (area, _) in &mut self.tabs {
+            move_y(area);
+        }
+        move_y(&mut self.refresh_button);
+        if let Some(installed) = &mut self.installed {
+            move_y(&mut installed.header);
+            move_y(&mut installed.group);
+            if let Some(btn) = &mut installed.empty_button {
+                move_y(btn);
+            }
+            for row in &mut installed.rows {
+                move_y(&mut row.area);
+                if let Some((btn, _)) = &mut row.update_button {
+                    move_y(btn);
+                }
+                if let Some(btn) = &mut row.remove_button {
+                    move_y(btn);
+                }
+            }
+        }
+        if let Some(market) = &mut self.market {
+            move_y(&mut market.header);
+            if let Some((banner, retry)) = &mut market.error_banner {
+                move_y(banner);
+                move_y(retry);
+            }
+            move_y(&mut market.group);
+            if let Some((btn, _)) = &mut market.state_button {
+                move_y(btn);
+            }
+        }
+        for stop in &mut self.stops {
+            move_y(&mut stop.scroll_area);
+            move_y(&mut stop.ring_area);
+        }
+    }
+
+    fn hit(&self, x: f32, y: f32) -> Option<Action> {
+        if let Some(&(_, tab)) = self.tabs.iter().find(|(a, _)| a.contains(x, y)) {
+            return Some(Action::PluginTab(tab));
+        }
+        if self.refresh_button.contains(x, y) {
+            return self.refresh_action;
+        }
+        if let Some(installed) = &self.installed {
+            if let Some(btn) = installed.empty_button
+                && btn.contains(x, y)
+            {
+                return Some(Action::PluginTab(PluginTab::Market));
+            }
+            if installed.group.contains(x, y)
+                && let Some(row) = installed.rows.iter().find(|r| r.area.contains(x, y))
+            {
+                if let Some((btn, market_idx)) = row.update_button
+                    && btn.contains(x, y)
+                {
+                    return self
+                        .view
+                        .busy
+                        .is_none()
+                        .then_some(Action::InstallPlugin(market_idx));
+                }
+                if let Some(btn) = row.remove_button
+                    && btn.contains(x, y)
+                {
+                    return row.remove_action;
+                }
+                return None;
+            }
+        }
+        if let Some(market) = &self.market {
+            if let Some((_, retry)) = market.error_banner
+                && retry.contains(x, y)
+            {
+                return self.refresh_action;
+            }
+            if let Some((btn, _)) = market.state_button
+                && btn.contains(x, y)
+            {
+                return self.refresh_action;
+            }
+            if !self.view.items.is_empty() && market.group.contains(x, y) {
+                let index = ((y - market.group.top) / MARKET_ROW) as usize;
+                return market
+                    .button(index)
+                    .contains(x, y)
+                    .then(|| market.action(index))
+                    .flatten();
+            }
+        }
+        None
+    }
+
+    fn key(&self, stop_index: usize, nav: Nav) -> Option<Action> {
+        let stop = self.stops.get(stop_index).filter(|s| s.enabled)?;
+        match stop.kind {
+            PluginFocus::Tabs => match nav {
+                Nav::Decrease => Some(Action::PluginTab(self.tab.step(-1))),
+                Nav::Increase | Nav::Activate => Some(Action::PluginTab(self.tab.step(1))),
+                _ => None,
+            },
+            PluginFocus::Refresh => (nav == Nav::Activate)
+                .then_some(self.refresh_action)
+                .flatten(),
+            PluginFocus::EmptyBrowseMarket => {
+                (nav == Nav::Activate).then_some(Action::PluginTab(PluginTab::Market))
+            }
+            PluginFocus::InstalledUpdate(market_idx) => (nav == Nav::Activate
+                && self.view.busy.is_none())
+            .then_some(Action::InstallPlugin(market_idx)),
+            PluginFocus::InstalledRemove(index) => (nav == Nav::Activate
+                && self.view.busy.is_none())
+            .then_some(Action::RemovePlugin(index)),
+            PluginFocus::MarketItem(index) => (nav == Nav::Activate)
+                .then(|| self.market.as_ref()?.action(index))
+                .flatten(),
         }
     }
 }
@@ -286,7 +792,7 @@ pub struct Row {
     pub key: Key,
     pub enabled: bool,
     pub label: &'static str,
-    pub help: &'static str,
+    pub help: Cow<'static, str>,
     /// The card behind the row, already moved by the scroll offset.
     pub card: Area,
     pub part: Part,
@@ -328,6 +834,7 @@ pub struct PanelState {
     pub slider_preview: Option<(Key, i32)>,
     /// Keyboard highlight while the Dock mode selector is open.
     pub mode_highlight: Option<usize>,
+    pub plugin_tab: PluginTab,
 }
 
 impl PanelState {
@@ -337,6 +844,16 @@ impl PanelState {
                 page,
                 ..Self::default()
             };
+        }
+    }
+
+    pub fn set_plugin_tab(&mut self, tab: PluginTab) {
+        if self.plugin_tab != tab {
+            self.plugin_tab = tab;
+            self.scroll = 0.;
+            if self.focus.is_some_and(|i| i > 1) {
+                self.focus = None;
+            }
         }
     }
 
@@ -385,18 +902,15 @@ impl PanelState {
                     .find(|&i| focusable(i))?;
                 self.focus = Some(next);
                 // Bring the focused card fully into view.
-                let card = layout.rows.get(next).map(|r| r.card).or_else(|| {
-                    let market = layout.market.as_ref()?;
-                    let i = next.checked_sub(layout.rows.len())?;
-                    (i < market.len()).then(|| market.row(i))
-                })?;
-                let view = layout.view;
-                if card.top < view.top {
-                    self.scroll -= view.top - card.top;
-                } else if card.bottom > view.bottom {
-                    self.scroll += card.bottom - view.bottom;
+                if let Some(card) = layout.focus_area(next) {
+                    let view = layout.view;
+                    if card.top < view.top {
+                        self.scroll -= view.top - card.top;
+                    } else if card.bottom > view.bottom {
+                        self.scroll += card.bottom - view.bottom;
+                    }
+                    self.scroll = self.scroll.clamp(0., layout.max_scroll);
                 }
-                self.scroll = self.scroll.clamp(0., layout.max_scroll);
                 None
             }
             Nav::Decrease | Nav::Increase | Nav::Activate => {
@@ -413,12 +927,10 @@ impl PanelState {
                 }
                 let Some(row) = layout.rows.get(focused?) else {
                     let index = focused? - layout.rows.len();
-                    if let Some(market) = &layout.market
-                        && index < market.len()
+                    if let Some(plugins) = &layout.plugins
+                        && index < plugins.stops.len()
                     {
-                        return (nav == Nav::Activate)
-                            .then(|| market.action(index))
-                            .flatten();
+                        return plugins.key(index, nav);
                     }
                     return (nav == Nav::Activate).then_some(
                         layout
@@ -467,12 +979,14 @@ pub struct PanelLayout {
     /// Content scrolls inside this area and is clipped to it.
     pub view: Area,
     pub rows: Vec<Row>,
-    pub market: Option<MarketList>,
+    pub plugins: Option<PluginsPage>,
     pub groups: Vec<Area>,
     pub footer_button: Area,
     pub about: Option<AboutPage>,
     pub footer_link: Option<(Area, &'static str, Action)>,
     pub max_scroll: f32,
+    pub scrolled_top: bool,
+    pub scrolled_bottom: bool,
     pub scroll_thumb: Option<Area>,
     pub focus: Option<usize>,
     pub hover: Option<Action>,
@@ -516,7 +1030,23 @@ impl PanelLayout {
     }
 
     pub fn footer_focus(&self) -> usize {
-        self.rows.len() + self.market.as_ref().map_or(0, MarketList::len)
+        self.rows.len() + self.plugins.as_ref().map_or(0, |p| p.stops.len())
+    }
+
+    pub fn focus_ring(&self) -> Option<(PluginFocus, Area)> {
+        let plugins = self.plugins.as_ref()?;
+        let index = self.focus?.checked_sub(self.rows.len())?;
+        let stop = plugins.stops.get(index).filter(|s| s.enabled)?;
+        Some((stop.kind, stop.ring_area))
+    }
+
+    fn focus_area(&self, index: usize) -> Option<Area> {
+        if let Some(row) = self.rows.get(index) {
+            return Some(row.card);
+        }
+        let plugins = self.plugins.as_ref()?;
+        let i = index.checked_sub(self.rows.len())?;
+        plugins.stops.get(i).map(|s| s.scroll_area)
     }
 
     fn focusable(&self, index: usize) -> bool {
@@ -524,10 +1054,10 @@ impl PanelLayout {
             return row.enabled;
         }
         let i = index - self.rows.len();
-        if let Some(market) = &self.market
-            && i < market.len()
+        if let Some(plugins) = &self.plugins
+            && let Some(stop) = plugins.stops.get(i)
         {
-            return market.action(i).is_some();
+            return stop.enabled;
         }
         index < self.focus_count()
     }
@@ -603,6 +1133,7 @@ impl PanelLayout {
                 top += GROUP_GAP;
             }
             let height = match spec.key {
+                Key::DesktopCards => PLUGIN_HERO_CARD,
                 Key::Appearance(_) if matches!(spec.control, Control::Slider { .. }) => 70.,
                 Key::Theme => 122.,
                 Key::TopBarBackground => 144.,
@@ -620,21 +1151,19 @@ impl PanelLayout {
             rows.push((spec, detail, card));
             top = card.bottom;
         }
-        let market = (section == Section::Plugins).then(|| {
-            let start = top + GROUP_GAP;
-            top = start + (1 + market_view.items.len()) as f32 * CARD;
-            MarketList {
-                area: Area::new(view.left, start, view.right, top),
-                view: market_view.clone(),
-            }
+        let plugins = (section == Section::Plugins).then(|| {
+            let (page, end_top) = PluginsPage::build(view, top, state.plugin_tab, market_view);
+            top = end_top;
+            page
         });
         let content = top - view.top;
         let max_scroll = (content - (view.bottom - view.top)).max(0.);
         state.scroll = state.scroll.clamp(0., max_scroll);
-        let market = market.map(|mut list| {
-            list.area.top -= state.scroll;
-            list.area.bottom -= state.scroll;
-            list
+        let scrolled_top = state.scroll > 0.5;
+        let scrolled_bottom = state.scroll + 0.5 < max_scroll;
+        let plugins = plugins.map(|mut page| {
+            page.shift(state.scroll);
+            page
         });
         let scroll_thumb = (max_scroll > 0.).then(|| {
             let track = view.bottom - view.top;
@@ -663,7 +1192,7 @@ impl PanelLayout {
                     },
                     label: spec.label,
                     help: if spec.key == Key::DockDisplayMode {
-                        match settings.dock_display_mode() {
+                        Cow::Borrowed(match settings.dock_display_mode() {
                             DockDisplayMode::Default => spec.help,
                             DockDisplayMode::Overlay => "允许其他窗口遮挡 Dock",
                             DockDisplayMode::AutoHide => "移开收起，停在主屏底边任意位置唤出",
@@ -672,9 +1201,11 @@ impl PanelLayout {
                             DockDisplayMode::Hotkey => "Ctrl+Alt+D 显示或隐藏 Dock",
                             DockDisplayMode::AlwaysIncludingFullscreen => "全屏时也保持置顶",
                             DockDisplayMode::Desktop => "仅在桌面处于前台时显示",
-                        }
+                        })
+                    } else if spec.key == Key::DesktopCards {
+                        desktop_cards_help(value != 0, market_view)
                     } else {
-                        spec.help
+                        Cow::Borrowed(spec.help)
                     },
                     card,
                     part: part(spec, value, card),
@@ -709,7 +1240,7 @@ impl PanelLayout {
             title: Area::new(view.left, 0., view.right, CAPTION),
             view,
             rows,
-            market,
+            plugins,
             groups,
             footer_link: match section {
                 Section::General => Some(("屏幕刷新率…", DISPLAY_SETTINGS)),
@@ -737,6 +1268,8 @@ impl PanelLayout {
                 reset_top + CONTROL_HEIGHT,
             ),
             max_scroll,
+            scrolled_top,
+            scrolled_bottom,
             scroll_thumb,
             focus: state.focus,
             hover: state.hover,
@@ -853,15 +1386,10 @@ impl PanelLayout {
         if !self.view.contains(x, y) {
             return None;
         }
-        if let Some(market) = &self.market
-            && market.area.contains(x, y)
+        if let Some(plugins) = &self.plugins
+            && let Some(action) = plugins.hit(x, y)
         {
-            let index = ((y - market.area.top) / CARD) as usize;
-            return market
-                .button(index)
-                .contains(x, y)
-                .then(|| market.action(index))
-                .flatten();
+            return Some(action);
         }
         let row = self.rows.iter().find(|row| row.card.contains(x, y))?;
         if !row.enabled {
@@ -1054,6 +1582,40 @@ fn part(spec: &settings::Spec, value: i32, card: Area) -> Part {
     }
 }
 
+fn desktop_cards_help(enabled: bool, view: &MarketView) -> Cow<'static, str> {
+    let count = view.installed.len();
+    let cards: usize = view.installed.iter().map(|item| item.cards).sum();
+    let errors = view
+        .installed
+        .iter()
+        .filter(|item| item.health == InstalledHealth::Error)
+        .count();
+    let setup = view
+        .installed
+        .iter()
+        .filter(|item| item.health == InstalledHealth::Setup)
+        .count();
+    if !enabled {
+        if count == 0 {
+            Cow::Borrowed("已暂停 · 开启后在主屏右侧显示插件卡片")
+        } else {
+            Cow::Owned(format!(
+                "已暂停 · 已保留 {count} 款本地插件（共 {cards} 张卡片）"
+            ))
+        }
+    } else if errors > 0 {
+        Cow::Owned(format!("已安装 {count} 款插件 · {errors} 款存在异常"))
+    } else if setup > 0 {
+        Cow::Owned(format!("共 {cards} 张卡片 · {setup} 款插件等待配置"))
+    } else if count > 0 && cards > 0 {
+        Cow::Owned(format!("正在展示 {count} 款插件发布的 {cards} 张卡片"))
+    } else if count > 0 {
+        Cow::Owned(format!("已安装 {count} 款插件 · 当前未发布可见卡片"))
+    } else {
+        Cow::Borrowed("在主屏桌面显示各插件发布的卡片")
+    }
+}
+
 /// Where the row's label and help text go: from the card's left edge to its control.
 pub fn text_area(row: &Row) -> Area {
     let control_left = match &row.part {
@@ -1066,6 +1628,8 @@ pub fn text_area(row: &Row) -> Area {
         row.card.left
             + if row.detail.is_some() {
                 MONITOR_INSET
+            } else if row.key == Key::DesktopCards {
+                62.
             } else {
                 CONTROL_INSET
             },
@@ -1183,9 +1747,14 @@ mod tests {
                 if let Some((button, _, action)) = layout.footer_link {
                     let (x, y) = center(button, s);
                     assert_eq!(layout.hit(x, y), Some(action));
-                    if let Some(market) = &layout.market {
-                        let (x, y) = center(market.button(0), s);
+                    if let Some(plugins) = &layout.plugins {
+                        let (x, y) = center(plugins.refresh_button, s);
                         assert_eq!(layout.hit(x, y), Some(Action::BrowseMarket));
+                        state.key(Nav::Next, &layout);
+                        assert_eq!(
+                            state.key(Nav::Increase, &layout),
+                            Some(Action::PluginTab(PluginTab::Market))
+                        );
                         state.key(Nav::Next, &layout);
                         assert_eq!(
                             state.key(Nav::Activate, &layout),
@@ -1212,12 +1781,32 @@ mod tests {
             ..Default::default()
         };
         let mut market = MarketView {
+            installed: vec![InstalledItem {
+                id: "local-card".into(),
+                title: "本地卡片".into(),
+                version: Some("1.0.0".into()),
+                market_update: Some((0, "1.2.0".into())),
+                summary: "1 张卡片 · 今日待办".into(),
+                cards: 1,
+                health: InstalledHealth::Ready,
+                removable: true,
+            }]
+            .into(),
             loaded: true,
             items: (0..18)
                 .map(|i| MarketItem {
-                    title: format!("插件 {i}"),
-                    description: String::new(),
-                    installed: i == 7,
+                    id: format!("plugin-{i}"),
+                    name: format!("插件 {i}"),
+                    version: "1.2.0".into(),
+                    installed_version: (i == 0 || i == 7).then(|| "1.0.0".into()),
+                    description: "示例卡片描述".into(),
+                    state: if i == 0 {
+                        MarketState::Update
+                    } else if i == 7 {
+                        MarketState::Installed
+                    } else {
+                        MarketState::Install
+                    },
                 })
                 .collect(),
             ..Default::default()
@@ -1226,7 +1815,10 @@ mod tests {
         let mut layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
         for expected in [
             Action::Change(Key::DesktopCards, Adjust::Toggle),
+            Action::PluginTab(PluginTab::Market),
             Action::BrowseMarket,
+            Action::InstallPlugin(0),
+            Action::RemovePlugin(0),
         ]
         .into_iter()
         .chain((0..18).filter(|i| *i != 7).map(Action::InstallPlugin))
@@ -1234,19 +1826,74 @@ mod tests {
             state.key(Nav::Next, &layout);
             layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
             assert_eq!(state.key(Nav::Activate, &layout), Some(expected));
-            if let Action::InstallPlugin(index) = expected {
-                let button = layout.market.as_ref().unwrap().button(index + 1);
+            if let Action::InstallPlugin(index) = expected
+                && state.focus.unwrap() > 4
+            {
+                let button = layout
+                    .plugins
+                    .as_ref()
+                    .unwrap()
+                    .market
+                    .as_ref()
+                    .unwrap()
+                    .button(index);
                 let (x, y) = center(button, layout.scale);
                 assert_eq!(layout.hit(x, y), Some(expected));
             }
         }
         market.busy = Some(Action::InstallPlugin(17));
         layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
-        let list = layout.market.as_ref().unwrap();
-        assert_eq!(list.labels(18).2, "安装中…");
-        let (x, y) = center(list.button(18), layout.scale);
+        let section = layout.plugins.as_ref().unwrap().market.as_ref().unwrap();
+        assert_eq!(section.button_label(17), "安装中…");
+        let (x, y) = center(section.button(17), layout.scale);
         assert_eq!(layout.hit(x, y), None);
         assert_eq!(state.key(Nav::Activate, &layout), None);
+
+        // Switching to the Installed tab preserves tab-bar keyboard focus and isolates installed items.
+        state.focus = Some(1);
+        state.set_plugin_tab(PluginTab::Installed);
+        assert_eq!(state.focus, Some(1));
+        market.busy = None;
+        layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &market);
+        let pages = layout.plugins.as_ref().unwrap();
+        assert!(pages.installed.is_some() && pages.market.is_none());
+        let remove = pages.installed.as_ref().unwrap().rows[0]
+            .remove_button
+            .unwrap();
+        let (x, y) = center(remove, layout.scale);
+        assert_eq!(layout.hit(x, y), Some(Action::RemovePlugin(0)));
+
+        // An empty Installed tab offers a direct jump to the Market tab, and inline errors retry.
+        let empty_error = MarketView {
+            error: Some("网络连接超时".into()),
+            ..Default::default()
+        };
+        layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &empty_error);
+        let cta = layout
+            .plugins
+            .as_ref()
+            .unwrap()
+            .installed
+            .as_ref()
+            .unwrap()
+            .empty_button
+            .unwrap();
+        let (x, y) = center(cta, layout.scale);
+        assert_eq!(layout.hit(x, y), Some(Action::PluginTab(PluginTab::Market)));
+        state.set_plugin_tab(PluginTab::Market);
+        layout = PanelLayout::with_market(&mut state, &settings, 144, work(510), &empty_error);
+        let (retry, label) = layout
+            .plugins
+            .as_ref()
+            .unwrap()
+            .market
+            .as_ref()
+            .unwrap()
+            .state_button
+            .unwrap();
+        assert_eq!(label, "重试");
+        let (x, y) = center(retry, layout.scale);
+        assert_eq!(layout.hit(x, y), Some(Action::BrowseMarket));
     }
 
     #[test]
