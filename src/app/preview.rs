@@ -452,7 +452,7 @@ impl Bars {
                     }
                 }
                 self.set_hover(None)?;
-                self.check_dock_pointer(true)?;
+                self.check_dock_pointer(false)?;
             }
             PreviewEvent::Press(x, y) => {
                 self.cancel_preview_grace();

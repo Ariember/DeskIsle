@@ -4,7 +4,33 @@ use crate::platform;
 use crate::settings::Key;
 use crate::visibility::{DockContext, DockDisplayMode, DockPolicy};
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::POINT;
 use windows::core::Result;
+
+const EDGE_POINTER_POLL_MS: u32 = 80;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PointerWatch {
+    TrackLeave,
+    Poll,
+    Collapse,
+}
+
+impl PointerWatch {
+    fn at(window: Rect, edge: Rect, point: POINT, over_dock: bool) -> Self {
+        if window.contains(point.x, point.y) {
+            if over_dock {
+                Self::TrackLeave
+            } else {
+                Self::Poll
+            }
+        } else if edge.contains(point.x, point.y) {
+            Self::Poll
+        } else {
+            Self::Collapse
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DockExposure {
@@ -159,40 +185,86 @@ impl Bars {
         Ok(())
     }
 
-    pub(super) fn check_dock_pointer(&mut self, window_leave: bool) -> Result<()> {
-        if self.dock_policy != DockPolicy::EdgeReveal
-            || self.dock_press.is_some()
-            || self.preview_pressed()
-        {
+    pub(super) fn check_dock_pointer(&mut self, dock_leave: bool) -> Result<()> {
+        if self.dock_policy != DockPolicy::EdgeReveal {
+            if dock_leave {
+                self.leave_dock()?;
+            }
             return Ok(());
         }
-        if self.dock_exposure.collapsed() && window_leave {
+        if self.dock_exposure.collapsed() && dock_leave {
             return self.hide_idle_dock();
         }
         let point = platform::cursor()?;
-        if self.preview_holds_dock(point) {
+        let window = self.dock_window_rect();
+        let inside = window.contains(point.x, point.y);
+        if self.dock_exposure.collapsed() && inside {
             return Ok(());
         }
-        let inside = self.dock_window_rect().contains(point.x, point.y);
-        if !inside
-            && self
-                .layout
-                .reveal_edge(self.settings.dock_display_mode())
-                .contains(point.x, point.y)
-        {
-            // After a corner reveal the pointer is outside the resized HWND. Check
-            // for departure only while it stays on this uncovered part of the edge.
-            self.bottom.time_dock_edge(80)?;
-        } else if !inside || window_leave {
-            self.hide_idle_dock()?;
+        // A leave queued during resize or glass capture can arrive after the pointer
+        // is back over the Dock. Keep the hover and any pending click in that case.
+        if dock_leave && !inside {
+            self.leave_dock()?;
         }
-        Ok(())
+        if self.dock_press.is_some() || self.preview_holds_dock(point) {
+            return Ok(());
+        }
+        let edge = self.layout.reveal_edge(self.settings.dock_display_mode());
+        match PointerWatch::at(
+            window,
+            edge,
+            point,
+            self.bottom.contains_screen_point(point.x, point.y),
+        ) {
+            PointerWatch::TrackLeave => platform::track_leave(self.bottom.0),
+            PointerWatch::Poll => self.bottom.time_dock_edge(EDGE_POINTER_POLL_MS),
+            PointerWatch::Collapse => self.hide_idle_dock(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::layout::{DockHit, DockStyle, Layout};
+
+    #[test]
+    fn revealed_dock_stays_open_from_edge_to_icon_until_pointer_leaves() {
+        let work = Rect {
+            x: -1280,
+            y: 40,
+            width: 1280,
+            height: 920,
+        };
+        let layout = Layout::new(work, 144, [DockHit::App(0)], 0, DockStyle::default());
+        let window = layout.revealed_window();
+        let icon = layout.slots[1].rect;
+        let x = window.x + icon.x + icon.width / 2;
+        let icon_y = window.y + icon.y + icon.height / 2;
+        for mode in [DockDisplayMode::AutoHide, DockDisplayMode::SmartHide] {
+            let edge = layout.reveal_edge(mode);
+            let watch = |x, y, over_dock| PointerWatch::at(window, edge, POINT { x, y }, over_dock);
+            // A temporary loss of the HWND under a stationary pointer must not collapse it.
+            assert_eq!(watch(x, edge.y, false), PointerWatch::Poll);
+            for y in (icon_y..=edge.y).rev() {
+                assert_eq!(watch(x, y, true), PointerWatch::TrackLeave);
+            }
+            assert_eq!(
+                layout.hit(x - window.x, icon_y - window.y),
+                Some(DockHit::App(0))
+            );
+            assert_eq!(watch(x, window.y - 1, false), PointerWatch::Collapse);
+            let corner = watch(work.x, edge.y, false);
+            assert_eq!(
+                corner,
+                if mode == DockDisplayMode::AutoHide {
+                    PointerWatch::Poll
+                } else {
+                    PointerWatch::Collapse
+                }
+            );
+        }
+    }
 
     #[test]
     fn revealing_requires_one_continuous_dwell() {

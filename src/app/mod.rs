@@ -424,10 +424,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.cancel_close_press();
                 bars.cancel_tray_drag();
             }
-            Event::Leave(hwnd) if hwnd == bars.bottom.0 => {
-                bars.leave_dock()?;
-                bars.check_dock_pointer(true)?;
-            }
+            Event::Leave(hwnd) if hwnd == bars.bottom.0 => bars.check_dock_pointer(true)?,
             Event::Leave(hwnd) if hwnd == bars.top.0 => bars.set_top_hover(None)?,
             Event::Scroll(owner, delta, x, y) if owner == bars.top.0 => {
                 bars.scroll_status(delta, x, y)?;
