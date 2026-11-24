@@ -519,6 +519,12 @@ impl Renderer {
         self.bottom_size = None;
     }
 
+    pub fn invalidate_dock_scene(&mut self) {
+        if let Some(surface) = &mut self.bottom_glass {
+            surface.invalidate_scene();
+        }
+    }
+
     /// Invalidates painted layers when their colors or text settings change.
     pub fn set_appearance(&mut self, dark: bool, settings: &Settings) -> bool {
         self.top_background = settings.top_bar_background();
@@ -1074,7 +1080,7 @@ impl Renderer {
         if let (Some(engine), Some(surface)) = (&self.glass, &mut self.bottom_glass) {
             dock_glass_active = dock_strength > 0
                 && surface
-                    .update(
+                    .update_behind(
                         engine,
                         glass::GlassSpec {
                             x: 0.,

@@ -172,6 +172,13 @@ impl WindowEvents {
         let mut hooks = Vec::new();
         for (first, last, flags) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0),
+            // The final position matters to the glass even if the foreground window
+            // intersected the Dock throughout the entire drag.
+            (
+                EVENT_SYSTEM_MOVESIZEEND,
+                EVENT_SYSTEM_MOVESIZEEND,
+                WINEVENT_SKIPOWNPROCESS,
+            ),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, 0),
             (
                 EVENT_OBJECT_DESTROY,
@@ -217,11 +224,10 @@ impl WindowEvents {
     }
 
     /// Compare against the expanded Dock even while its window is at the reveal edge.
-    pub fn watch_dock_overlap(&self, rect: Option<Rect>) -> bool {
-        let watched =
-            rect.map(|bounds| (bounds, super::window_overlaps(super::foreground(), bounds)));
-        DOCK_OVERLAP.set(watched);
-        watched.is_some_and(|(_, overlaps)| overlaps)
+    pub fn watch_dock_overlap(&self, rect: Rect) -> bool {
+        let overlaps = super::overlapping_window_frame(super::foreground(), rect).is_some();
+        DOCK_OVERLAP.set(Some((rect, overlaps)));
+        overlaps
     }
 }
 
@@ -253,7 +259,7 @@ unsafe extern "system" fn window_event(
         }
         let maximized = super::maximized_on_primary(hwnd).then_some(hwnd);
         let overlap_changed = DOCK_OVERLAP.get().is_some_and(|(dock, previous)| {
-            let overlaps = super::window_overlaps(hwnd, dock);
+            let overlaps = super::overlapping_window_frame(hwnd, dock).is_some();
             DOCK_OVERLAP.set(Some((dock, overlaps)));
             overlaps != previous
         });

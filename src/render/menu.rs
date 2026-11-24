@@ -41,7 +41,7 @@ const HOVER_DURATION: f32 = 0.09;
 /// The open context menu. Its surfaces are painted once; pointer movement only animates
 /// the highlight's offset and opacity in the compositor.
 pub(super) struct MenuView {
-    _glass: Option<super::glass::GlassSurface>,
+    glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     _root: IDCompositionVisual2,
@@ -131,6 +131,9 @@ impl Renderer {
         animate: bool,
         backdrop: Option<&Backdrop>,
     ) -> Result<()> {
+        // A flyout rebuild reuses its HWND and the sampled rim. Content-only updates
+        // should not cloak a visible window to take the same sample again.
+        let previous_glass = self.menu.as_mut().and_then(|view| view.glass.take());
         self.close_menu();
         let (width, height) = layout.pixels();
         let (left, top, right, bottom) = layout.panel();
@@ -158,7 +161,9 @@ impl Renderer {
         let mut glass_surface = None;
         if blur_strength > 0
             && let Some(engine) = &self.glass
-            && let Ok(mut surface) = engine.attach(hwnd)
+            && let Some(mut surface) = previous_glass
+                .filter(|surface| surface.hwnd() == hwnd)
+                .or_else(|| engine.attach(hwnd).ok())
         {
             let spec = super::glass::GlassSpec {
                 x: left * layout.scale,
@@ -169,7 +174,7 @@ impl Renderer {
                 strength: blur_strength,
                 rim: super::glass::rim::DOCK,
             };
-            if surface.update(engine, spec).is_ok() {
+            if surface.update_behind(engine, spec).is_ok() {
                 if animate {
                     let _ = surface.animate_open(engine, width, height, OPEN_DURATION);
                 }
@@ -198,7 +203,7 @@ impl Renderer {
                 && blur_strength > 0
                 && let Some(image) = backdrop
             {
-                c.liquid_backdrop(image, area, MENU_RADIUS, super::glass::rim::DOCK)?;
+                c.liquid_bevel(image, area, MENU_RADIUS, super::glass::rim::DOCK)?;
             }
             c.liquid_glass_shell(
                 area,
@@ -298,7 +303,7 @@ impl Renderer {
             target.SetRoot(&root)?;
             self.device.Commit()?;
             self.menu = Some(MenuView {
-                _glass: glass_surface,
+                glass: glass_surface,
                 _target: target,
                 _root: root,
                 content,

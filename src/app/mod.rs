@@ -63,6 +63,7 @@ struct Bars {
     pins: Vec<Pin>,
     apps: Vec<AppGroup>,
     foreground: Option<isize>,
+    dock_foreground_frame: Option<Rect>,
     maximized_window: Option<isize>,
     top_window_color: Option<u32>,
     /// Only close the window whose corner button received the original press.
@@ -242,6 +243,10 @@ pub(crate) fn run() -> Result<()> {
         pins,
         apps,
         foreground,
+        dock_foreground_frame: platform::overlapping_window_frame(
+            platform::foreground(),
+            layout.bottom,
+        ),
         maximized_window: None,
         top_window_color: None,
         close_press: None,
@@ -357,6 +362,9 @@ pub(crate) fn run() -> Result<()> {
             Event::DockShortcut if bars.dock_shortcut.is_some() && !bars.fullscreen => {
                 bars.dock_hotkey_shown = !bars.dock_hotkey_shown;
                 bars.sync_dock_visibility(false)?;
+                if bars.dock_shown() {
+                    bars.draw()?;
+                }
             }
             Event::DockEdgeTimer if matches!(bars.dock_exposure, DockExposure::Waiting(_)) => {
                 bars.hover_dock_edge(true)?;
@@ -643,7 +651,15 @@ impl Bars {
             }
         }
         self.monitor = settings::primary_monitor(&self.settings)?;
-        (self.apps, self.foreground) = applications(&self.pins)?;
+        let (apps, foreground) = applications(&self.pins)?;
+        // Display and desktop-setting notifications can change the wallpaper under the
+        // Dock even if the foreground window and its bounds are unchanged.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.invalidate_dock_scene();
+        }
+        self.dock_foreground_frame =
+            platform::overlapping_window_frame(platform::foreground(), self.layout.bottom);
+        (self.apps, self.foreground) = (apps, foreground);
         self.refresh_top_window(true);
         self.restatus();
         if !self.relayout(self.layout.first)? {
@@ -842,9 +858,33 @@ impl Bars {
         self.draw()
     }
 
+    fn refresh_dock_scene(&mut self, apps: &[AppGroup], foreground: Option<isize>) {
+        fn foreground_title(apps: &[AppGroup], foreground: Option<isize>) -> Option<&str> {
+            let id = foreground?;
+            apps.iter()
+                .flat_map(|app| &app.windows)
+                .find(|window| window.id == id)
+                .map(|window| window.title.as_str())
+        }
+
+        let frame = platform::overlapping_window_frame(platform::foreground(), self.layout.bottom);
+        // A title change can be a new browser tab or document in the same window.
+        if (self.foreground != foreground
+            || frame != self.dock_foreground_frame
+            || (frame.is_some()
+                && foreground_title(&self.apps, self.foreground)
+                    != foreground_title(apps, foreground)))
+            && let Some(renderer) = self.renderer.as_mut()
+        {
+            renderer.invalidate_dock_scene();
+        }
+        self.dock_foreground_frame = frame;
+    }
+
     fn refresh(&mut self) -> Result<()> {
         let (apps, foreground) = applications(&self.pins)?;
         let foreground_changed = self.foreground != foreground;
+        self.refresh_dock_scene(&apps, foreground);
         self.foreground = foreground;
         if self.apps != apps
             || !self
@@ -926,6 +966,7 @@ impl Bars {
         self.sync_dock_label()?;
         let (preview, dock_hover) = self.dock_preview();
         let dropping = self.dropping_on_launchpad();
+        let dock_shown = self.dock_shown();
         let renderer = self.renderer.as_mut().expect("renderer bound to bars");
         renderer.check_device()?;
         let dpi = self.monitor.dpi;
@@ -980,6 +1021,9 @@ impl Bars {
             self.top_glass,
             self.top_window_color,
         )?;
+        if !dock_shown {
+            return Ok(());
+        }
         let (slots, scale) = preview
             .as_ref()
             .map_or((&self.layout.slots, 1.), |preview| {

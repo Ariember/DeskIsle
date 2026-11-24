@@ -98,10 +98,7 @@ impl Bars {
 
     pub(super) fn sync_dock_visibility(&mut self, reposition: bool) -> Result<()> {
         let mode = self.settings.dock_display_mode();
-        let smart = mode == DockDisplayMode::SmartHide;
-        let overlaps = self
-            .events
-            .watch_dock_overlap(smart.then_some(self.layout.bottom));
+        let overlaps = self.events.watch_dock_overlap(self.layout.bottom);
         let policy = mode.policy(DockContext {
             fullscreen: self.fullscreen,
             desktop: mode == DockDisplayMode::Desktop && platform::foreground_is_desktop(),
@@ -145,6 +142,9 @@ impl Bars {
         let next = self.dock_exposure.enter_edge(Instant::now(), delay);
         if next != self.dock_exposure || timer {
             self.set_dock_exposure(next, false)?;
+            if self.dock_shown() {
+                self.draw()?;
+            }
         }
         Ok(())
     }

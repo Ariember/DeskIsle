@@ -143,6 +143,16 @@ fn sd(px: f32, py: f32, bx: f32, by: f32, r: f32) -> f32 {
 
 /// Renders `card` over `scene` into a premultiplied BGRA image of `width` x `height`.
 pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<u8> {
+    render_card(scene, width, height, card, false)
+}
+
+/// Renders the curved glass edge over a live desktop. The flat body is transparent
+/// so changes in the windows underneath show through between bevel samples.
+pub(super) fn render_bevel(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<u8> {
+    render_card(scene, width, height, card, true)
+}
+
+fn render_card(scene: &Scene, width: u32, height: u32, card: Card, bevel_only: bool) -> Vec<u8> {
     let mut out = vec![0u8; width as usize * height as usize * 4];
     if !scene.valid() || width == 0 || height == 0 {
         return out;
@@ -160,8 +170,14 @@ pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<
                 for (row, line) in chunk.chunks_exact_mut(width as usize * 4).enumerate() {
                     let y = (index * band + row) as u32;
                     for (x, px) in line.chunks_exact_mut(4).enumerate() {
-                        let [r, g, b, a] =
-                            shade(scene, card, ambient, x as f32 + 0.5, y as f32 + 0.5);
+                        let [r, g, b, a] = shade(
+                            scene,
+                            card,
+                            ambient,
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                            bevel_only,
+                        );
                         let byte = |v: f32| (v.clamp(0., 1.) * 255. + 0.5) as u8;
                         px.copy_from_slice(&[byte(b), byte(g), byte(r), byte(a)]);
                     }
@@ -173,17 +189,30 @@ pub(super) fn render(scene: &Scene, width: u32, height: u32, card: Card) -> Vec<
 }
 
 /// The fragment shader for one pixel centre `(px, py)`; returns premultiplied RGBA.
-fn shade(scene: &Scene, card: Card, ambient: [f32; 3], px: f32, py: f32) -> [f32; 4] {
+fn shade(
+    scene: &Scene,
+    card: Card,
+    ambient: [f32; 3],
+    px: f32,
+    py: f32,
+    bevel_only: bool,
+) -> [f32; 4] {
     let (dx, dy) = (px - card.center_x, py - card.center_y);
     let bx = (card.half_w - 2.).max(0.01);
     let by = (card.half_h - 2.).max(0.01);
     let r = card.radius;
     let dist = sd(dx, dy, bx, by, r);
-    if dist > 8. {
+    let depth = (-dist).max(0.);
+    let bevel = (card.bevel_half_h * 0.46).clamp(10., 30.);
+    if dist > 8. || (bevel_only && (depth >= bevel || dist >= 0.8)) {
         return [0.; 4];
     }
     let mut coverage = 1. - smoothstep(-0.8, 0.8, dist);
-    let original = scene.sample(px, py);
+    if bevel_only {
+        // Keep the highlight and chromatic fringe at full strength, then blend into
+        // the live scene as the surface flattens.
+        coverage *= 1. - smoothstep(3., bevel, depth);
+    }
     let mut result = [0.; 3];
     if dist < 1. {
         let e = 0.7;
@@ -192,8 +221,6 @@ fn shade(scene: &Scene, card: Card, ambient: [f32; 3], px: f32, py: f32) -> [f32
         let gl = (gx * gx + gy * gy).sqrt().max(1e-12);
         let (gx, gy) = (gx / gl, gy / gl);
 
-        let depth = (-dist).max(0.);
-        let bevel = (card.bevel_half_h * 0.46).clamp(10., 30.);
         let rim = (-depth / bevel).exp();
         let t = (depth / bevel).clamp(0., 1.);
         let arc = (1. - (1. - t) * (1. - t)).max(0.).sqrt();
@@ -270,13 +297,35 @@ fn shade(scene: &Scene, card: Card, ambient: [f32; 3], px: f32, py: f32) -> [f32
             - rim * (1. - light) * 0.045;
         result = c.map(|v| v + lift);
     }
+    if bevel_only {
+        return bevel_overlay(scene.sample(px, py), result, coverage);
+    }
     if card.opaque {
-        result = mix3(original, result, coverage);
+        result = mix3(scene.sample(px, py), result, coverage);
         coverage = 1.;
     }
     // WebGL clamps the color on write; the premultiplied output keeps that order.
     let result = result.map(|v| v.clamp(0., 1.) * coverage);
     [result[0], result[1], result[2], coverage]
+}
+
+/// Encodes just the refracted color change in a premultiplied overlay. For each channel,
+/// `source + (1 - alpha) * background = target` with `0 <= source <= alpha`.
+/// The tightest channel sets the least opacity that can reproduce the sampled glass.
+fn bevel_overlay(background: [f32; 3], target: [f32; 3], coverage: f32) -> [f32; 4] {
+    let target = target.map(|v| v.clamp(0., 1.));
+    let mut alpha = 0f32;
+    for (base, desired) in background.into_iter().zip(target) {
+        if desired > base {
+            alpha = alpha.max((desired - base) / (1. - base));
+        } else if desired < base {
+            alpha = alpha.max((base - desired) / base);
+        }
+    }
+    let [r, g, b] = std::array::from_fn(|i| {
+        (target[i] - (1. - alpha) * background[i]).clamp(0., alpha) * coverage
+    });
+    [r, g, b, alpha * coverage]
 }
 
 #[cfg(test)]
@@ -359,5 +408,48 @@ mod tests {
         let brightest = (1..24).map(red).max().unwrap();
         assert!(brightest > 120, "bevel did not refract the band");
         assert!(red(60) < 80, "center={}", red(60));
+
+        let edge = render_bevel(&scene, w, h, card);
+        let pixel = |x: u32| ((40 * w + x) * 4) as usize;
+        for x in [1, 10] {
+            let i = pixel(x);
+            let coverage = 1. - smoothstep(3., 18.4, x as f32 + 0.5);
+            let transmission = 1. - f32::from(edge[i + 3]) / 255.;
+            for channel in 0..3 {
+                let composited = f32::from(edge[i + channel]) + transmission * 40.;
+                let expected = mix(40., f32::from(out[i + channel]), coverage);
+                assert!((composited - expected).abs() <= 1.5);
+                assert!(edge[i + channel] <= edge[i + 3]);
+            }
+        }
+        let center = pixel(60);
+        assert_eq!(edge[center..center + 4], [0; 4]);
+    }
+
+    #[test]
+    fn lit_rim_transmits_an_updated_window_without_resampling() {
+        let (w, h) = (48, 32);
+        let base = [80, 130, 100, 0];
+        let pixels = base.repeat((w * h) as usize);
+        let scene = Scene {
+            width: w,
+            height: h,
+            pixels: &pixels,
+            scale_x: 1.,
+            scale_y: 1.,
+            offset_x: 0.,
+            offset_y: 0.,
+        };
+        let card = Card::filling(0., 0., w as f32, h as f32, 8., 1.);
+        let prism = render(&scene, w, h, card);
+        let edge = render_bevel(&scene, w, h, card);
+        let i = ((w + w / 2) * 4) as usize; // Middle of the lit top edge, 1.5 px in.
+        let transmission = 1. - f32::from(edge[i + 3]) / 255.;
+        for (channel, updated) in [200., 50., 40.].into_iter().enumerate() {
+            let over = |background| f32::from(edge[i + channel]) + transmission * background;
+            let old = over(f32::from(base[channel]));
+            assert!((old - f32::from(prism[i + channel])).abs() <= 1.5);
+            assert!((over(updated) - old).abs() > 20.);
+        }
     }
 }

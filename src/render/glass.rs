@@ -1,5 +1,5 @@
 //! Liquid Glass surfaces modelled on PrismGlass Desktop's classic material. The glass
-//! is clear: it refracts the sharp desktop wallpaper through a curved bevel with RGB
+//! is clear: it refracts the scene behind the surface through a curved bevel with RGB
 //! dispersion, diffuses the body lightly, and adds Fresnel reflection and a lit rim
 //! (`prism.rs`). Live surfaces show the result in a `Windows.UI.Composition` visual
 //! beneath DeskIsle's DirectComposition content; captured backdrops are painted the
@@ -62,7 +62,7 @@ fn ensure_dispatcher_queue() -> Result<()> {
     })
 }
 
-/// Wallpaper beyond the glass that its bevel refracts and reflects, in pixels. The
+/// Scene beyond the glass that its bevel refracts and reflects, in pixels. The
 /// longest PrismGlass ray is the Fresnel reflection at twice the 30 px maximum bevel.
 const SCENE_MARGIN: f32 = 64.;
 /// How far a card continues past a monitor edge it touches, so only its inner edges
@@ -96,13 +96,19 @@ pub(super) struct GlassSpec {
     pub rim: f32,
 }
 
-/// What a live surface last showed: its spec, where it sat and which wallpaper.
+#[derive(Clone, Copy, PartialEq)]
+enum Background {
+    Wallpaper(u64),
+    BehindWindow,
+}
+
+/// Placement and source used to render the current surface.
 #[derive(Clone, Copy, PartialEq)]
 struct Shown {
     spec: GlassSpec,
     origin: (i32, i32),
     monitor: Rect,
-    wallpaper: u64,
+    background: Background,
 }
 
 /// Shared UI-thread `Windows.UI.Composition` host bound to the renderer's Direct2D device.
@@ -248,17 +254,40 @@ pub(super) struct GlassSurface {
 }
 
 impl GlassSurface {
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn hide(&mut self) -> Result<()> {
-        if self.current.take().is_some() {
-            self.frame.SetIsVisible(false)?;
-        }
+        self.frame.SetIsVisible(false)?;
+        self.current = None;
         Ok(())
     }
 
-    /// Shows the glass for `spec`, rendering again only when the surface moved, changed
-    /// shape, or the wallpaper changed since the last call. The window must already be
-    /// at its final position, since the glass refracts the wallpaper beneath it.
+    pub fn invalidate_scene(&mut self) {
+        self.current = None;
+    }
+
     pub fn update(&mut self, engine: &GlassEngine, spec: GlassSpec) -> Result<()> {
+        self.show(
+            engine,
+            spec,
+            Background::Wallpaper(backdrop::wallpaper_stamp()),
+        )
+    }
+
+    /// Refract the composite behind this HWND at its final screen position. The flat
+    /// center stays transparent so scrolling and video remain live between samples.
+    pub fn update_behind(&mut self, engine: &GlassEngine, spec: GlassSpec) -> Result<()> {
+        self.show(engine, spec, Background::BehindWindow)
+    }
+
+    fn show(
+        &mut self,
+        engine: &GlassEngine,
+        spec: GlassSpec,
+        background: Background,
+    ) -> Result<()> {
         if spec.strength <= 0 || spec.width < 1. || spec.height < 1. {
             return self.hide();
         }
@@ -267,7 +296,7 @@ impl GlassSurface {
             spec,
             origin: (ox, oy),
             monitor,
-            wallpaper: backdrop::wallpaper_stamp(),
+            background,
         };
         if self.current == Some(shown) {
             return Ok(());
@@ -280,7 +309,7 @@ impl GlassSurface {
         let width = spec.width.round().max(1.) as u32;
         let height = spec.height.round().max(1.) as u32;
 
-        // The glass rectangle in screen pixels, and the wallpaper around it.
+        // Include pixels outside the rectangle for rays bent outwards at the bevel.
         let gx = ox as f32 + spec.x;
         let gy = oy as f32 + spec.y;
         let (gr, gb) = (gx + width as f32, gy + height as f32);
@@ -297,13 +326,16 @@ impl GlassSurface {
                 width: (scene_r - scene_l) as i32,
                 height: (scene_b - scene_t) as i32,
             };
-            let wallpaper = Backdrop::wallpaper(rect)?;
+            let image = match background {
+                Background::Wallpaper(_) => Backdrop::wallpaper(rect)?,
+                Background::BehindWindow => Backdrop::behind(self.hwnd, rect, 0, false)?,
+            };
             let scene = Scene {
-                width: wallpaper.width,
-                height: wallpaper.height,
-                pixels: &wallpaper.pixels,
-                scale_x: 1.,
-                scale_y: 1.,
+                width: image.width,
+                height: image.height,
+                pixels: &image.pixels,
+                scale_x: image.width as f32 / rect.width as f32,
+                scale_y: image.height as f32 / rect.height as f32,
                 offset_x: gx - scene_l,
                 offset_y: gy - scene_t,
             };
@@ -314,7 +346,10 @@ impl GlassSurface {
             let b = height as f32 + if touches(gb, mb) { OFFSCREEN } else { 0. };
             let mut card = Card::filling(l, t, r - l, b - t, radius, spec.rim);
             card.bevel_half_h = height as f32 * 0.5;
-            prism::render(&scene, width, height, card)
+            match background {
+                Background::Wallpaper(_) => prism::render(&scene, width, height, card),
+                Background::BehindWindow => prism::render_bevel(&scene, width, height, card),
+            }
         } else {
             // Off every monitor: nothing to refract and nothing visible.
             vec![0; width as usize * height as usize * 4]
@@ -438,6 +473,27 @@ impl Canvas {
         radius: f32,
         rim: f32,
     ) -> Result<()> {
+        self.paint_prism(image, area, radius, rim, prism::render)
+    }
+
+    pub(super) fn liquid_bevel(
+        &self,
+        image: &Backdrop,
+        area: Area,
+        radius: f32,
+        rim: f32,
+    ) -> Result<()> {
+        self.paint_prism(image, area, radius, rim, prism::render_bevel)
+    }
+
+    fn paint_prism(
+        &self,
+        image: &Backdrop,
+        area: Area,
+        radius: f32,
+        rim: f32,
+        render: fn(&Scene, u32, u32, Card) -> Vec<u8>,
+    ) -> Result<()> {
         let dest = self.rect(area.left, area.top, area.right, area.bottom);
         let left = dest.left.round();
         let top = dest.top.round();
@@ -460,7 +516,7 @@ impl Canvas {
             radius * self.scale,
             rim,
         );
-        let pixels = prism::render(&scene, width, height, card);
+        let pixels = render(&scene, width, height, card);
         let bitmap = premultiplied_bitmap(&self.ctx, width, height, &pixels)?;
         let at = D2D_RECT_F {
             left,
@@ -753,6 +809,57 @@ mod tests {
     use crate::render::canvas::{Palette, paint_pixels};
     use crate::settings::Settings;
     use windows::Win32::Graphics::{Direct3D::D3D_DRIVER_TYPE_WARP, Dxgi::IDXGIDevice};
+    use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
+        WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    use windows::core::w;
+
+    struct WinRtGuard;
+
+    impl WinRtGuard {
+        fn init() -> Result<Self> {
+            unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
+            Ok(Self)
+        }
+    }
+
+    impl Drop for WinRtGuard {
+        fn drop(&mut self) {
+            unsafe { RoUninitialize() };
+        }
+    }
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new(style: WINDOW_EX_STYLE, x: i32, y: i32, w: i32, h: i32) -> Result<Self> {
+            unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | style,
+                    w!("STATIC"),
+                    None,
+                    WS_POPUP,
+                    x,
+                    y,
+                    w,
+                    h,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(Self)
+            }
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
 
     #[test]
     fn liquid_backdrop_clips_to_rounded_bounds_and_lights_its_rim() -> Result<()> {
@@ -810,50 +917,8 @@ mod tests {
 
     #[test]
     fn live_glass_engine_coexists_with_dcomp_and_rebinds_cleanly() -> Result<()> {
-        use windows::Win32::{
-            System::{
-                LibraryLoader::GetModuleHandleW,
-                WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
-            },
-            UI::WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-                WS_EX_TOOLWINDOW, WS_POPUP,
-            },
-        };
-        use windows::core::w;
-
-        struct WinRtGuard(bool);
-        impl Drop for WinRtGuard {
-            fn drop(&mut self) {
-                if self.0 {
-                    unsafe { RoUninitialize() };
-                }
-            }
-        }
-        struct WindowGuard(HWND);
-        impl Drop for WindowGuard {
-            fn drop(&mut self) {
-                let _ = unsafe { DestroyWindow(self.0) };
-            }
-        }
-
-        let _winrt = WinRtGuard(unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }.is_ok());
-        let hwnd = WindowGuard(unsafe {
-            CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
-                w!("STATIC"),
-                None,
-                WS_POPUP,
-                0,
-                0,
-                320,
-                48,
-                None,
-                None,
-                Some(GetModuleHandleW(None)?.into()),
-                None,
-            )?
-        });
+        let _winrt = WinRtGuard::init()?;
+        let hwnd = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 0, 0, 320, 48)?;
         let dxgi: IDXGIDevice = super::super::d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
         let d2d = unsafe { D2D1CreateDevice(&dxgi, None)? };
         let dcomp: windows::Win32::Graphics::DirectComposition::IDCompositionDesktopDevice = unsafe {
@@ -892,6 +957,168 @@ mod tests {
                 strength: 50,
                 rim: rim::PANEL,
             },
+        )
+    }
+
+    #[test]
+    #[ignore = "shows two small non-activating windows on an interactive Windows desktop"]
+    fn glass_tracks_the_window_behind_its_visible_surface() -> Result<()> {
+        use windows::Win32::Graphics::{
+            Dwm::DwmFlush,
+            Gdi::{
+                BLACK_BRUSH, FillRect, GdiFlush, GetDC, GetPixel, GetStockObject, HBRUSH,
+                ReleaseDC, UpdateWindow, WHITE_BRUSH,
+            },
+        };
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, SW_HIDE, SW_SHOWNOACTIVATE, ShowWindow,
+            WS_EX_TOPMOST,
+        };
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let _winrt = WinRtGuard::init()?;
+        let underlay = TestWindow::new(WS_EX_TOPMOST, 160, 160, 208, 144)?;
+        let overlay = TestWindow::new(
+            WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
+            180,
+            180,
+            168,
+            104,
+        )?;
+        let dxgi: IDXGIDevice = super::super::d3d_device(D3D_DRIVER_TYPE_WARP)?.cast()?;
+        let d2d = unsafe { D2D1CreateDevice(&dxgi, None)? };
+        let engine = GlassEngine::new(&d2d)?;
+        let mut surface = engine.attach(overlay.0)?;
+        let spec = GlassSpec {
+            x: 20.,
+            y: 20.,
+            width: 128.,
+            height: 64.,
+            radius: 16.,
+            strength: 65,
+            rim: rim::DOCK,
+        };
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 208,
+            bottom: 144,
+        };
+        let paint = |brush, area: RECT| -> Result<()> {
+            unsafe {
+                let dc = GetDC(Some(underlay.0));
+                let filled = FillRect(dc, &area, HBRUSH(GetStockObject(brush).0));
+                ReleaseDC(Some(underlay.0), dc);
+                assert_ne!(filled, 0);
+                GdiFlush().ok()?;
+                DwmFlush()
+            }
+        };
+        let sample = |x, y| unsafe {
+            let dc = GetDC(None);
+            let color = GetPixel(dc, x, y);
+            ReleaseDC(None, dc);
+            assert_ne!(color.0, u32::MAX);
+            color.0.to_le_bytes()[0]
+        };
+        let bevel = || (201..212).map(|x| sample(x, 232)).max().unwrap();
+        let wait = |reason: &str, condition: &dyn Fn() -> bool| -> Result<()> {
+            let start = std::time::Instant::now();
+            loop {
+                let mut msg = MSG::default();
+                while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&msg) };
+                }
+                unsafe { DwmFlush()? };
+                if condition() {
+                    return Ok(());
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "{reason}, underlay={}, stripe={}, rim={}, center={}, bevel={}",
+                    sample(170, 230),
+                    sample(195, 232),
+                    sample(264, 200),
+                    sample(264, 232),
+                    bevel()
+                );
+            }
+        };
+        unsafe {
+            let _ = ShowWindow(underlay.0, SW_SHOWNOACTIVATE);
+            let _ = UpdateWindow(underlay.0);
+        }
+        paint(BLACK_BRUSH, area)?;
+        wait("underlay should be black", &|| sample(170, 230) < 10)?;
+        surface.update_behind(&engine, spec)?;
+        unsafe {
+            let _ = ShowWindow(overlay.0, SW_SHOWNOACTIVATE);
+        }
+        wait("glass should light the upper rim on black", &|| {
+            sample(264, 200) > 12 && sample(264, 232) < 20
+        })?;
+
+        paint(WHITE_BRUSH, area)?;
+        wait(
+            "the clear center should reveal the new white background",
+            &|| sample(170, 230) > 235 && sample(264, 232) > 215,
+        )?;
+        // Cover the surface and its sampling margin with a black visual, then draw
+        // a white stripe on the underlay just outside the glass's left edge.
+        let marker = engine.compositor.CreateSpriteVisual()?;
+        let black = engine
+            .compositor
+            .CreateColorBrushWithColor(windows::UI::Color {
+                A: 255,
+                R: 0,
+                G: 0,
+                B: 0,
+            })?;
+        marker.SetBrush(&black)?;
+        let mut size = marker.Size()?;
+        size.X = 168.;
+        size.Y = 104.;
+        marker.SetSize(size)?;
+        surface.root.Children()?.InsertAtTop(&marker)?;
+        wait("foreground marker should cover the surface", &|| {
+            sample(264, 232) < 10
+        })?;
+        paint(BLACK_BRUSH, area)?;
+        paint(
+            WHITE_BRUSH,
+            RECT {
+                left: 24,
+                right: 39,
+                ..area
+            },
+        )?;
+        surface.invalidate_scene();
+        surface.update_behind(&engine, spec)?;
+        surface.root.Children()?.Remove(&marker)?;
+        wait(
+            "the bevel should refract the stripe through the previously covered area",
+            &|| bevel() > 100 && sample(264, 232) < 20,
+        )?;
+        let refreshed = bevel();
+        unsafe {
+            let _ = ShowWindow(overlay.0, SW_HIDE);
+        }
+        wait(
+            "hiding the overlay should reveal the unbroken black interior",
+            &|| bevel() < 10,
+        )?;
+        surface.invalidate_scene();
+        surface.update_behind(&engine, spec)?;
+        unsafe {
+            let _ = ShowWindow(overlay.0, SW_SHOWNOACTIVATE);
+        }
+        wait(
+            "visible refresh and capture-before-show should produce the same bevel",
+            &|| bevel().abs_diff(refreshed) < 6,
         )
     }
 }

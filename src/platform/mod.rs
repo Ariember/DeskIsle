@@ -1301,7 +1301,7 @@ fn is_desktop(hwnd: HWND) -> bool {
         && shell::window_process(hwnd) == shell::window_process(shell)
 }
 
-fn window_overlaps(hwnd: HWND, dock: Rect) -> bool {
+pub fn overlapping_window_frame(hwnd: HWND, dock: Rect) -> Option<Rect> {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool()
             || IsIconic(hwnd).as_bool()
@@ -1309,7 +1309,7 @@ fn window_overlaps(hwnd: HWND, dock: Rect) -> bool {
                 .contains(WS_EX_TOOLWINDOW)
             || is_desktop(hwnd)
         {
-            return false;
+            return None;
         }
         // GetWindowRect includes invisible resize borders. Prefer the frame that
         // the compositor actually draws, including for partially overlapping windows.
@@ -1323,12 +1323,18 @@ fn window_overlaps(hwnd: HWND, dock: Rect) -> bool {
         .is_err()
             && GetWindowRect(hwnd, &mut frame).is_err()
         {
-            return false;
+            return None;
         }
-        frame.left < dock.x + dock.width
+        (frame.left < dock.x + dock.width
             && frame.right > dock.x
             && frame.top < dock.y + dock.height
-            && frame.bottom > dock.y
+            && frame.bottom > dock.y)
+            .then_some(Rect {
+                x: frame.left,
+                y: frame.top,
+                width: frame.right - frame.left,
+                height: frame.bottom - frame.top,
+            })
     }
 }
 
