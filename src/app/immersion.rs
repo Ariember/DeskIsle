@@ -17,9 +17,11 @@ enum PointerWatch {
 }
 
 impl PointerWatch {
-    fn at(window: Rect, edge: Rect, point: POINT, over_dock: bool) -> Self {
+    fn at(window: Rect, edge: Rect, point: POINT, over_dock: bool, dock_leave: bool) -> Self {
         if window.contains(point.x, point.y) {
-            if over_dock {
+            // TME_LEAVE can post WM_MOUSELEAVE immediately, even when the HWND
+            // is under the cursor again. Defer rearming from its own notification.
+            if over_dock && !dock_leave {
                 Self::TrackLeave
             } else {
                 Self::Poll
@@ -215,6 +217,7 @@ impl Bars {
             edge,
             point,
             self.bottom.contains_screen_point(point.x, point.y),
+            dock_leave,
         ) {
             PointerWatch::TrackLeave => platform::track_leave(self.bottom.0),
             PointerWatch::Poll => self.bottom.time_dock_edge(EDGE_POINTER_POLL_MS),
@@ -243,12 +246,21 @@ mod tests {
         let icon_y = window.y + icon.y + icon.height / 2;
         for mode in [DockDisplayMode::AutoHide, DockDisplayMode::SmartHide] {
             let edge = layout.reveal_edge(mode);
-            let watch = |x, y, over_dock| PointerWatch::at(window, edge, POINT { x, y }, over_dock);
+            let watch =
+                |x, y, over_dock| PointerWatch::at(window, edge, POINT { x, y }, over_dock, false);
             // A temporary loss of the HWND under a stationary pointer must not collapse it.
             assert_eq!(watch(x, edge.y, false), PointerWatch::Poll);
             for y in (icon_y..=edge.y).rev() {
                 assert_eq!(watch(x, y, true), PointerWatch::TrackLeave);
             }
+            // A stale leave over an icon must give queued mouse input a turn,
+            // including when WindowFromPoint already reports the Dock again.
+            let point = POINT { x, y: icon_y };
+            assert_eq!(
+                PointerWatch::at(window, edge, point, true, true),
+                PointerWatch::Poll
+            );
+            assert_eq!(watch(x, icon_y, true), PointerWatch::TrackLeave);
             assert_eq!(
                 layout.hit(x - window.x, icon_y - window.y),
                 Some(DockHit::App(0))
