@@ -239,7 +239,7 @@ fn render_card(scene: &Scene, width: u32, height: u32, card: Card, bevel_only: b
             s.spawn(move || {
                 for (row, line) in chunk.chunks_exact_mut(width as usize * 4).enumerate() {
                     let y = (index * band + row) as u32;
-                    for (x, px) in line.chunks_exact_mut(4).enumerate() {
+                    for (x, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                         let [r, g, b, a] = shade(
                             scene,
                             card,
