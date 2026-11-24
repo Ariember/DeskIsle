@@ -101,6 +101,15 @@ impl Bars {
         let mark = self.status.mark;
         let anchor = self.top_anchor(mark.x + mark.width / 2);
         let choice = self.popup(menu::mark_menu(), anchor, None);
+        let hovered = platform::cursor().ok().is_some_and(|point| {
+            let (x, y) = (point.x - self.top_rect.x, point.y - self.top_rect.y);
+            (0..self.status.width).contains(&x)
+                && (0..self.status.height).contains(&y)
+                && self.status.hit(x, y) == StatusHit::Mark
+        });
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_mark_hovered_state(hovered);
+        }
         self.focus_mark(false);
         match choice? {
             Some(command) => self.run_command(command),

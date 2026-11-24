@@ -72,6 +72,8 @@ struct Bars {
     dock_foreground_frame: Option<Rect>,
     maximized_window: Option<isize>,
     top_window_color: Option<u32>,
+    /// Left button held after pressing on the status bar's DeskIsle mark.
+    mark_press: bool,
     /// Only close the window whose corner button received the original press.
     close_press: Option<(String, isize)>,
     monitor: Monitor,
@@ -259,6 +261,7 @@ pub(crate) fn run() -> Result<()> {
         ),
         maximized_window: None,
         top_window_color: None,
+        mark_press: false,
         close_press: None,
         status,
         monitor,
@@ -436,9 +439,17 @@ pub(crate) fn run() -> Result<()> {
                 if let Some(press) = &mut bars.tray_press {
                     press.track(x, y);
                 }
-                bars.set_top_hover(Some(bars.status.hit(x, y)))?;
+                let hit = bars.status.hit(x, y);
+                if bars.mark_press {
+                    let over = hit == StatusHit::Mark;
+                    bars.press_mark(over);
+                    bars.set_top_hover(over.then_some(StatusHit::Mark))?;
+                } else {
+                    bars.set_top_hover(Some(hit))?;
+                }
             }
             Event::CancelPress(hwnd) if hwnd == bars.top.0 => {
+                bars.cancel_mark_press();
                 bars.cancel_close_press();
                 bars.cancel_tray_drag();
             }
@@ -467,16 +478,26 @@ pub(crate) fn run() -> Result<()> {
                 double,
             } => {
                 bars.cancel_tray_drag();
+                bars.cancel_mark_press();
                 bars.cancel_close_press();
                 bars.swallow_click = false;
-                if owner == bars.top.0
-                    && !right
-                    && bars.status.hit(x, y) == StatusHit::CloseMaximized
-                    && let Some(id) = bars.maximized_window
-                    && let Some(app) = bars.apps.iter().find(|app| app.active)
-                {
-                    bars.top.capture();
-                    bars.close_press = Some((app.app_id.clone(), id));
+                if owner == bars.top.0 && !right {
+                    match bars.status.hit(x, y) {
+                        StatusHit::Mark => {
+                            bars.top.capture();
+                            bars.mark_press = true;
+                            bars.press_mark(true);
+                        }
+                        StatusHit::CloseMaximized => {
+                            if let Some(id) = bars.maximized_window
+                                && let Some(app) = bars.apps.iter().find(|app| app.active)
+                            {
+                                bars.top.capture();
+                                bars.close_press = Some((app.app_id.clone(), id));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 bars.cancel_dock_press()?;
                 if owner == bars.bottom.0 {
@@ -502,6 +523,21 @@ pub(crate) fn run() -> Result<()> {
                 bars.release_tray(x, y)?;
             }
             Event::Click(owner, x, y) if owner == bars.top.0 => {
+                if bars.mark_press {
+                    bars.mark_press = false;
+                    bars.top.release();
+                    if bars.status.hit(x, y) == StatusHit::Mark {
+                        if bars.mark_menu()? {
+                            return Ok(());
+                        }
+                    } else {
+                        bars.press_mark(false);
+                        let inside = (0..bars.status.width).contains(&x)
+                            && (0..bars.status.height).contains(&y);
+                        bars.set_top_hover(inside.then(|| bars.status.hit(x, y)))?;
+                    }
+                    continue;
+                }
                 if let Some((app, id)) = bars.close_press.take() {
                     bars.top.release();
                     if bars.status.hit(x, y) == StatusHit::CloseMaximized
@@ -559,6 +595,21 @@ pub(crate) fn run() -> Result<()> {
 }
 
 impl Bars {
+    fn press_mark(&mut self, pressed: bool) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            let _ = renderer.press_mark(pressed);
+        }
+    }
+
+    fn cancel_mark_press(&mut self) {
+        if self.mark_press {
+            self.mark_press = false;
+            self.press_mark(false);
+            self.top.release();
+            self.swallow_click = true;
+        }
+    }
+
     fn cancel_close_press(&mut self) {
         if self.close_press.take().is_some() {
             self.top.release();
@@ -625,6 +676,7 @@ impl Bars {
         self.publish_tray_rects();
         self.position()?;
         if fullscreen {
+            self.cancel_mark_press();
             self.cancel_tray_drag();
             self.tray.cancel_click();
             self.set_top_hover(None)?;
@@ -653,6 +705,7 @@ impl Bars {
     /// Re-reads the monitor. The appbar strip is negotiated again only when the shell
     /// asks or the monitor changed, since each negotiation changes the work area again.
     fn display(&mut self, replace: bool) -> Result<()> {
+        self.cancel_mark_press();
         self.cancel_tray_drag();
         self.tray.cancel_click();
         let monitor = settings::primary_monitor(&self.settings)?;

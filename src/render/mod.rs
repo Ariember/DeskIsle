@@ -5,6 +5,7 @@ mod glass;
 mod label;
 mod launchpad;
 pub(crate) use label::LabelView;
+mod mark;
 mod menu;
 mod metrics;
 mod panel;
@@ -122,7 +123,7 @@ pub struct Renderer {
     top_background: TopBarBackground,
     color_tray_icons: bool,
     traditional_panel: bool,
-    mark: Option<MarkLayer>,
+    mark: Option<mark::MarkLayer>,
 }
 
 #[derive(PartialEq)]
@@ -160,19 +161,6 @@ impl Bar {
             })
         }
     }
-}
-
-/// The DeskIsle mark on its own layer above the status bar, so the compositor can animate
-/// it without repainting the bar. A container holds the ring and the core that grows
-/// inside it while the system menu is open, each scaled about the ring's center.
-struct MarkLayer {
-    visual: IDCompositionVisual2,
-    ring: IDCompositionScaleTransform,
-    core: IDCompositionScaleTransform,
-    core_size: Tween,
-    open: bool,
-    /// The bar height in pixels, DPI, palette and shadow state the ring was painted for.
-    key: (i32, u32, Palette, bool),
 }
 
 struct IconLayer {
@@ -256,25 +244,9 @@ const BATTERY_ICON: f32 = layout::BATTERY_ICON as f32;
 /// Opacity of a status icon whose feature is unavailable: visibly faded, yet keeping
 /// more than 3:1 contrast with the light bar.
 const DIM: f32 = 0.55;
-/// The DeskIsle mark: a ring centered this far from the bar's leading edge, in DIPs.
-const MARK_X: f32 = 18.;
-const MARK_RADIUS: f32 = 6.;
-const MARK_STROKE: f32 = 1.75;
-/// Edge of the mark's layer in DIPs, with room for the ring's antialiased rim.
-const MARK_BOX: f32 = 20.;
-/// Radius in DIPs of the core that fills the ring while the system menu is open, so the
-/// ring reads as an isle with land at its middle. It is painted at this size and scaled
-/// down to nothing at rest, so it is crisp whenever it is fully shown.
-const MARK_CORE: f32 = 2.5;
-/// The ring's press as the menu opens: (seconds, scale). It draws in slightly while the
-/// core grows, then settles back to its painted size.
-const MARK_PRESS: [(f32, f32); 3] = [(0., 1.), (0.08, 0.86), (0.22, 1.)];
-/// Seconds for the core to grow as the menu opens and to recede after it closes.
-const MARK_GROW: f32 = 0.22;
-const MARK_SHRINK: f32 = 0.16;
 
 /// An ease-out cubic from `from` to `to` over `duration` seconds.
-fn ease(
+pub(super) fn ease(
     device: &IDCompositionDesktopDevice,
     from: f32,
     to: f32,
@@ -297,7 +269,7 @@ fn ease(
 
 /// A curve through `keys` of (seconds, value) that eases in and out of each key and
 /// holds the last value afterwards.
-fn keyframes(
+pub(super) fn keyframes(
     device: &IDCompositionDesktopDevice,
     keys: impl Iterator<Item = (f32, f32)>,
 ) -> Result<IDCompositionAnimation> {
@@ -321,29 +293,6 @@ fn keyframes(
             curve.End(time as f64, value)?;
         }
         Ok(curve)
-    }
-}
-
-/// A child of `parent` showing `content`, scaled by `scale` about `center` in the
-/// parent's pixels. Returns the transform so the caller can animate the scale.
-fn scaled_child(
-    device: &IDCompositionDesktopDevice,
-    parent: &IDCompositionVisual2,
-    content: &IDCompositionSurface,
-    (x, y): (f32, f32),
-    scale: f32,
-) -> Result<IDCompositionScaleTransform> {
-    unsafe {
-        let visual = device.CreateVisual()?;
-        visual.SetContent(content)?;
-        let transform = device.CreateScaleTransform()?;
-        transform.SetCenterX2(x)?;
-        transform.SetCenterY2(y)?;
-        transform.SetScaleX2(scale)?;
-        transform.SetScaleY2(scale)?;
-        visual.SetTransform(&transform)?;
-        parent.AddVisual(&visual, true, None)?;
-        Ok(transform)
     }
 }
 
@@ -933,109 +882,10 @@ impl Renderer {
         )?;
         unsafe { self.top.root.SetContent(&surface)? };
         self.place_mark(layout.height, dpi, palette, shadow)?;
+        self.sync_mark_hover(hover == Some(StatusHit::Mark))?;
         unsafe { self.device.Commit()? };
         self.top_state = Some(state);
         Ok(())
-    }
-
-    /// Paints the DeskIsle mark, a ring as round as the controls beside it, onto its own
-    /// layer above the bar. The layer is kept while the bar's height, DPI and palette are;
-    /// a repainted layer keeps showing the core if the system menu is still open.
-    fn place_mark(&mut self, height: i32, dpi: u32, palette: Palette, shadow: bool) -> Result<()> {
-        let key = (height, dpi, palette, shadow);
-        if self.mark.as_ref().is_some_and(|mark| mark.key == key) {
-            return Ok(());
-        }
-        let open = self.mark.as_ref().is_some_and(|mark| mark.open);
-        let s = dpi as f32 / 96.;
-        // Whole-pixel offsets keep the ring as crisp as when it was painted into the bar.
-        let (cx, cy) = (MARK_X * s, height as f32 / 2.);
-        let left = (cx - MARK_BOX / 2. * s).floor();
-        let top = (cy - MARK_BOX / 2. * s).floor();
-        let (x, y) = (cx - left, cy - top);
-        let edge = (MARK_BOX * s).ceil() as i32 + 1;
-        let ring_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
-            if shadow {
-                let (sr, sa) = c.top_shadow();
-                c.ring_alpha(
-                    x / s,
-                    y / s + TOP_SHADOW_Y,
-                    MARK_RADIUS,
-                    MARK_STROKE,
-                    sr,
-                    sa,
-                )?;
-            }
-            c.ring(x / s, y / s, MARK_RADIUS, MARK_STROKE, c.p.accent)
-        })?;
-        let core_surface = paint(&self.device, palette, edge, edge, dpi, |c| {
-            let (x, y, r) = (x / s, y / s, MARK_CORE);
-            if shadow {
-                let (sr, sa) = c.top_shadow();
-                c.fill(
-                    x - r,
-                    y - r + TOP_SHADOW_Y,
-                    x + r,
-                    y + r + TOP_SHADOW_Y,
-                    r,
-                    sr,
-                    sa,
-                )?;
-            }
-            c.round(x - r, y - r, x + r, y + r, r, c.p.accent)
-        })?;
-        let core_goal = if open { 1. } else { 0. };
-        unsafe {
-            if let Some(old) = self.mark.take() {
-                self.top.root.RemoveVisual(&old.visual)?;
-            }
-            let visual = self.device.CreateVisual()?;
-            visual.SetOffsetX2(left)?;
-            visual.SetOffsetY2(top)?;
-            let ring = scaled_child(&self.device, &visual, &ring_surface, (x, y), 1.)?;
-            let core = scaled_child(&self.device, &visual, &core_surface, (x, y), core_goal)?;
-            self.top.root.AddVisual(&visual, true, None)?;
-            self.mark = Some(MarkLayer {
-                visual,
-                ring,
-                core,
-                core_size: Tween::new(core_goal),
-                open,
-                key,
-            });
-        }
-        Ok(())
-    }
-
-    /// Turns the DeskIsle mark into an isle while its system menu is `open`: the ring
-    /// presses in once as a core grows from its center, and the core recedes after the
-    /// menu closes. Only compositor transforms change, so the bar is not repainted. A
-    /// change midway continues from the core's current size.
-    pub fn focus_mark(&mut self, open: bool) -> Result<()> {
-        let Some(mark) = self.mark.as_mut() else {
-            return Ok(());
-        };
-        if mark.open == open {
-            return Ok(());
-        }
-        mark.open = open;
-        let (goal, duration) = if open {
-            (1., MARK_GROW)
-        } else {
-            (0., MARK_SHRINK)
-        };
-        unsafe {
-            if open {
-                let press = keyframes(&self.device, MARK_PRESS.into_iter())?;
-                mark.ring.SetScaleX(&press)?;
-                mark.ring.SetScaleY(&press)?;
-            }
-            if let Some(curve) = mark.core_size.retarget(&self.device, goal, duration)? {
-                mark.core.SetScaleX(&curve)?;
-                mark.core.SetScaleY(&curve)?;
-            }
-            self.device.Commit()
-        }
     }
 
     /// A short bounce after the launchpad has saved a new entry, also visible when
