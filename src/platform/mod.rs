@@ -658,8 +658,6 @@ pub enum Event {
     PanelClick(i32, i32),
     PanelScroll(i16),
     PanelKey(PanelKey),
-    PanelMoved,
-    PanelActivation(bool),
     /// The panel moved to a monitor with this DPI and already took the suggested size.
     PanelDpi,
     PanelClose,
@@ -695,8 +693,6 @@ impl Event {
                 | Event::PanelClick(..)
                 | Event::PanelScroll(_)
                 | Event::PanelKey(_)
-                | Event::PanelMoved
-                | Event::PanelActivation(_)
                 | Event::PanelDpi
                 | Event::PanelClose
         )
@@ -1064,8 +1060,7 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 /// The settings window. It has a caption style so DWM gives it a shadow, rounded corners
 /// and a place in Alt+Tab, while its client area covers the frame and DeskIsle draws it.
-/// The second field records whether DWM accepted the acrylic backdrop for the sidebar.
-pub struct PanelWindow(pub HWND, bool);
+pub struct PanelWindow(pub HWND);
 
 impl PanelWindow {
     pub fn capture(&self) {
@@ -1081,16 +1076,8 @@ impl PanelWindow {
     }
 
     /// Creates the hidden window at `r`, in screen pixels. `caption` is the draggable
-    /// height and the left and right edges of the close button, and `sidebar` the
-    /// sidebar's width, in client pixels. When `dwm_acrylic` is false, DeskIsle's live
-    /// Liquid Glass compositor supplies the sidebar backdrop and DWM only frames the window.
-    pub fn create(
-        r: Rect,
-        caption: (i32, i32, i32),
-        sidebar: i32,
-        dark: bool,
-        dwm_acrylic: bool,
-    ) -> Result<Self> {
+    /// height and the left and right edges of the close button in client pixels.
+    pub fn create(r: Rect, caption: (i32, i32, i32), dark: bool) -> Result<Self> {
         PANEL_CAPTION.set(caption);
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -1108,16 +1095,7 @@ impl PanelWindow {
                 Some(instance.into()),
                 None,
             )?;
-            let backdrop = DWMSBT_TRANSIENTWINDOW;
-            let glass = dwm_acrylic
-                && DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_SYSTEMBACKDROP_TYPE,
-                    (&raw const backdrop).cast(),
-                    size_of_val(&backdrop) as u32,
-                )
-                .is_ok();
-            let window = Self(hwnd, glass);
+            let window = Self(hwnd);
             window.set_dark(dark);
             // Cosmetic only: builds without this attribute keep square corners.
             let round = DWMWCP_ROUND;
@@ -1127,31 +1105,8 @@ impl PanelWindow {
                 (&raw const round).cast(),
                 size_of_val(&round) as u32,
             );
-            window.extend_frame(sidebar);
             Ok(window)
         }
-    }
-
-    /// Whether DWM draws the acrylic backdrop under the sidebar. With transparency
-    /// effects off, DWM shows a flat fill there instead.
-    pub fn backdrop(&self) -> bool {
-        self.1
-    }
-
-    /// Extend the frame only for DWM acrylic. With composition glass, even a one-pixel
-    /// extension introduces an opaque frame fill underneath the clear sidebar.
-    fn extend_frame(&self, sidebar: i32) {
-        if !self.1 {
-            return;
-        }
-        let margins = MARGINS {
-            cxLeftWidth: sidebar.max(1),
-            cxRightWidth: 1,
-            cyTopHeight: 1,
-            cyBottomHeight: 1,
-        };
-        // Cosmetic only: without it the window keeps the DWM frame's default look.
-        let _ = unsafe { DwmExtendFrameIntoClientArea(self.0, &margins) };
     }
 
     /// Matches the frame DWM draws around the panel, such as its border, to the palette.
@@ -1183,10 +1138,8 @@ impl PanelWindow {
         height: i32,
         work: Rect,
         caption: (i32, i32, i32),
-        sidebar: i32,
     ) -> Result<()> {
         PANEL_CAPTION.set(caption);
-        self.extend_frame(sidebar);
         let mut r = RECT::default();
         unsafe { GetWindowRect(self.0, &mut r)? };
         let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
@@ -1234,14 +1187,6 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         // Both forms must keep the window rectangle: CreateWindowEx sends the one without
         // `wParam`, and the system caption would stay until the next frame change.
         WM_NCCALCSIZE => return LRESULT(0),
-        WM_MOVE if unsafe { IsWindowVisible(hwnd) }.as_bool() => Event::PanelMoved,
-        WM_ACTIVATE => {
-            queue(
-                hwnd,
-                Event::PanelActivation(wp.0 & 0xffff != WA_INACTIVE as usize),
-            );
-            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
-        }
         WM_NCHITTEST => {
             let mut point = POINT { x, y };
             let _ = unsafe { ScreenToClient(hwnd, &mut point) };

@@ -19,17 +19,8 @@ pub(super) struct Panel {
     state: PanelState,
     layout: PanelLayout,
     dpi: u32,
-    /// Whether the sidebar is painted translucent over the acrylic backdrop.
-    glass: bool,
-    /// Another window may have changed the scene while it had focus.
-    was_inactive: bool,
+    translucent: bool,
     pressed: Option<Action>,
-}
-
-/// The sidebar shows its backdrop when transparency effects are on and either DeskIsle's
-/// live Liquid Glass compositor or DWM acrylic is available.
-fn glass(window: &PanelWindow, live_glass: bool) -> bool {
-    display::transparency().unwrap_or(false) && (live_glass || window.backdrop())
 }
 
 /// Settings saved by the user, falling back to defaults with a message when the file
@@ -183,7 +174,6 @@ impl Bars {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let live_glass = renderer.has_live_glass();
         let repalette = renderer.set_appearance(dark, &self.settings);
         self.retheme_about(dark, repalette)?;
         if repalette {
@@ -195,11 +185,11 @@ impl Bars {
         let Some(panel) = self.panel.as_mut() else {
             return Ok(());
         };
-        let glass = glass(&panel.window, live_glass);
-        if !repalette && glass == panel.glass {
+        let translucent = display::transparency().unwrap_or(false);
+        if !repalette && translucent == panel.translucent {
             return Ok(());
         }
-        panel.glass = glass;
+        panel.translucent = translucent;
         if repalette {
             panel.window.set_dark(dark);
         }
@@ -222,20 +212,13 @@ impl Bars {
         let dpi = panel_dpi(self.monitor.dpi, self.monitor.work);
         let mut state = PanelState::default();
         let layout = PanelLayout::new(&mut state, &self.settings, dpi, self.monitor.work);
-        let live_glass = self
-            .renderer
-            .as_ref()
-            .is_some_and(crate::render::Renderer::has_live_glass);
         let window = PanelWindow::create(
             layout.place(self.monitor.work),
             layout.caption_pixels(),
-            layout.sidebar_pixels(),
             self.dark(),
-            !live_glass,
         )?;
         self.panel = Some(Panel {
-            glass: glass(&window, live_glass),
-            was_inactive: false,
+            translucent: display::transparency().unwrap_or(false),
             window,
             pressed: None,
             state,
@@ -265,7 +248,7 @@ impl Bars {
         let (Some(panel), Some(renderer)) = (&self.panel, self.renderer.as_mut()) else {
             return Ok(());
         };
-        renderer.draw_panel(panel.window.0, &panel.layout, panel.dpi, panel.glass)
+        renderer.draw_panel(panel.window.0, &panel.layout, panel.dpi, panel.translucent)
     }
 
     fn draw_panel(&mut self) -> Result<()> {
@@ -303,13 +286,9 @@ impl Bars {
         }
         if layout.pixels() != panel.layout.pixels() || layout.scale != panel.layout.scale {
             let (width, height) = layout.pixels();
-            panel.window.resize(
-                width,
-                height,
-                work,
-                layout.caption_pixels(),
-                layout.sidebar_pixels(),
-            )?;
+            panel
+                .window
+                .resize(width, height, work, layout.caption_pixels())?;
         }
         panel.layout = layout;
         self.draw_panel()
@@ -321,23 +300,6 @@ impl Bars {
             return Ok(false);
         };
         let action = match *event {
-            Event::PanelActivation(active) => {
-                let reactivated = active && panel.was_inactive;
-                panel.was_inactive = !active;
-                if reactivated && panel.glass {
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.invalidate_panel_scene();
-                    }
-                    self.draw_panel()?;
-                }
-                return Ok(false);
-            }
-            Event::PanelMoved => {
-                if panel.glass {
-                    self.draw_panel()?;
-                }
-                return Ok(false);
-            }
             Event::PanelPress(x, y) => {
                 panel.pressed = panel.layout.hit(x, y);
                 if let Some(key) = panel.layout.slider_at(x, y)

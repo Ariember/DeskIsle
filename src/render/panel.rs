@@ -13,7 +13,7 @@ use crate::ui::icon::Symbol;
 use crate::ui::panel::{self, Action, Area, PanelLayout, Part};
 
 use super::Renderer;
-use super::canvas::{Canvas, Palette, Rgb, Text, accent_color, paint};
+use super::canvas::{Canvas, Rgb, Text, accent_color, paint};
 
 const WHITE: Rgb = (255, 255, 255);
 const BLACK: Rgb = (0, 0, 0);
@@ -160,8 +160,7 @@ fn top_bar_preview(c: &Canvas, a: Area, style: TopBarBackground) -> Result<()> {
 /// a plain content area and rows grouped into one rounded list.
 struct Tones {
     window: Rgb,
-    sidebar_top: Rgb,
-    sidebar_bottom: Rgb,
+    sidebar: Rgb,
     divider: (Rgb, f32),
     /// Alphas of `line` for the grouped list's fill and rim.
     group: f32,
@@ -184,8 +183,7 @@ impl Tones {
         if dark {
             Self {
                 window: (30, 30, 31),
-                sidebar_top: (50, 49, 53),
-                sidebar_bottom: (40, 39, 43),
+                sidebar: (45, 44, 48),
                 divider: (BLACK, 0.55),
                 group: 0.05,
                 group_rim: 0.07,
@@ -201,8 +199,7 @@ impl Tones {
         } else {
             Self {
                 window: (248, 248, 248),
-                sidebar_top: (237, 235, 241),
-                sidebar_bottom: (227, 225, 232),
+                sidebar: (232, 230, 237),
                 divider: (BLACK, 0.1),
                 group: 0.035,
                 group_rim: 0.06,
@@ -223,7 +220,6 @@ impl Tones {
 /// it changes only on input, so nothing runs while it sits open.
 pub(super) struct PanelView {
     hwnd: HWND,
-    glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     root: IDCompositionVisual2,
@@ -231,64 +227,30 @@ pub(super) struct PanelView {
 
 impl Renderer {
     /// Paints `layout` into `hwnd`, the settings window, binding to it on first use and
-    /// again after the device was rebuilt. With `glass` the sidebar renders translucent
-    /// Liquid Glass over the windows behind it.
+    /// again after the device was rebuilt.
     pub fn draw_panel(
         &mut self,
         hwnd: HWND,
         layout: &PanelLayout,
         dpi: u32,
-        glass: bool,
+        translucent: bool,
     ) -> Result<()> {
         if self.panel.as_ref().map(|view| view.hwnd) != Some(hwnd) {
             self.close_panel();
-            let glass_surface = self.glass.as_ref().and_then(|g| g.attach(hwnd).ok());
             unsafe {
                 let target = self.device.CreateTargetForHwnd(hwnd, true)?;
                 let root = self.device.CreateVisual()?;
                 target.SetRoot(&root)?;
                 self.panel = Some(PanelView {
                     hwnd,
-                    glass: glass_surface,
                     _target: target,
                     root,
                 });
             }
         }
         let (width, height) = layout.pixels();
-        let sidebar_px = layout.sidebar_pixels() as f32;
-        // The window can supply DWM acrylic when the composition engine is unavailable.
-        let mut sidebar_glass = (glass && self.glass.is_none()).then_some(self.palette);
-        if let (Some(engine), Some(panel_view)) = (&self.glass, self.panel.as_mut())
-            && let Some(surface) = &mut panel_view.glass
-        {
-            if glass
-                && surface
-                    .update_behind(
-                        engine,
-                        super::glass::GlassSpec {
-                            x: 0.,
-                            y: 0.,
-                            width: sidebar_px,
-                            height: height as f32,
-                            radius: 0.,
-                            strength: self.appearance.get(Key::Backdrop),
-                            rim: super::glass::rim::LABEL,
-                        },
-                    )
-                    .is_ok()
-            {
-                sidebar_glass = Some(
-                    surface
-                        .light_ground()
-                        .map_or(self.palette, |light| Palette::new(!light, &self.appearance)),
-                );
-            } else {
-                let _ = surface.hide();
-            }
-        }
         let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
-            self.paint_panel(c, layout, sidebar_glass)
+            self.paint_panel(c, layout, translucent)
         })?;
         let view = self.panel.as_ref().expect("panel bound above");
         unsafe {
@@ -301,12 +263,6 @@ impl Renderer {
     pub fn close_panel(&mut self) {
         if self.panel.take().is_some() {
             let _ = unsafe { self.device.Commit() };
-        }
-    }
-
-    pub fn invalidate_panel_scene(&mut self) {
-        if let Some(glass) = self.panel.as_mut().and_then(|panel| panel.glass.as_mut()) {
-            glass.invalidate_scene();
         }
     }
 
@@ -382,12 +338,7 @@ impl Renderer {
         )
     }
 
-    fn paint_panel(
-        &self,
-        c: &Canvas,
-        layout: &PanelLayout,
-        sidebar_glass: Option<Palette>,
-    ) -> Result<()> {
+    fn paint_panel(&self, c: &Canvas, layout: &PanelLayout, translucent: bool) -> Result<()> {
         let t = Tones::new(c.p.dark, c.p.accent);
         let (w, h) = (layout.width, layout.height);
         let hover = |action: Action| layout.hover == Some(action);
@@ -395,17 +346,8 @@ impl Renderer {
         c.round(side, 0., w, h, 0., t.window)?;
 
         // The sidebar runs the full height, under the window lights, as in macOS.
-        if sidebar_glass.is_none() {
-            c.gradient(
-                0.,
-                0.,
-                side,
-                h,
-                0.,
-                (t.sidebar_top, 1.),
-                (t.sidebar_bottom, 1.),
-            )?;
-        }
+        let opacity = if translucent { 0.8 } else { 1. };
+        c.fill(0., 0., side, h, 0., t.sidebar, opacity)?;
         c.fill(
             side,
             0.,
@@ -432,13 +374,12 @@ impl Renderer {
             c.symbol_in(Symbol::Close, cross, 10., CLOSE_CROSS, 0.9)?;
         }
 
-        let nav_palette = sidebar_glass.unwrap_or(c.p);
         for (index, &(a, section)) in layout.nav.iter().enumerate() {
             let selected = index == layout.page;
             if selected {
                 c.round(a.left, a.top, a.right, a.bottom, 6., t.accent)?;
             } else if hover(Action::Page(index)) {
-                c.fill(a.left, a.top, a.right, a.bottom, 6., nav_palette.line, 0.06)?;
+                c.fill(a.left, a.top, a.right, a.bottom, 6., c.p.line, 0.06)?;
             }
             let tile = Area::new(
                 a.left + 8.,
@@ -471,11 +412,7 @@ impl Renderer {
                 right: a.right - 8.,
                 ..a
             };
-            let ink = if selected {
-                c.p.on_accent
-            } else {
-                nav_palette.ink
-            };
+            let ink = if selected { c.p.on_accent } else { c.p.ink };
             self.label(c, section.title(), text, 13., false, ink, 1.)?;
         }
 
@@ -1310,7 +1247,7 @@ mod render_tests {
 
     #[test]
     #[ignore = "shows a settings panel over a test window on an interactive Windows desktop"]
-    fn sidebar_shows_live_content_from_the_window_behind_the_panel() -> Result<()> {
+    fn sidebar_overlays_live_content_with_a_uniform_theme_tint() -> Result<()> {
         use crate::platform::{Desktop, PanelWindow, backdrop::Backdrop, create_bars, monitor};
         use std::time::{Duration, Instant};
         use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -1326,26 +1263,13 @@ mod render_tests {
         let layout = PanelLayout::new(&mut PanelState::default(), &settings, 96, work);
         let area = layout.place(work);
         let background = HiddenWindow::create()?;
-        let panel = PanelWindow::create(
-            area,
-            layout.caption_pixels(),
-            layout.sidebar_pixels(),
-            false,
-            false,
-        )?;
+        let panel = PanelWindow::create(area, layout.caption_pixels(), false)?;
         let mut renderer = Renderer::new(top.0, bottom.0, false, &settings)?;
         let layer = super::super::Bar::new(&renderer.device, background.0)?;
         let device = renderer.device.clone();
         let palette = renderer.palette;
-        // Cover the scene beyond the bevel as well; a refracted ray may land there.
-        let underlay = Rect {
-            x: area.x - 64,
-            y: area.y - 64,
-            width: area.width + 128,
-            height: area.height + 128,
-        };
         let set_background = |color: Option<Rgb>| -> Result<()> {
-            let (w, h) = (underlay.width, underlay.height);
+            let (w, h) = (area.width, area.height);
             let surface = paint(&device, palette, w, h, 96, |c| {
                 if let Some(rgb) = color {
                     return c.round(0., 0., w as f32, h as f32, 0., rgb);
@@ -1355,7 +1279,7 @@ mod render_tests {
                     height: h as u32,
                     pixels: (0..w * h)
                         .flat_map(|i| {
-                            let value = if (i % w + i / w) % 6 < 3 { 20 } else { 235 };
+                            let value = if i % w % 6 < 3 { 20 } else { 235 };
                             [value, value, value, 255]
                         })
                         .collect(),
@@ -1379,21 +1303,22 @@ mod render_tests {
                 SWP_SHOWWINDOW | SWP_NOACTIVATE,
             )
         };
-        // Sample an unselected navigation label, the empty glass beside it, and
+        // Sample an unselected navigation label, the empty sidebar beside it, and
         // the opaque gutter between the sidebar and the scrollable page.
         let row = layout.nav[1].0;
+        let sidebar_width = panel::SIDEBAR as i32; // 96 DPI
         let strip = Rect {
             x: area.x + row.left as i32 + 37,
             y: area.y + row.top as i32,
-            width: layout.sidebar_pixels() + 10 - (row.left as i32 + 37),
+            width: sidebar_width + 10 - (row.left as i32 + 37),
             height: (row.bottom - row.top) as i32,
         };
         let label_samples = |frame: &Backdrop| {
             let rows = frame.pixels.chunks_exact(4 * strip.width as usize);
             let middle = rows.clone().nth(strip.height as usize / 2).unwrap();
             let red_at = |x| middle[(x - strip.x) as usize * 4 + 2];
-            let sidebar = red_at(area.x + layout.sidebar_pixels() - 36);
-            let page = red_at(area.x + layout.sidebar_pixels() + 8);
+            let sidebar = red_at(area.x + sidebar_width - 36);
+            let page = red_at(area.x + sidebar_width + 8);
             let ink = rows
                 .flat_map(|row| row[..32 * 4].chunks_exact(4))
                 .map(|pixel| pixel[2])
@@ -1405,7 +1330,7 @@ mod render_tests {
                         rect: Rect,
                         sample: &dyn Fn(&Backdrop) -> [u8; 3],
                         matches: &dyn Fn([u8; 3]) -> bool|
-         -> Result<()> {
+         -> Result<[u8; 3]> {
             let start = Instant::now();
             loop {
                 let mut msg = MSG::default();
@@ -1417,7 +1342,7 @@ mod render_tests {
                 }
                 let values = sample(&Backdrop::capture(rect, 0, false)?);
                 if matches(values) {
-                    return Ok(());
+                    return Ok(values);
                 }
                 assert!(
                     start.elapsed() < Duration::from_secs(3),
@@ -1429,65 +1354,62 @@ mod render_tests {
             wait_for(description, strip, &label_samples, matches)
         };
         set_background(Some(BLACK))?;
-        show(background.0, underlay)?;
+        show(background.0, area)?;
         wait_labels("test window visible", &|[side, page, _]| {
             side < 20 && page < 20
         })?;
         renderer.draw_panel(panel.0, &layout, 96, true)?;
         show(panel.0, area)?;
-        wait_labels("light label on dark content behind the glass", &|[
-            side,
-            page,
-            ink,
-        ]| {
-            side < 60 && page > 200 && ink > 210
+        wait_labels("light theme over black", &|[side, page, ink]| {
+            (145..225).contains(&side) && page > 230 && ink < 70
         })?;
         set_background(Some(WHITE))?;
-        wait_labels(
-            "glass follows the background without repainting the panel",
-            &|[side, page, _]| side > 200 && page > 200,
-        )?;
-        renderer.invalidate_panel_scene();
+        wait_labels("light theme over white", &|[side, page, ink]| {
+            side >= 225 && page > 230 && ink < 70
+        })?;
+        renderer.set_appearance(true, &settings);
         renderer.draw_panel(panel.0, &layout, 96, true)?;
-        wait_labels("dark label on light content", &|[side, page, ink]| {
-            side > 200 && page > 200 && ink < 60
+        wait_labels("dark theme over white", &|[side, page, ink]| {
+            (60..150).contains(&side) && page < 60 && ink > 205
         })?;
 
         set_background(None)?;
         let probe = Rect {
-            width: layout.sidebar_pixels(),
-            height: 64,
+            width: sidebar_width,
             ..area
         };
-        let stripe_contrast = |frame: &Backdrop| {
-            // Probe inside the native outer corner, beside the page divider, and in
-            // the center of the glass caption. All three strips avoid panel controls.
-            [(8, 9), (probe.width - 5, 40), (probe.width / 2, 20)].map(|(x, y)| {
-                let reds =
-                    (y..y + 12).map(|row| frame.pixels[((row * probe.width + x) * 4 + 2) as usize]);
-                reds.clone().max().unwrap() - reds.min().unwrap()
-            })
+        let stripe_samples = |frame: &Backdrop| {
+            // Two pixels on the same dark stripe and one on the next light stripe.
+            let red = |x, y| frame.pixels[((y * probe.width + x) * 4 + 2) as usize];
+            [red(7, 20), red(7, probe.height - 30), red(10, 20)]
         };
+        let mut clear_stripes = None;
         for blur in [0, 100] {
             settings.set(Key::Backdrop, blur);
             renderer.set_appearance(false, &settings);
             renderer.draw_panel(panel.0, &layout, 96, true)?;
-            if blur == 0 {
-                wait_for(
-                    "clear corner, edge and center show fine stripes",
-                    probe,
-                    &stripe_contrast,
-                    &|c| c.into_iter().all(|v| v > 65),
-                )?;
-            } else {
-                wait_for(
-                    "frost covers the corner, edge and center",
-                    probe,
-                    &stripe_contrast,
-                    &|c| c.into_iter().all(|v| v < 40),
-                )?;
+            let stripes = wait_for(
+                "stripes show through a uniform mask",
+                probe,
+                &stripe_samples,
+                &|[top, bottom, light]| {
+                    top > 140
+                        && top.abs_diff(bottom) <= 2
+                        && (20..65).contains(&light.saturating_sub(top))
+                },
+            )?;
+            if let Some(clear) = clear_stripes {
+                assert_eq!(stripes, clear, "global glass blur changed the sidebar");
             }
+            clear_stripes = Some(stripes);
         }
+        renderer.draw_panel(panel.0, &layout, 96, false)?;
+        wait_for(
+            "opaque mask hides all stripes",
+            probe,
+            &stripe_samples,
+            &|[a, b, c]| a == b && b == c,
+        )?;
         Ok(())
     }
 

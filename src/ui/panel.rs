@@ -765,11 +765,6 @@ impl PanelLayout {
         )
     }
 
-    /// The sidebar's width in client pixels, where the window shows its backdrop.
-    pub fn sidebar_pixels(&self) -> i32 {
-        (SIDEBAR * self.scale).round() as i32
-    }
-
     /// Centers the window in `work`, in screen pixels.
     pub fn place(&self, work: Rect) -> Rect {
         let (width, height) = self.pixels();
