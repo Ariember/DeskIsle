@@ -6,7 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::{
     Foundation::{E_INVALIDARG, HWND, POINT},
-    Graphics::Dwm::{DWMWA_CLOAK, DwmFlush, DwmSetWindowAttribute},
+    Graphics::Dwm::{DWMWA_CLOAK, DWMWA_USE_HOSTBACKDROPBRUSH, DwmFlush, DwmSetWindowAttribute},
     Graphics::Gdi::*,
     UI::WindowsAndMessaging::{
         IsWindowVisible, SPI_GETDESKWALLPAPER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -199,6 +199,21 @@ impl Backdrop {
                 pixels,
             })
         }
+    }
+}
+
+/// Lets `hwnd`'s `Windows.UI.Composition` tree draw the live, system-blurred content
+/// behind it through `Compositor::CreateHostBackdropBrush`. Windows 10 and Windows 11
+/// before build 22000 reject the attribute.
+pub fn use_host_backdrop(hwnd: HWND) -> Result<()> {
+    let on = 1i32;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_HOSTBACKDROPBRUSH,
+            (&raw const on).cast(),
+            size_of_val(&on) as u32,
+        )
     }
 }
 

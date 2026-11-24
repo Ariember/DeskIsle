@@ -15,7 +15,7 @@ use crate::ui::menu::{self, Calendar, Entry, Icon, Menu, MenuLayout, Slider};
 use crate::ui::panel::Area;
 use crate::ui::system::PLAYER_SYMBOL;
 
-use super::canvas::{Canvas, Rgb, Text, paint, paint_region, text_format};
+use super::canvas::{Canvas, Palette, Rgb, Text, paint, paint_region, text_format};
 use super::{Renderer, ease};
 
 /// The panel's corner radius. The highlight inside it, inset by the panel padding,
@@ -60,6 +60,8 @@ pub(super) struct MenuView {
     sliders: Vec<(usize, IDCompositionVisual2)>,
     /// The track size of the sliders in DIPs and the DPI they were painted at.
     track: (f32, f32, u32),
+    /// The palette the menu was painted with, which may follow the scene behind it.
+    palette: Palette,
 }
 
 /// Mirrors an [`ease`] handed to the compositor, so a new one starts where it is now.
@@ -174,7 +176,12 @@ impl Renderer {
                 strength: blur_strength,
                 rim: super::glass::rim::DOCK,
             };
-            if surface.update_behind(engine, spec).is_ok() {
+            let frost = if custom {
+                blur_strength as f32 / 100.
+            } else {
+                super::glass::DEFAULT_FROST
+            };
+            if surface.update_behind(engine, spec, frost).is_ok() {
                 if animate {
                     let _ = surface.animate_open(engine, width, height, OPEN_DURATION);
                 }
@@ -186,12 +193,24 @@ impl Renderer {
             opacity = 0.96;
             rim = 0.62;
         }
-        let (top_tint, bottom_tint) = if self.palette.dark {
+        // Over clear glass, text and icons take the ink that stands out on the scene
+        // behind the menu rather than the theme's.
+        let light_ground = match &glass_surface {
+            Some(surface) => surface.light_ground(),
+            None => backdrop
+                .filter(|_| glass_active)
+                .and_then(super::glass::light_ground),
+        };
+        let palette = match light_ground {
+            Some(light) => Palette::new(!light, &self.appearance),
+            None => self.palette,
+        };
+        let (top_tint, bottom_tint) = if palette.dark {
             ((38, 46, 62), (18, 22, 32))
         } else {
             ((252, 254, 255), (235, 243, 252))
         };
-        let background = paint(&self.device, self.palette, width, height, dpi, |c| {
+        let background = paint(&self.device, palette, width, height, dpi, |c| {
             let area = Area::new(left, top, right, bottom);
             c.shadow(
                 area,
@@ -217,7 +236,7 @@ impl Renderer {
                 },
             )
         })?;
-        let content = paint(&self.device, self.palette, width, height, dpi, |c| {
+        let content = paint(&self.device, palette, width, height, dpi, |c| {
             for (index, entry) in menu.entries.iter().enumerate() {
                 self.paint_entry(c, entry, layout, index, tray)?;
             }
@@ -229,7 +248,7 @@ impl Renderer {
             if let Entry::Slider(slider) = entry {
                 let (l, t, r, b) = layout.track(index);
                 track = (r - l, b - t, dpi);
-                let surface = self.slider_surface(slider, track)?;
+                let surface = self.slider_surface(slider, track, palette)?;
                 unsafe {
                     let visual = self.device.CreateVisual()?;
                     visual.SetContent(&surface)?;
@@ -244,7 +263,7 @@ impl Renderer {
         let highlight = |accent: Rgb, alpha: f32, rim: f32| {
             paint(
                 &self.device,
-                self.palette,
+                palette,
                 ((row_right - row_left) * layout.scale).round() as i32,
                 (menu::ITEM_HEIGHT * layout.scale).round() as i32,
                 dpi,
@@ -260,13 +279,13 @@ impl Renderer {
                 },
             )
         };
-        let pill_tint = if self.palette.dark {
+        let pill_tint = if palette.dark {
             (215, 232, 255)
         } else {
             (255, 255, 255)
         };
-        let accent = highlight(pill_tint, if self.palette.dark { 0.14 } else { 0.34 }, 0.42)?;
-        let danger = highlight(self.palette.danger, 0.18, 0.45)?;
+        let accent = highlight(pill_tint, if palette.dark { 0.14 } else { 0.34 }, 0.42)?;
+        let danger = highlight(palette.danger, 0.18, 0.45)?;
         unsafe {
             let target = self.device.CreateTargetForHwnd(hwnd, true)?;
             let root = self.device.CreateVisual()?;
@@ -318,6 +337,7 @@ impl Renderer {
                 y: Tween::at(0.),
                 sliders,
                 track,
+                palette,
             });
         }
         Ok(())
@@ -345,7 +365,7 @@ impl Renderer {
                 right: width,
                 bottom: (bottom * layout.scale).round() as i32,
             };
-            paint_region(&view.content, self.palette, rect, dpi, |c| {
+            paint_region(&view.content, view.palette, rect, dpi, |c| {
                 self.paint_entry(c, &menu.entries[index], layout, index, tray)
             })?;
         }
@@ -360,10 +380,11 @@ impl Renderer {
         &self,
         slider: &Slider<C>,
         (w, h, dpi): (f32, f32, u32),
+        palette: Palette,
     ) -> Result<IDCompositionSurface> {
         let s = dpi as f32 / 96.;
         let size = ((w * s).round() as i32, (h * s).round() as i32);
-        paint(&self.device, self.palette, size.0, size.1, dpi, |c| {
+        paint(&self.device, palette, size.0, size.1, dpi, |c| {
             let radius = h / 2.;
             let track_tint = if c.p.dark {
                 (205, 222, 248)
@@ -424,10 +445,11 @@ impl Renderer {
 
     /// Repaints the slider of entry `index` after its value changed.
     pub fn menu_slider<C>(&mut self, index: usize, slider: &Slider<C>) -> Result<()> {
-        let Some(track) = self.menu.as_ref().map(|view| view.track) else {
+        let Some((track, palette)) = self.menu.as_ref().map(|view| (view.track, view.palette))
+        else {
             return Ok(());
         };
-        let surface = self.slider_surface(slider, track)?;
+        let surface = self.slider_surface(slider, track, palette)?;
         let view = self.menu.as_ref().expect("menu checked above");
         if let Some((_, visual)) = view.sliders.iter().find(|(i, _)| *i == index) {
             unsafe {

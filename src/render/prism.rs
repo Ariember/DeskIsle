@@ -97,6 +97,76 @@ impl Card {
 
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
+/// How the scene behind a glass body reads, so content on it can pick the ink that
+/// stands out most and the body can frost a busy scene a little more.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Tone {
+    /// Mean WCAG relative luminance (`0..=1`).
+    pub luminance: f32,
+    /// Standard deviation of gamma-encoded luma (`0..=0.5`): high where detail such as
+    /// text or sharp edges behind the glass would compete with its content.
+    pub busy: f32,
+}
+
+impl Tone {
+    /// The scene under `width` x `height` output pixels, read on an even grid of
+    /// samples. `None` when the scene holds no pixels.
+    pub fn measure(scene: &Scene, width: u32, height: u32) -> Option<Self> {
+        if !scene.valid() || width == 0 || height == 0 {
+            return None;
+        }
+        const COLUMNS: u32 = 24;
+        const ROWS: u32 = 12;
+        let linear = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (mut light, mut sum, mut squares) = (0f32, 0f32, 0f32);
+        for row in 0..ROWS {
+            let y = (row as f32 + 0.5) * height as f32 / ROWS as f32;
+            for column in 0..COLUMNS {
+                let x = (column as f32 + 0.5) * width as f32 / COLUMNS as f32;
+                let c = scene.sample(x, y);
+                light += dot3(c.map(linear), LUMA);
+                let luma = dot3(c, LUMA);
+                sum += luma;
+                squares += luma * luma;
+            }
+        }
+        let n = (COLUMNS * ROWS) as f32;
+        let mean = sum / n;
+        Some(Self {
+            luminance: light / n,
+            busy: (squares / n - mean * mean).max(0.).sqrt(),
+        })
+    }
+
+    /// Whether dark ink reads better than light ink. Without a `previous` choice this is
+    /// the luminance where black and white text have equal WCAG contrast; otherwise
+    /// the scene must cross well past it, so a background near the crossover does not
+    /// make the content flip at every sample.
+    pub fn light_ground(self, previous: Option<bool>) -> bool {
+        let crossover = match previous {
+            Some(true) => 0.12,
+            Some(false) => 0.26,
+            None => 0.179,
+        };
+        self.luminance > crossover
+    }
+
+    /// Opacity of the system-blurred layer under a clear body whose user frost is `base`:
+    /// busy scenes get up to a quarter more, never so much that the glass turns milky.
+    pub fn frost(self, base: f32) -> f32 {
+        if base <= 0. {
+            return 0.;
+        }
+        (base + 0.25 * smoothstep(0.10, 0.24, self.busy)).min(0.85)
+    }
+}
+
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -346,6 +416,59 @@ mod tests {
             }
         }
         pixels
+    }
+
+    fn uniform(pixel: [u8; 4], w: u32, h: u32) -> Vec<u8> {
+        pixel.repeat((w * h) as usize)
+    }
+
+    fn scene_of(pixels: &[u8], w: u32, h: u32) -> Scene<'_> {
+        Scene {
+            width: w,
+            height: h,
+            pixels,
+            scale_x: 1.,
+            scale_y: 1.,
+            offset_x: 0.,
+            offset_y: 0.,
+        }
+    }
+
+    #[test]
+    fn tone_picks_the_ink_with_more_contrast_and_holds_it_near_the_crossover() {
+        let (w, h) = (96, 32);
+        let light = uniform([235, 240, 245, 0], w, h);
+        let dark = uniform([40, 30, 20, 0], w, h);
+        let tone = |p: &[u8]| Tone::measure(&scene_of(p, w, h), w, h).unwrap();
+        assert!(tone(&light).light_ground(None));
+        assert!(!tone(&dark).light_ground(None));
+        // Saturated yellow is light enough for black text; saturated blue is not.
+        assert!(tone(&uniform([0, 220, 255, 0], w, h)).light_ground(None));
+        assert!(!tone(&uniform([255, 60, 0, 0], w, h)).light_ground(None));
+        // Mid gray (sRGB 118, luminance ~0.18) keeps whichever ink was already chosen.
+        let gray = tone(&uniform([118, 118, 118, 0], w, h));
+        assert!(gray.light_ground(Some(true)));
+        assert!(!gray.light_ground(Some(false)));
+    }
+
+    #[test]
+    fn busy_scenes_frost_more_than_flat_ones() {
+        let (w, h) = (96, 32);
+        let flat = uniform([90, 120, 150, 0], w, h);
+        // Black and white stripes, as text or a web page behind the glass would give.
+        let mut stripes = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x % 7 < 3 { 0 } else { 255 };
+                stripes.extend_from_slice(&[v, v, v, 0]);
+            }
+        }
+        let flat = Tone::measure(&scene_of(&flat, w, h), w, h).unwrap();
+        let busy = Tone::measure(&scene_of(&stripes, w, h), w, h).unwrap();
+        assert!((flat.frost(0.3) - 0.3).abs() < 1e-3);
+        assert!(busy.frost(0.3) > 0.5);
+        assert!(busy.frost(0.8) <= 0.85);
+        assert_eq!(busy.frost(0.), 0.);
     }
 
     #[test]

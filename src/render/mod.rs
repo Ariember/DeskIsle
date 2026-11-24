@@ -105,7 +105,8 @@ pub struct Renderer {
     write: IDWriteFactory,
     imaging: IWICImagingFactory,
     icons: Vec<IconLayer>,
-    bottom_size: Option<(Dimensions, bool)>,
+    /// Size, whether live glass lies beneath, and whether the palette is dark.
+    bottom_size: Option<(Dimensions, bool, bool)>,
     separator_centers: Vec<i32>,
     top_state: Option<TopState>,
     pub(crate) wallpaper_tint: Option<(u8, u8, u8)>,
@@ -188,8 +189,9 @@ struct IconLayer {
     shade: Option<(IDCompositionEffectGroup, Tween)>,
     /// The running indicator below the icon.
     dot: Option<IDCompositionVisual2>,
-    /// Active state, slot top, bar height and DPI the indicator was placed for.
-    dot_key: Option<(bool, i32, i32, u32)>,
+    /// Active state, slot top, bar height, DPI and dark palette the indicator was
+    /// placed for.
+    dot_key: Option<(bool, i32, i32, u32, bool)>,
 }
 
 const DURATION: f32 = 0.14;
@@ -381,7 +383,9 @@ impl IconLayer {
         dpi: u32,
     ) -> Result<bool> {
         let top = item.center_y - item.size / 2;
-        let key = item.running.then_some((item.active, top, height, dpi));
+        let key = item
+            .running
+            .then_some((item.active, top, height, dpi, palette.dark));
         if key == self.dot_key {
             return Ok(false);
         }
@@ -1046,7 +1050,7 @@ impl Renderer {
         let skin = self
             .appearance
             .get(Key::Appearance(AppearanceKey::DockSkin));
-        let palette = match skin {
+        let mut palette = match skin {
             1 => Palette::new(false, &self.appearance),
             2 => Palette::new(true, &self.appearance),
             _ => self.palette,
@@ -1075,6 +1079,13 @@ impl Renderer {
                 _ => 70,
             }
         };
+        let frost = if dock_custom {
+            self.appearance
+                .get(Key::Appearance(AppearanceKey::DockBlur)) as f32
+                / 100.
+        } else {
+            glass::DEFAULT_FROST
+        };
         let radius_px = Canvas::dock_radius(width as f32 / s, height as f32 / s, skin) * s;
         let mut dock_glass_active = false;
         if let (Some(engine), Some(surface)) = (&self.glass, &mut self.bottom_glass) {
@@ -1091,20 +1102,29 @@ impl Renderer {
                             strength: dock_strength,
                             rim: glass::rim::DOCK,
                         },
+                        frost,
                     )
                     .is_ok();
             if !dock_glass_active {
                 let _ = surface.hide();
             }
+            // With the theme's own skin over clear glass, separators and indicators
+            // take the ink that stands out on what lies behind the Dock.
+            if skin == 0
+                && dock_glass_active
+                && let Some(light) = surface.light_ground()
+            {
+                palette = Palette::new(!light, &self.appearance);
+            }
         }
-        let size = ((width, height, dpi), dock_glass_active);
+        let size = ((width, height, dpi), dock_glass_active, palette.dark);
         let layout_changed = self.icons.len() != items.len()
             || self.icons.iter().zip(items).any(|(layer, icon)| {
                 !layer.matches(icon, dpi) || layer.center != (icon.center_x, icon.center_y)
             });
         // A resized Dock re-centers on the screen, so the old offsets do not line up with
         // the new slots. Icons then take their places at once.
-        let slide = self.bottom_size.map(|(dim, _)| dim) == Some(size.0);
+        let slide = self.bottom_size.map(|(dim, ..)| dim) == Some(size.0);
         let panel_changed = self.bottom_size != Some(size) || self.separator_centers != separators;
         if panel_changed {
             let surface = paint(&self.device, palette, width, height, dpi, |c| {
