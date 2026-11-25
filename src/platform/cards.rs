@@ -47,7 +47,7 @@ impl DesktopCards {
         work: Rect,
         dpi: u32,
     ) -> Result<()> {
-        let Some(layout) = CardLayout::new(work, dpi, cards.len(), self.page) else {
+        let Some(layout) = CardLayout::new(work, dpi, cards, self.page) else {
             self.page = 0;
             self.hide();
             return Ok(());
@@ -182,7 +182,7 @@ fn desktop_icon_host() -> Option<HWND> {
 /// Clip the window and its input to the same set of rounded tiles. Desktop icons and
 /// the desktop context menu remain accessible in every gap.
 fn set_shape(hwnd: HWND, layout: &CardLayout, dpi: u32) -> Result<()> {
-    let diameter = (30. * dpi as f32 / 96.).round() as i32;
+    let diameter = (crate::ui::cards::CARD_RADIUS_DIP * 2. * dpi as f32 / 96.).round() as i32;
     unsafe {
         let region = Owned::new(CreateRectRgn(0, 0, 0, 0));
         if region.is_invalid() {
@@ -263,12 +263,7 @@ mod tests {
         };
         let data: Vec<_> = [CardState::Ready, CardState::Error, CardState::Setup]
             .into_iter()
-            .map(|state| Card {
-                title: "窗口测试".into(),
-                value: "42".into(),
-                detail: "显示与翻页".into(),
-                state,
-            })
+            .map(|state| Card::simple("窗口测试", "42", "显示与翻页", state))
             .collect();
         let desktop = desktop_icon_host().expect("Explorer desktop is running");
         window.update(&mut renderer, &data, work, monitor.dpi)?;

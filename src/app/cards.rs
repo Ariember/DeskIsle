@@ -43,12 +43,12 @@ impl CardReader {
                     reader.snapshot.lock().expect("card reader").dirty = false;
                     let cards = match storage::plugins_directory() {
                         Ok(directory) => load_cards(&directory),
-                        Err(_) => vec![Card {
-                            title: "桌面卡片".into(),
-                            value: "目录不可用".into(),
-                            detail: "请检查当前用户的应用数据目录".into(),
-                            state: CardState::Error,
-                        }],
+                        Err(_) => vec![Card::simple(
+                            "桌面卡片",
+                            "目录不可用",
+                            "请检查当前用户的应用数据目录",
+                            CardState::Error,
+                        )],
                     };
                     let mut snapshot = reader.snapshot.lock().expect("card reader");
                     let Some(owner) = snapshot.owner else { return };

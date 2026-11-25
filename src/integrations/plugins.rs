@@ -177,12 +177,7 @@ pub(crate) fn load_cards(dir: &Path) -> Vec<Card> {
 }
 
 fn error_card(title: &str, detail: &str) -> Card {
-    Card {
-        title: title.into(),
-        value: "暂不可用".into(),
-        detail: detail.into(),
-        state: CardState::Error,
-    }
+    Card::simple(title, "暂不可用", detail, CardState::Error)
 }
 
 fn read_document(path: &Path) -> io::Result<Publication> {

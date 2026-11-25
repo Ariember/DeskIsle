@@ -6,7 +6,7 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::cards::Card;
+use crate::cards::{Card, CardBlock, CardState};
 
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
@@ -30,11 +30,18 @@ struct ExtensionPoint {
 }
 
 // Each entry advertises and decodes one supported point/version pair.
-const EXTENSIONS: &[ExtensionPoint] = &[ExtensionPoint {
-    name: "desktop.cards",
-    version: 1,
-    decode: decode_cards,
-}];
+const EXTENSIONS: &[ExtensionPoint] = &[
+    ExtensionPoint {
+        name: "desktop.cards",
+        version: 1,
+        decode: decode_cards_v1,
+    },
+    ExtensionPoint {
+        name: "desktop.cards",
+        version: 2,
+        decode: decode_cards_v2,
+    },
+];
 
 pub(crate) fn capabilities() -> Value {
     let mut points: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
@@ -136,28 +143,136 @@ fn valid_text(text: &str, limit: usize, required: bool) -> bool {
             .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
-fn decode_cards(value: Value) -> Result<Contribution, String> {
+fn decode_cards_v1(value: Value) -> Result<Contribution, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct CardData {
+    struct CardV1 {
+        title: String,
+        value: String,
+        #[serde(default)]
+        detail: String,
+        #[serde(default)]
+        state: CardState,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CardDataV1 {
+        cards: Vec<CardV1>,
+    }
+    let data: CardDataV1 =
+        serde_json::from_value(value).map_err(|_| "desktop.cards 数据格式无效")?;
+    if data.cards.len() > 16 {
+        return Err("单个插件最多发布 16 张卡片".into());
+    }
+    let mut cards = Vec::with_capacity(data.cards.len());
+    for (i, card) in data.cards.into_iter().enumerate() {
+        validate_card_header(i, &card.title, &card.value, &card.detail)?;
+        cards.push(Card::simple(
+            card.title,
+            card.value,
+            card.detail,
+            card.state,
+        ));
+    }
+    Ok(Contribution::DesktopCards(cards))
+}
+
+fn decode_cards_v2(value: Value) -> Result<Contribution, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CardDataV2 {
         cards: Vec<Card>,
     }
-    let data: CardData = serde_json::from_value(value).map_err(|_| "desktop.cards 数据格式无效")?;
+    let data: CardDataV2 =
+        serde_json::from_value(value).map_err(|_| "desktop.cards v2 数据格式无效")?;
     if data.cards.len() > 16 {
         return Err("单个插件最多发布 16 张卡片".into());
     }
     for (i, card) in data.cards.iter().enumerate() {
-        for (name, value, limit, required) in [
-            ("title", &card.title, 64, true),
-            ("value", &card.value, 64, true),
-            ("detail", &card.detail, 160, false),
-        ] {
-            if !valid_text(value, limit, required) {
-                return Err(format!("第 {} 张卡片的 {name} 不符合文本规范", i + 1));
-            }
+        validate_card_header(i, &card.title, &card.value, &card.detail)?;
+        if !valid_text(&card.badge, 24, false) {
+            return Err(format!("第 {} 张卡片的 badge 不符合文本规范", i + 1));
+        }
+        if !valid_text(&card.footer, 96, false) {
+            return Err(format!("第 {} 张卡片的 footer 不符合文本规范", i + 1));
+        }
+        if card.blocks.len() > 6 {
+            return Err(format!("第 {} 张卡片最多包含 6 个区块", i + 1));
+        }
+        for (b, block) in card.blocks.iter().enumerate() {
+            validate_block(i, b, block)?;
         }
     }
     Ok(Contribution::DesktopCards(data.cards))
+}
+
+fn validate_card_header(i: usize, title: &str, value: &str, detail: &str) -> Result<(), String> {
+    for (name, text, limit, required) in [
+        ("title", title, 64, true),
+        ("value", value, 64, true),
+        ("detail", detail, 160, false),
+    ] {
+        if !valid_text(text, limit, required) {
+            return Err(format!("第 {} 张卡片的 {name} 不符合文本规范", i + 1));
+        }
+    }
+    Ok(())
+}
+
+fn validate_block(card_idx: usize, block_idx: usize, block: &CardBlock) -> Result<(), String> {
+    let prefix = format!("第 {} 张卡片第 {} 个区块", card_idx + 1, block_idx + 1);
+    match block {
+        CardBlock::Metrics { title, items } => {
+            if !valid_text(title, 32, false) {
+                return Err(format!("{prefix}的 title 不符合文本规范"));
+            }
+            if items.is_empty() || items.len() > 4 {
+                return Err(format!("{prefix}的 metrics 需要 1 至 4 项"));
+            }
+            for item in items {
+                if !valid_text(&item.label, 32, true)
+                    || !valid_text(&item.value, 32, true)
+                    || !valid_text(&item.sub, 48, false)
+                {
+                    return Err(format!("{prefix}包含不符合规范的指标文本"));
+                }
+            }
+        }
+        CardBlock::Segments { title, note, items } => {
+            if !valid_text(title, 32, false) || !valid_text(note, 32, false) {
+                return Err(format!("{prefix}的标题或备注不符合文本规范"));
+            }
+            if items.is_empty() || items.len() > 5 {
+                return Err(format!("{prefix}的 segments 需要 1 至 5 项"));
+            }
+            for item in items {
+                if item.share > 100
+                    || !valid_text(&item.label, 32, true)
+                    || !valid_text(&item.value, 24, false)
+                {
+                    return Err(format!("{prefix}包含不符合规范的分段项"));
+                }
+            }
+        }
+        CardBlock::Meters { title, items } => {
+            if !valid_text(title, 32, false) {
+                return Err(format!("{prefix}的 title 不符合文本规范"));
+            }
+            if items.is_empty() || items.len() > 4 {
+                return Err(format!("{prefix}的 meters 需要 1 至 4 项"));
+            }
+            for item in items {
+                if item.percent > 100
+                    || !valid_text(&item.label, 32, true)
+                    || !valid_text(&item.value, 24, true)
+                    || !valid_text(&item.detail, 48, false)
+                {
+                    return Err(format!("{prefix}包含不符合规范的进度条项"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn valid_plugin_id(id: &str) -> bool {
@@ -201,7 +316,7 @@ mod tests {
         let advertised = capabilities();
         assert_eq!(
             advertised,
-            json!({"protocol":1,"points":{"desktop.cards":[1]}})
+            json!({"protocol":1,"points":{"desktop.cards":[1, 2]}})
         );
         for (point, versions) in advertised["points"].as_object().unwrap() {
             for version in versions.as_array().unwrap() {
@@ -229,7 +344,7 @@ mod tests {
     #[test]
     fn negotiates_only_supported_points_and_rejects_duplicate_declarations() {
         let cards = cards_entry(json!([]));
-        for (name, version) in [("vendor.some-point", 1), ("desktop.cards", 2)] {
+        for (name, version) in [("vendor.some-point", 1), ("desktop.cards", 3)] {
             let mut other = json!({"point":name,"version":version,"data":42});
             assert!(parse_entries(json!([other])).is_err());
             other["required"] = json!(false);
@@ -285,21 +400,14 @@ mod tests {
         let base = json!({"title":"状态","value":"42"});
         let plugin = parse_entries(json!([cards_entry(json!([base]))])).unwrap();
         let Contribution::DesktopCards(cards) = &plugin.contributions[0];
-        assert_eq!(
-            cards,
-            &[Card {
-                title: "状态".into(),
-                value: "42".into(),
-                detail: String::new(),
-                state: CardState::Ready,
-            }]
-        );
+        assert_eq!(cards, &[Card::simple("状态", "42", "", CardState::Ready)]);
         for (field, input) in [
             ("title", json!("  ")),
             ("value", json!(42)),
             ("value", json!("界".repeat(65))),
             ("detail", json!("foo\nbar")),
             ("state", json!("private-payload")),
+            ("badge", json!("v2-only")),
             ("private-payload", json!(true)),
         ] {
             let mut invalid = base.clone();
@@ -315,6 +423,67 @@ mod tests {
         assert!(parse_entries(json!([cards_entry(json!(vec![base; 17]))])).is_err());
         let valid = json!({"title":"s","value":"v","detail":"界".repeat(160),"state":"setup"});
         assert!(parse_entries(json!([cards_entry(json!([valid]))])).is_ok());
+
+        let rich = json!({
+            "point": "desktop.cards",
+            "version": 2,
+            "data": {
+                "cards": [{
+                    "title": "Magpie 数据面板",
+                    "value": "$158.1",
+                    "detail": "4251 次请求 · 34 会话",
+                    "badge": "近7日 · 10:55",
+                    "blocks": [
+                        {
+                            "type": "metrics",
+                            "title": "TOKEN 统计",
+                            "items": [
+                                {"label": "总 Token", "value": "267M", "sub": "入 846K · 出 1.4M", "tone": "accent"},
+                                {"label": "缓存命中", "value": "93%", "sub": "读 248M · 写 17M", "tone": "good"}
+                            ]
+                        },
+                        {
+                            "type": "segments",
+                            "title": "模型占比",
+                            "note": "3 个模型",
+                            "items": [
+                                {"label": "opus-5-5", "share": 92, "value": "92%", "tone": "accent"},
+                                {"label": "swe-2", "share": 8, "value": "8%", "tone": "purple"}
+                            ]
+                        },
+                        {
+                            "type": "meters",
+                            "title": "订阅配额",
+                            "items": [
+                                {"label": "Codex", "value": "剩 6%", "detail": "14分重置", "percent": 6, "tone": "danger"}
+                            ]
+                        }
+                    ],
+                    "footer": "网关 127.0.0.1:3425"
+                }]
+            }
+        });
+        let parsed = parse_entries(json!([rich])).unwrap();
+        let Contribution::DesktopCards(rich_cards) = &parsed.contributions[0];
+        assert_eq!(rich_cards.len(), 1);
+        assert!(rich_cards[0].is_rich());
+        assert_eq!(rich_cards[0].blocks.len(), 3);
+
+        let bad_percent = json!({
+            "point": "desktop.cards",
+            "version": 2,
+            "data": {
+                "cards": [{
+                    "title": "Bad",
+                    "value": "0",
+                    "blocks": [{
+                        "type": "meters",
+                        "items": [{"label": "X", "value": "101%", "percent": 101}]
+                    }]
+                }]
+            }
+        });
+        assert!(parse_entries(json!([bad_percent])).is_err());
     }
 
     #[test]
