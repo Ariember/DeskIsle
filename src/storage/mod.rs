@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn only_global_blur_is_restored_from_old_appearance_settings() {
-        for (saved, expected) in [(None, 80), (Some("0"), 0), (Some("65"), 65)] {
+        for (saved, expected) in [(None, 65), (Some("0"), 0), (Some("65"), 65)] {
             let mut lines = vec!["appearance.dock.blur=15".to_string()];
             if let Some(value) = saved {
                 lines.push(format!("general.backdrop={value}"));

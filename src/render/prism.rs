@@ -94,8 +94,9 @@ impl Scene<'_> {
 
 /// One separable Gaussian pass. Store the result transposed so the same row
 /// filter can run vertically; the second pass restores the original orientation.
+/// Keep at least two samples per sigma so bilinear upsampling stays silky smooth.
 fn blur_rows(src: &[u8], width: u32, height: u32, sigma: f32, dest: &mut Vec<u8>) -> (u32, u32) {
-    let step = sigma.floor().max(1.) as u32;
+    let step = (sigma * 0.5).floor().max(1.) as u32;
     let columns = width.div_ceil(step);
     // Match Scene::sample's half-texel convention on the reduced grid.
     let center = (step - 1) as f32 * 0.5;
@@ -143,6 +144,13 @@ pub(super) struct Card {
     pub rim: f32,
     /// PrismGlass `opaqueSurface`: antialiased edges blend with the unrefracted scene.
     pub opaque: bool,
+    /// Apple Liquid Glass vibrancy and luminance-shaping strength (`0..=1`).
+    /// Zero preserves pure crystal transmission; higher values lift vibrancy and
+    /// shape luminance away from the foreground ink without heavy Acrylic fog.
+    pub frost: f32,
+    /// Whether the underlying scene is light (dark foreground ink), selecting
+    /// luminous pearlescent glass shaping over smoked obsidian shaping.
+    pub light_ground: bool,
 }
 
 impl Card {
@@ -158,6 +166,8 @@ impl Card {
             bevel_half_h: height * 0.5,
             rim,
             opaque: false,
+            frost: 0.,
+            light_ground: false,
         }
     }
 }
@@ -224,11 +234,48 @@ impl Tone {
         self.luminance > crossover
     }
 
-    /// Busy scenes fade out the remaining sharp detail faster. Both slider
-    /// endpoints still give exactly clear or fully system-blurred transmission.
-    pub fn frost(self, base: f32) -> f32 {
-        base + base * (1. - base) * smoothstep(0.10, 0.24, self.busy)
+    /// Normalized scene detail factor (`0..=1`): near zero on flat wallpapers, rising
+    /// toward one when sharp text or high-contrast edges lie behind the glass.
+    pub fn busy_factor(self) -> f32 {
+        smoothstep(0.10, 0.24, self.busy)
     }
+
+    /// Maps slider strength (`0..=1`) and measured scene detail to Apple Liquid Glass frost
+    /// opacity over the live desktop. Calm wallpapers stay airy and translucent; busy text
+    /// or sharp window edges smoothly lift the vibrant glass layer so foreground ink stays
+    /// crisp without turning the surface into opaque Acrylic.
+    pub fn frost(self, base: f32) -> f32 {
+        let base = base.clamp(0., 1.);
+        if base <= 0. {
+            return 0.;
+        }
+        let calm = base * (0.90 - 0.14 * base);
+        (calm + base * (1. - calm) * 0.72 * self.busy_factor()).min(0.92)
+    }
+}
+
+/// Shared Apple Liquid Glass vibrancy and adaptive luminance shaping used by both
+/// the CPU optical shader and the GPU `HostBackdropBrush` effect graph so the curved
+/// bevel melts seamlessly into the live glass body.
+pub(super) fn glass_color_params(light_ground: bool) -> (f32, f32, [f32; 3]) {
+    if light_ground {
+        // Luminous pearlescent crystal: vivid colors and airy bright floor for dark ink.
+        (1.62, 0.77, [0.205, 0.214, 0.228])
+    } else {
+        // Rich smoked obsidian crystal: glowing hues and deep floor for light ink.
+        (1.52, 0.67, [0.030, 0.037, 0.052])
+    }
+}
+
+fn shape_glass_color(c: [f32; 3], frost: f32, light_ground: bool) -> [f32; 3] {
+    let frost = frost.clamp(0., 1.);
+    let (sat_target, k_target, lift_target) = glass_color_params(light_ground);
+    let sat = mix(1.18, sat_target, frost);
+    let luma = dot3(c, LUMA);
+    let vivid = mix3([luma; 3], c, sat);
+    let veil = frost * 0.82;
+    let k = mix(1., k_target, veil);
+    std::array::from_fn(|i| (vivid[i] * k + lift_target[i] * veil).clamp(0., 1.))
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -387,9 +434,9 @@ fn shade(
             )
         };
         let strength = mix(0.78, 1., card.rim);
-        let (rx, ry) = bend(1. / (1.46 - 0.065));
-        let (gx_, gy_) = bend(1. / 1.46);
-        let (bx_, by_) = bend(1. / (1.46 + 0.065));
+        let (rx, ry) = bend(1. / (1.45 - 0.048));
+        let (gx_, gy_) = bend(1. / 1.45);
+        let (bx_, by_) = bend(1. / (1.45 + 0.048));
         let (ax, ay) = (px + gx_ * strength, py + gy_ * strength);
         let mut c = [
             scene.sample(px + rx * strength, py + ry * strength)[0],
@@ -421,37 +468,69 @@ fn shade(
         }
 
         let luminance = dot3(c, LUMA);
-        c = mix3([luminance; 3], c, 1.16);
         let bright = smoothstep(0.35, 0.88, luminance);
         let dark = 1. - smoothstep(0.04, 0.3, luminance);
         // Neutral backgrounds pick up a little surrounding color instead of a gray veil.
         let chroma = c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
         let ambient_luma = dot3(ambient, LUMA).max(0.12);
         let tinted = ambient.map(|v| v * luminance / ambient_luma);
-        c = mix3(c, tinted, (1. - smoothstep(0.05, 0.22, chroma)) * 0.08);
-        let clear = mix(1., 0.86, bright);
-        c = c.map(|v| v * clear);
-        for (k, lift) in [0.012, 0.018, 0.027].into_iter().enumerate() {
-            c[k] += lift * dark;
+        c = mix3(c, tinted, (1. - smoothstep(0.05, 0.22, chroma)) * 0.06);
+        if card.frost > 0. {
+            c = shape_glass_color(c, card.frost, card.light_ground);
+        } else {
+            c = mix3([luminance; 3], c, 1.18);
+            let clear = mix(1., 0.88, bright);
+            c = c.map(|v| v * clear);
+            for (k, lift) in [0.012, 0.018, 0.027].into_iter().enumerate() {
+                c[k] += lift * dark;
+            }
         }
         let fresnel = 0.04 + 0.96 * (1. - normal[2]).powi(5);
         let reflection = scene.sample(px + gx * bevel * 2., py + gy * bevel * 2.);
-        let mirror = [0.28, 0.32, 0.36];
+        let mirror = if card.frost > 0. && card.light_ground {
+            [0.34, 0.36, 0.40]
+        } else {
+            [0.24, 0.28, 0.34]
+        };
         let reflected: [f32; 3] = std::array::from_fn(|k| reflection[k] * 0.65 + mirror[k]);
-        c = mix3(c, reflected, fresnel * 0.38 * rim);
+        c = mix3(c, reflected, fresnel * 0.36 * rim);
 
-        let (lx, ly) = (-0.65f32, -0.85f32);
-        let ll = (lx * lx + ly * ly).sqrt();
-        let light = (gx * lx / ll + gy * ly / ll).max(0.).powi(4);
-        let specular = dot3(normal, normalize3([0.4, 0.6, 1.])).max(0.).powi(32);
-        let band = (-((depth - 0.9) / 0.48).powi(2)).exp();
-        let lift = band * (0.10 + 0.44 * light) * (1. - bright * 0.35) * mix(0.5, 1., card.rim)
-            + specular * rim * 0.16
-            - rim * (1. - light) * 0.045;
+        // Apple Liquid Glass dual opposing specular rim: a crisp primary highlight along
+        // the top-left contour paired with a softer bottom-right internal caustic glint,
+        // framed by an ultra-fine outer contrast edge so light glass separates cleanly
+        // over bright windows.
+        let (lx, ly) = (-0.60f32, -0.80f32);
+        let dot_l = gx * lx + gy * ly;
+        let light = dot_l.max(0.).powi(3);
+        let opposing = (-dot_l).max(0.).powi(3);
+        let specular = dot3(normal, normalize3([0.38, 0.58, 1.])).max(0.).powi(28);
+        let band = (-((depth - 0.9) / 0.50).powi(2)).exp();
+        let outer_edge = (-((depth - 0.15) / 0.42).powi(2)).exp();
+        let rim_scale = mix(0.5, 1., card.rim);
+        let rim_bright = if card.frost > 0. && card.light_ground {
+            1. - bright * 0.20
+        } else {
+            1. - bright * 0.32
+        };
+        let edge_dark = if card.frost > 0. && card.light_ground {
+            0.075
+        } else {
+            0.045
+        };
+        let lift = band * (0.13 + 0.46 * light + 0.23 * opposing) * rim_bright * rim_scale
+            + specular * rim * 0.14
+            - rim * (1. - light.max(opposing * 0.6)) * 0.032
+            - outer_edge * edge_dark * rim_scale;
         result = c.map(|v| v + lift);
     }
     if bevel_only {
-        return bevel_overlay(scene.sample(px, py), result, coverage);
+        let base = scene.sample(px, py);
+        let background = if card.frost > 0. {
+            shape_glass_color(base, card.frost, card.light_ground)
+        } else {
+            base
+        };
+        return bevel_overlay(background, result, coverage);
     }
     if card.opaque {
         result = mix3(scene.sample(px, py), result, coverage);
@@ -548,11 +627,16 @@ mod tests {
         }
         let flat = Tone::measure(&scene_of(&flat, w, h), w, h).unwrap();
         let busy = Tone::measure(&scene_of(&stripes, w, h), w, h).unwrap();
-        assert!((flat.frost(0.3) - 0.3).abs() < 1e-3);
-        assert!(busy.frost(0.3) > 0.5);
-        assert!(busy.frost(0.8) > 0.9);
+        assert!(flat.frost(0.65) < 0.60, "flat={}", flat.frost(0.65));
+        assert!(
+            busy.frost(0.65) > flat.frost(0.65) + 0.15,
+            "flat={} busy={}",
+            flat.frost(0.65),
+            busy.frost(0.65)
+        );
+        assert!(busy.frost(0.8) > flat.frost(0.8) + 0.15);
         assert_eq!(busy.frost(0.), 0.);
-        assert_eq!(busy.frost(1.), 1.);
+        assert!(busy.frost(1.) <= 0.92);
     }
 
     #[test]
@@ -712,5 +796,44 @@ mod tests {
             assert!((old - f32::from(prism[i + channel])).abs() <= 1.5);
             assert!((over(updated) - old).abs() > 20.);
         }
+    }
+
+    #[test]
+    fn apple_glass_shapes_light_and_dark_grounds_and_lights_opposing_rims() {
+        let (w, h) = (120u32, 60u32);
+        // Midtone saturated blue-teal scene (BGRA).
+        let pixels = uniform([190, 120, 60, 255], w, h);
+        let scene = scene_of(&pixels, w, h);
+        let mut light_card = Card::filling(0., 0., w as f32, h as f32, 16., 1.);
+        light_card.frost = 0.65;
+        light_card.light_ground = true;
+        let mut dark_card = light_card;
+        dark_card.light_ground = false;
+
+        let light = render(&scene, w, h, light_card, 4.8);
+        let dark = render(&scene, w, h, dark_card, 4.8);
+        let at = |buf: &[u8], x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+        let luma = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+
+        let light_mid = at(&light, w / 2, h / 2);
+        let dark_mid = at(&dark, w / 2, h / 2);
+        // Light ground produces a brighter airy crystal; dark ground a deeper smoked crystal,
+        // while both preserve strong blue chroma over red instead of washing out to gray.
+        assert!(
+            luma(light_mid) > luma(dark_mid) + 80,
+            "{light_mid:?} vs {dark_mid:?}"
+        );
+        assert!(light_mid[0] > light_mid[2] + 60, "light={light_mid:?}");
+        assert!(dark_mid[0] > dark_mid[2] + 60, "dark={dark_mid:?}");
+
+        // Both top-left primary rim and bottom-right opposing caustic rim catch light.
+        let top_left_rim = luma(at(&dark, 40, 1));
+        let bottom_right_rim = luma(at(&dark, w - 40, h - 2));
+        let body = luma(at(&dark, 40, 20));
+        assert!(top_left_rim > body + 20, "{top_left_rim} vs {body}");
+        assert!(bottom_right_rim > body + 5, "{bottom_right_rim} vs {body}");
     }
 }

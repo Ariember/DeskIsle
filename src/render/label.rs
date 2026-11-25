@@ -47,63 +47,67 @@ impl Renderer {
             }
         }
         let glass_active = glass_surface.is_some() || (glass_enabled && image.is_some());
-        let (top_tint, bottom_tint) = if self.palette.dark {
+        let light_ground = match &glass_surface {
+            Some(surface) => surface.light_ground(),
+            None => image
+                .filter(|_| glass_active)
+                .and_then(super::glass::light_ground),
+        };
+        let palette = match light_ground {
+            Some(light) => super::canvas::Palette::new(!light, &self.appearance).on_glass(),
+            None if glass_active => self.palette.on_glass(),
+            None => self.palette,
+        };
+        let (top_tint, bottom_tint) = if palette.dark {
             ((38, 46, 62), (18, 22, 32))
         } else {
             ((252, 254, 255), (235, 243, 252))
         };
-        let surface = paint(
-            &self.device,
-            self.palette,
-            rect.width,
-            rect.height,
-            dpi,
-            |c| {
-                let w = rect.width as f32 / c.scale;
-                let h = rect.height as f32 / c.scale;
-                let area = Area::new(0., 0., w, h);
-                if glass_surface.is_none()
-                    && glass_enabled
-                    && let Some(image) = image
-                {
-                    c.liquid_backdrop(
-                        image,
-                        area,
-                        LABEL_RADIUS,
-                        super::glass::rim::LABEL,
-                        strength as f32 / 100.,
-                    )?;
-                }
-                let eff_opacity = if glass_active {
-                    opacity * (1. - 0.50 * (strength as f32 / 100.) * (1. - opacity))
-                } else {
-                    opacity.max(0.88)
-                };
-                c.liquid_glass_shell(
+        let surface = paint(&self.device, palette, rect.width, rect.height, dpi, |c| {
+            let w = rect.width as f32 / c.scale;
+            let h = rect.height as f32 / c.scale;
+            let area = Area::new(0., 0., w, h);
+            if glass_surface.is_none()
+                && glass_enabled
+                && let Some(image) = image
+            {
+                c.liquid_backdrop(
+                    image,
                     area,
                     LABEL_RADIUS,
-                    super::glass::LiquidShell {
-                        top_tint,
-                        bottom_tint,
-                        opacity: eff_opacity,
-                        rim: 0.38 + 0.95 * border,
-                        glass_active,
-                    },
+                    super::glass::rim::LABEL,
+                    strength as f32 / 100.,
                 )?;
-                c.draw_text(
-                    &self.write,
-                    text,
-                    c.rect(6., 0., w - 6., h),
-                    Text {
-                        size: 13.,
-                        align: DWRITE_TEXT_ALIGNMENT_CENTER,
-                        ..Text::default()
-                    },
-                    c.p.ink,
-                    1.,
-                )
-            },
-        )?;
+            }
+            let eff_opacity = if glass_active {
+                opacity * (1. - 0.50 * (strength as f32 / 100.) * (1. - opacity))
+            } else {
+                opacity.max(0.88)
+            };
+            c.liquid_glass_shell(
+                area,
+                LABEL_RADIUS,
+                super::glass::LiquidShell {
+                    top_tint,
+                    bottom_tint,
+                    opacity: eff_opacity,
+                    rim: 0.38 + 0.95 * border,
+                    glass_active,
+                },
+            )?;
+            c.draw_text(
+                &self.write,
+                text,
+                c.rect(6., 0., w - 6., h),
+                Text {
+                    size: 13.,
+                    align: DWRITE_TEXT_ALIGNMENT_CENTER,
+                    ..Text::default()
+                },
+                c.p.ink,
+                1.,
+            )
+        })?;
         unsafe {
             bar.root.SetContent(&surface)?;
             self.device.Commit()?;

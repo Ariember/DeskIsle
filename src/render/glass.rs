@@ -9,15 +9,21 @@ use std::cell::RefCell;
 use std::mem::size_of;
 use std::time::Duration;
 
-use windows::Foundation::{Numerics::Plane, Size, TimeSpan};
-use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
+use windows::Foundation::{Numerics::Plane, PropertyValue, Size, TimeSpan};
+use windows::Graphics::{
+    DirectX::{DirectXAlphaMode, DirectXPixelFormat},
+    Effects::{
+        IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
+    },
+};
 use windows::System::{DispatcherQueue, DispatcherQueueController};
 use windows::UI::Composition::{
-    CompositionDrawingSurface, CompositionGraphicsDevice, CompositionRoundedRectangleGeometry,
-    Compositor, ContainerVisual, Desktop::DesktopWindowTarget, SpriteVisual,
+    CompositionBrush, CompositionDrawingSurface, CompositionEffectSourceParameter,
+    CompositionGraphicsDevice, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual,
+    Desktop::DesktopWindowTarget, SpriteVisual,
 };
 use windows::Win32::{
-    Foundation::{E_INVALIDARG, HWND, POINT, RECT},
+    Foundation::{E_INVALIDARG, E_NOTIMPL, HWND, POINT, RECT},
     Graphics::{
         Direct2D::{Common::*, *},
         Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -28,9 +34,13 @@ use windows::Win32::{
         },
         CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
         DispatcherQueueOptions,
+        Graphics::Direct2D::{
+            GRAPHICS_EFFECT_PROPERTY_MAPPING, IGraphicsEffectD2D1Interop,
+            IGraphicsEffectD2D1Interop_Impl,
+        },
     },
 };
-use windows::core::{Error, Interface, Result, h};
+use windows::core::{Error, GUID, HSTRING, Interface, PCWSTR, Result, h, implement};
 
 use crate::geometry::Rect;
 use crate::platform::backdrop::{self, Backdrop};
@@ -70,7 +80,118 @@ const SCENE_MARGIN: f32 = 64.;
 const OFFSCREEN: f32 = 48.;
 
 /// Filtering scale at maximum blur for wallpaper and captured backgrounds, in DIPs.
-const MAX_BLUR_DIP: f32 = 16.;
+/// Kept tight like Apple's Regular Liquid Glass so fine background text melts smoothly
+/// without turning the glass into thick, muddy Acrylic.
+const MAX_BLUR_DIP: f32 = 7.5;
+
+/// Lightweight D2D1 effect node implementing WinRT's `IGraphicsEffectD2D1Interop` so
+/// `Compositor::CreateEffectFactory` can apply Apple-style vibrancy and adaptive
+/// luminance shaping directly onto Windows' live `HostBackdropBrush` in DWM.
+#[implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
+struct D2DEffect {
+    id: GUID,
+    sources: Vec<IGraphicsEffectSource>,
+    properties: Vec<windows::Foundation::IPropertyValue>,
+}
+
+impl D2DEffect {
+    fn into_effect(self) -> IGraphicsEffect {
+        self.into()
+    }
+
+    fn into_source(self) -> IGraphicsEffectSource {
+        let effect: IGraphicsEffect = self.into();
+        effect
+            .cast()
+            .expect("IGraphicsEffect requires IGraphicsEffectSource")
+    }
+}
+
+impl IGraphicsEffectSource_Impl for D2DEffect_Impl {}
+
+impl IGraphicsEffect_Impl for D2DEffect_Impl {
+    fn Name(&self) -> Result<HSTRING> {
+        Ok(HSTRING::new())
+    }
+
+    fn SetName(&self, _name: &HSTRING) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl IGraphicsEffectD2D1Interop_Impl for D2DEffect_Impl {
+    fn GetEffectId(&self) -> Result<GUID> {
+        Ok(self.id)
+    }
+
+    fn GetNamedPropertyMapping(
+        &self,
+        _name: &PCWSTR,
+        _index: *mut u32,
+        _mapping: *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
+    ) -> Result<()> {
+        Err(Error::from_hresult(E_NOTIMPL))
+    }
+
+    fn GetPropertyCount(&self) -> Result<u32> {
+        Ok(self.properties.len() as u32)
+    }
+
+    fn GetProperty(&self, index: u32) -> Result<windows::Foundation::IPropertyValue> {
+        self.properties
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))
+    }
+
+    fn GetSource(&self, index: u32) -> Result<IGraphicsEffectSource> {
+        self.sources
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))
+    }
+
+    fn GetSourceCount(&self) -> Result<u32> {
+        Ok(self.sources.len() as u32)
+    }
+}
+
+fn saturation_effect(source: IGraphicsEffectSource, saturation: f32) -> Result<D2DEffect> {
+    Ok(D2DEffect {
+        id: CLSID_D2D1Saturation,
+        sources: vec![source],
+        properties: vec![PropertyValue::CreateSingle(saturation.clamp(0., 2.))?.cast()?],
+    })
+}
+
+fn color_matrix_effect(source: IGraphicsEffectSource, matrix: &[f32; 20]) -> Result<D2DEffect> {
+    Ok(D2DEffect {
+        id: CLSID_D2D1ColorMatrix,
+        sources: vec![source],
+        properties: vec![
+            PropertyValue::CreateSingleArray(matrix)?.cast()?,
+            // D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED = 1
+            PropertyValue::CreateUInt32(1)?.cast()?,
+            PropertyValue::CreateBoolean(true)?.cast()?,
+        ],
+    })
+}
+
+/// Premultiplied 5x4 color matrix mirroring `prism::glass_color_params` so the live
+/// GPU backdrop shares the same luminous pearlescent (light) or smoked obsidian (dark)
+/// optical curve as the refracted bevel.
+fn frost_color_matrix(light_ground: bool) -> (f32, [f32; 20]) {
+    let (sat, k, [lr, lg, lb]) = prism::glass_color_params(light_ground);
+    #[rustfmt::skip]
+    let matrix = [
+        k,  0., 0., 0.,
+        0., k,  0., 0.,
+        0., 0., k,  0.,
+        0., 0., 0., 1.,
+        lr, lg, lb, 0.,
+    ];
+    (sat, matrix)
+}
 
 /// PrismGlass `rimStrength` presets, named by the PrismGlass surface each mirrors.
 pub(super) mod rim {
@@ -117,6 +238,9 @@ struct Shown {
 pub(super) struct GlassEngine {
     compositor: Compositor,
     graphics: CompositionGraphicsDevice,
+    /// Cached vibrant Apple-style live backdrop brushes (light ground and dark ground).
+    light_frost: Option<CompositionBrush>,
+    dark_frost: Option<CompositionBrush>,
 }
 
 impl GlassEngine {
@@ -125,10 +249,41 @@ impl GlassEngine {
         let compositor = Compositor::new()?;
         let interop: ICompositorInterop = compositor.cast()?;
         let graphics = unsafe { interop.CreateGraphicsDevice(d2d)? };
+        let light_frost = Self::build_frost_brush(&compositor, true).ok();
+        let dark_frost = Self::build_frost_brush(&compositor, false).ok();
         Ok(Self {
             compositor,
             graphics,
+            light_frost,
+            dark_frost,
         })
+    }
+
+    /// Builds a DWM `CompositionEffectBrush` that runs `HostBackdropBrush` through
+    /// saturation vibrancy and adaptive light/dark luminance shaping, turning raw
+    /// Windows Acrylic into luminous Apple-style Liquid Glass.
+    fn build_frost_brush(compositor: &Compositor, light_ground: bool) -> Result<CompositionBrush> {
+        let backdrop = compositor.CreateHostBackdropBrush()?;
+        let param = CompositionEffectSourceParameter::Create(h!("backdrop"))?;
+        let source: IGraphicsEffectSource = param.cast()?;
+        let (sat, matrix) = frost_color_matrix(light_ground);
+        let vibrant = saturation_effect(source, sat)?.into_source();
+        let shaped = color_matrix_effect(vibrant, &matrix)?.into_effect();
+        let factory = compositor.CreateEffectFactory(&shaped)?;
+        let brush = factory.CreateBrush()?;
+        brush.SetSourceParameter(h!("backdrop"), &backdrop)?;
+        brush.cast()
+    }
+
+    fn frost_brush(&self, light_ground: bool) -> Result<CompositionBrush> {
+        if let Some(brush) = if light_ground {
+            &self.light_frost
+        } else {
+            &self.dark_frost
+        } {
+            return Ok(brush.clone());
+        }
+        self.compositor.CreateHostBackdropBrush()?.cast()
     }
 
     /// `hwnd` belongs to this UI thread and outlives the returned surface.
@@ -163,16 +318,18 @@ impl GlassEngine {
             clip_geom,
             core,
             frost,
+            frost_light: None,
             surface: None,
             current: None,
             light_ground: None,
         })
     }
 
-    /// A hidden layer showing the live content behind `hwnd` as the system blurs it.
+    /// A hidden layer showing the live content behind `hwnd` through Apple-style
+    /// vibrancy and luminance shaping (falling back to plain HostBackdropBrush).
     fn frost(&self, hwnd: HWND) -> Result<SpriteVisual> {
         backdrop::use_host_backdrop(hwnd)?;
-        let brush = self.compositor.CreateHostBackdropBrush()?;
+        let brush = self.frost_brush(false)?;
         let visual = self.compositor.CreateSpriteVisual()?;
         visual.SetBrush(&brush)?;
         visual.SetIsVisible(false)?;
@@ -270,6 +427,8 @@ pub(super) struct GlassSurface {
     core: SpriteVisual,
     /// System-blurred live backdrop under the clear body, when Windows provides one.
     frost: Option<SpriteVisual>,
+    /// Ground polarity currently bound to `frost`, so its brush only swaps on flip.
+    frost_light: Option<bool>,
     surface: Option<(CompositionDrawingSurface, u32, u32)>,
     current: Option<Shown>,
     /// Whether the last sampled scene is light enough for dark ink.
@@ -343,7 +502,8 @@ impl GlassSurface {
         // A bevel ray can reach outside the rectangle. Include its Gaussian
         // support (three sigma) and the next filtered texel for interpolation.
         let scale = crate::platform::window_dpi(self.hwnd) as f32 / 96.;
-        let blur_px = MAX_BLUR_DIP * scale * (spec.strength as f32 / 100.);
+        let strength_f = (spec.strength as f32 / 100.).clamp(0., 1.);
+        let blur_px = MAX_BLUR_DIP * scale * strength_f;
         let margin = SCENE_MARGIN + 4. * blur_px;
         let gx = ox as f32 + spec.x;
         let gy = oy as f32 + spec.y;
@@ -355,6 +515,7 @@ impl GlassSurface {
         let scene_r = (gr + margin).min(mr).ceil();
         let scene_b = (gb + margin).min(mb).ceil();
         let mut tone = None;
+        let mut light = self.light_ground.unwrap_or(false);
         let pixels = if scene_r > scene_l && scene_b > scene_t {
             let rect = Rect {
                 x: scene_l as i32,
@@ -380,9 +541,14 @@ impl GlassSurface {
             let t = if touches(gy, mt) { -OFFSCREEN } else { 0. };
             let r = width as f32 + if touches(gr, mr) { OFFSCREEN } else { 0. };
             let b = height as f32 + if touches(gb, mb) { OFFSCREEN } else { 0. };
+            tone = Tone::measure(&scene, width, height);
+            if let Some(tone) = tone {
+                light = tone.light_ground(self.light_ground);
+            }
             let mut card = Card::filling(l, t, r - l, b - t, radius, spec.rim);
             card.bevel_half_h = height as f32 * 0.5;
-            tone = Tone::measure(&scene, width, height);
+            card.frost = strength_f;
+            card.light_ground = light;
             match background {
                 Background::Wallpaper(_) => prism::render(&scene, width, height, card, blur_px),
                 Background::BehindWindow => {
@@ -431,19 +597,28 @@ impl GlassSurface {
         self.core.SetSize(size)?;
         if let Some(frost) = &self.frost {
             let opacity = match background {
-                Background::BehindWindow => {
-                    let base = spec.strength as f32 / 100.;
-                    tone.map_or(base, |tone| tone.frost(base))
-                }
+                Background::BehindWindow => tone
+                    .unwrap_or(Tone {
+                        luminance: 0.5,
+                        busy: 0.,
+                    })
+                    .frost(strength_f),
                 Background::Wallpaper(_) => 0.,
             };
+            if opacity > 0.
+                && self.frost_light != Some(light)
+                && let Ok(brush) = engine.frost_brush(light)
+            {
+                frost.SetBrush(&brush)?;
+                self.frost_light = Some(light);
+            }
             frost.SetOffset(plane.Normal)?;
             frost.SetSize(size)?;
             frost.SetOpacity(opacity)?;
             frost.SetIsVisible(opacity > 0.)?;
         }
-        if let Some(tone) = tone {
-            self.light_ground = Some(tone.light_ground(self.light_ground));
+        if tone.is_some() {
+            self.light_ground = Some(light);
         }
 
         self.frame.SetIsVisible(true)?;
@@ -581,7 +756,7 @@ impl Canvas {
             offset_x: 0.,
             offset_y: 0.,
         };
-        let card = Card::filling(
+        let mut card = Card::filling(
             0.,
             0.,
             width as f32,
@@ -589,12 +764,15 @@ impl Canvas {
             radius * self.scale,
             rim,
         );
+        card.frost = strength.clamp(0., 1.);
+        card.light_ground = Tone::measure(&scene, width, height)
+            .map_or(self.p.light_ground(), |tone| tone.light_ground(None));
         let pixels = render(
             &scene,
             width,
             height,
             card,
-            MAX_BLUR_DIP * self.scale * strength,
+            MAX_BLUR_DIP * self.scale * card.frost,
         );
         let bitmap = premultiplied_bitmap(&self.ctx, width, height, &pixels)?;
         let at = D2D_RECT_F {
@@ -1006,6 +1184,18 @@ mod tests {
         let _dcomp_target = unsafe { dcomp.CreateTargetForHwnd(hwnd.0, true)? };
 
         let engine = GlassEngine::new(&d2d)?;
+        // Verify both Apple vibrancy effect graphs compile inside Windows.UI.Composition
+        // instead of silently falling back to raw HostBackdropBrush.
+        assert!(
+            engine.light_frost.is_some(),
+            "light frost effect failed: {:?}",
+            GlassEngine::build_frost_brush(&engine.compositor, true).err()
+        );
+        assert!(
+            engine.dark_frost.is_some(),
+            "dark frost effect failed: {:?}",
+            GlassEngine::build_frost_brush(&engine.compositor, false).err()
+        );
         {
             let mut surface = engine.attach(hwnd.0)?;
             surface.update(

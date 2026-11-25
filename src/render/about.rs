@@ -120,7 +120,18 @@ impl Renderer {
             }
         }
         let backdrop = (glass && (live_glass || self.glass.is_none())).then_some(strength);
-        let surface = paint(&self.device, self.palette, width, height, dpi, |c| {
+        let light_ground = self
+            .about
+            .as_ref()
+            .filter(|_| live_glass)
+            .and_then(|view| view.glass.as_ref())
+            .and_then(super::glass::GlassSurface::light_ground);
+        let palette = match light_ground {
+            Some(light) => super::canvas::Palette::new(!light, &self.appearance).on_glass(),
+            None if live_glass => self.palette.on_glass(),
+            None => self.palette,
+        };
+        let surface = paint(&self.device, palette, width, height, dpi, |c| {
             self.paint_about(c, layout, backdrop)
         })?;
         let view = self.about.as_ref().expect("about card bound above");

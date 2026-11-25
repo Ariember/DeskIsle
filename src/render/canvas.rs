@@ -76,6 +76,24 @@ impl Palette {
         299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) < 127_500
     }
 
+    /// Strengthens secondary ink contrast over translucent Liquid Glass so labels,
+    /// subtitles and details stay crisp without needing heavy opaque blur.
+    pub(super) fn on_glass(self) -> Self {
+        Self {
+            ink: if self.dark {
+                (248, 249, 252)
+            } else {
+                (18, 20, 24)
+            },
+            muted: if self.dark {
+                (204, 208, 218)
+            } else {
+                (70, 74, 82)
+            },
+            ..self
+        }
+    }
+
     /// Match the foreground of an opaque window-caption color (a Win32 COLORREF), or the
     /// dark translucent scrim used by the gradient-mask top bar style.
     pub(super) fn for_top_bar(self, style: TopBarBackground, caption: Option<u32>) -> Self {
@@ -654,13 +672,13 @@ impl Canvas {
                 )
             }
             TopBarBackground::Frosted if frosted => {
-                // The glass core already darkens or lightens the backdrop behind the ink;
-                // this adds only a faint neutral veil so text holds up over busy spots,
-                // then a hairline sky glint on top and a soft specular edge at the bottom.
+                // `prism.rs` already applies Apple vibrancy and adaptive luminance shaping;
+                // keep the foreground veil whisper-light, framed by a hairline sky glint
+                // on top and a crisp specular edge along the bottom.
                 let (veil, veil_a) = if self.p.dark {
-                    ((0, 0, 0), 0.10)
+                    ((0, 0, 0), 0.04)
                 } else {
-                    ((255, 255, 255), 0.14)
+                    ((255, 255, 255), 0.06)
                 };
                 self.fill(l, t, r, b, 0., veil, veil_a)?;
                 self.fill(
@@ -670,9 +688,9 @@ impl Canvas {
                     (t + hairline).min(b),
                     0.,
                     (255, 255, 255),
-                    if self.p.dark { 0.10 } else { 0.30 },
+                    if self.p.dark { 0.14 } else { 0.34 },
                 )?;
-                let edge_a = if self.p.dark { 0.22 } else { 0.40 };
+                let edge_a = if self.p.dark { 0.26 } else { 0.44 };
                 self.gradient_stroke(
                     Area::new(l, b - hairline * 0.5, r, b - hairline * 0.5),
                     0.,

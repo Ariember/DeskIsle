@@ -47,14 +47,22 @@ impl Renderer {
         } else {
             1.08
         };
+        let glass_active = self.transparency && backdrop.is_some() && user_opacity < 1.;
+        let palette = match backdrop
+            .filter(|_| glass_active)
+            .and_then(super::glass::light_ground)
+        {
+            Some(light) => super::canvas::Palette::new(!light, &self.appearance).on_glass(),
+            None if glass_active => self.palette.on_glass(),
+            None => self.palette,
+        };
         paint_pixels(
             &self.d2d,
-            self.palette,
+            palette,
             layout.bounds.width,
             layout.bounds.height,
             dpi,
             |c| {
-                let glass_active = self.transparency && backdrop.is_some() && user_opacity < 1.;
                 let opacity = if glass_active { user_opacity } else { 1. };
                 if let Some(image) = backdrop {
                     if glass_active {

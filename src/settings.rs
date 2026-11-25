@@ -497,14 +497,14 @@ pub const SCHEMA: &[Spec] = &[
         id: "general.backdrop",
         section: Section::General,
         label: "玻璃背景模糊",
-        help: "统一调整 Dock、顶部栏和各玻璃面板背后的模糊强度",
+        help: "统一调整 Dock、顶部栏和各玻璃面板的液态玻璃柔化强度",
         control: Control::Slider {
             min: 0,
             max: 100,
             step: 5,
             unit: "%",
         },
-        default: 80,
+        default: 65,
         store: Store::File,
     },
     Spec {

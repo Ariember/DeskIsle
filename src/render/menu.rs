@@ -193,7 +193,8 @@ impl Renderer {
                 .and_then(super::glass::light_ground),
         };
         let palette = match light_ground {
-            Some(light) => Palette::new(!light, &self.appearance),
+            Some(light) => Palette::new(!light, &self.appearance).on_glass(),
+            None if glass_active => self.palette.on_glass(),
             None => self.palette,
         };
         let (top_tint, bottom_tint) = if palette.dark {
