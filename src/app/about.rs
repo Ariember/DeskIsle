@@ -19,6 +19,8 @@ pub(super) struct About {
     dpi: u32,
     /// Whether the card is painted translucent over the acrylic backdrop.
     glass: bool,
+    /// Another window may have changed the scene while it had focus.
+    was_inactive: bool,
 }
 
 /// The backdrop shows when transparency effects are on and either DeskIsle's live
@@ -57,6 +59,7 @@ impl Bars {
         )?;
         self.about = Some(About {
             glass: glass(&window, live_glass),
+            was_inactive: false,
             window,
             machine,
             layout,
@@ -88,7 +91,7 @@ impl Bars {
         renderer.draw_about(about.window.0, &about.layout, about.dpi, about.glass)
     }
 
-    fn draw_about(&mut self) -> Result<()> {
+    pub(super) fn draw_about(&mut self) -> Result<()> {
         match self.paint_about() {
             // Rebuilding the device for the bars repaints the card too.
             Err(error) if is_device_lost(&error) => self.rebuild_renderer(),
@@ -155,6 +158,23 @@ impl Bars {
         };
         let (hover, owner) = (about.layout.hover, about.window.0);
         let action = match event {
+            AboutEvent::Moved => {
+                if about.glass {
+                    return self.draw_about();
+                }
+                return Ok(());
+            }
+            AboutEvent::Activation(active) => {
+                let reactivated = active && about.was_inactive;
+                about.was_inactive = !active;
+                if reactivated && about.glass {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.invalidate_about_scene();
+                    }
+                    return self.draw_about();
+                }
+                return Ok(());
+            }
             AboutEvent::Move(x, y) => {
                 let hover = about.layout.hit(x, y);
                 return self.relayout_about(hover).map(drop);

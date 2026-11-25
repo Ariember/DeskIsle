@@ -62,7 +62,7 @@ impl Tones {
 /// The About card's composition target. It repaints only on hover and theme changes.
 pub(super) struct AboutView {
     hwnd: HWND,
-    glass: Option<super::glass::GlassSurface>,
+    pub(super) glass: Option<super::glass::GlassSurface>,
     // The target must outlive all commits to its root.
     _target: IDCompositionTarget,
     root: IDCompositionVisual2,
@@ -70,7 +70,7 @@ pub(super) struct AboutView {
 
 impl Renderer {
     /// Paints `layout` into `hwnd`, the About window, binding to it on first use and again
-    /// after the device was rebuilt. With glass enabled the card refracts the wallpaper.
+    /// after the device was rebuilt. With glass enabled the card refracts the scene behind it.
     pub fn draw_about(
         &mut self,
         hwnd: HWND,
@@ -102,7 +102,7 @@ impl Renderer {
         {
             live_glass = glass
                 && surface
-                    .update(
+                    .update_behind(
                         engine,
                         super::glass::GlassSpec {
                             x: 0.,
@@ -145,6 +145,12 @@ impl Renderer {
     pub fn close_about(&mut self) {
         if self.about.take().is_some() {
             let _ = unsafe { self.device.Commit() };
+        }
+    }
+
+    pub fn invalidate_about_scene(&mut self) {
+        if let Some(glass) = self.about.as_mut().and_then(|view| view.glass.as_mut()) {
+            glass.invalidate_scene();
         }
     }
 

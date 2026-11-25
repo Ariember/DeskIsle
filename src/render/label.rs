@@ -11,6 +11,13 @@ pub(crate) struct LabelView {
     _bar: Bar,
 }
 
+#[cfg(test)]
+impl LabelView {
+    pub(super) fn glass(&self) -> Option<&super::glass::GlassSurface> {
+        self._glass.as_ref()
+    }
+}
+
 const LABEL_RADIUS: f32 = 9.;
 
 impl Renderer {
@@ -42,7 +49,7 @@ impl Renderer {
                 strength,
                 rim: super::glass::rim::LABEL,
             };
-            if surface.update(engine, spec).is_ok() {
+            if surface.update_behind(engine, spec).is_ok() {
                 glass_surface = Some(surface);
             }
         }

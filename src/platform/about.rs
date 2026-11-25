@@ -56,6 +56,10 @@ pub enum AboutEvent {
     Leave,
     Click(i32, i32),
     Key(AboutKey),
+    /// The card settled at a new screen position.
+    Moved,
+    /// The card gained or lost activation.
+    Activation(bool),
     /// The card moved to a monitor with this DPI and already took the suggested size.
     Dpi(u32),
     Close,
@@ -64,6 +68,9 @@ pub enum AboutEvent {
 thread_local! {
     /// The close light and the button in client pixels. Everything else drags the card.
     static CONTROLS: Cell<[(i32, i32, i32, i32); 2]> = const { Cell::new([(0, 0, 0, 0); 2]) };
+    /// Suppresses per-frame bevel captures while the user drags the card; `WM_EXITSIZEMOVE`
+    /// captures once the drag settles while live composition tracks the interior throughout.
+    static SIZING_MOVING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The card's window. The second field records whether DWM accepted the backdrop.
@@ -114,15 +121,17 @@ impl AboutWindow {
                 (&raw const round).cast(),
                 size_of_val(&round) as u32,
             );
-            // DWM draws the backdrop only where the frame extends into the client area.
-            let edge = if glass { -1 } else { 1 };
-            let margins = MARGINS {
-                cxLeftWidth: edge,
-                cxRightWidth: edge,
-                cyTopHeight: edge,
-                cyBottomHeight: edge,
-            };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            // Extend the frame only for DWM acrylic. With composition glass, even a
+            // one-pixel extension introduces an opaque frame fill underneath clear glass.
+            if glass {
+                let margins = MARGINS {
+                    cxLeftWidth: -1,
+                    cxRightWidth: -1,
+                    cyTopHeight: -1,
+                    cyBottomHeight: -1,
+                };
+                let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            }
             Ok(window)
         }
     }
@@ -193,6 +202,7 @@ impl Drop for AboutWindow {
         // Created and destroyed on the UI thread; drop input the window still queued.
         let _ = unsafe { DestroyWindow(self.0) };
         EVENTS.with_borrow_mut(|events| events.retain(|e| !matches!(e, Event::About(_))));
+        SIZING_MOVING.set(false);
     }
 }
 
@@ -201,6 +211,29 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     let event = match msg {
         // The client area takes the whole window; DeskIsle draws the card itself.
         WM_NCCALCSIZE => return LRESULT(0),
+        WM_ENTERSIZEMOVE => {
+            SIZING_MOVING.set(true);
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        WM_EXITSIZEMOVE => {
+            SIZING_MOVING.set(false);
+            if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                queue(hwnd, Event::About(AboutEvent::Moved));
+            }
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        WM_MOVE if !SIZING_MOVING.get() && unsafe { IsWindowVisible(hwnd) }.as_bool() => {
+            AboutEvent::Moved
+        }
+        WM_ACTIVATE => {
+            queue(
+                hwnd,
+                Event::About(AboutEvent::Activation(
+                    wp.0 & 0xffff != WA_INACTIVE as usize,
+                )),
+            );
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
         WM_NCHITTEST => {
             let mut point = POINT { x, y };
             let _ = unsafe { ScreenToClient(hwnd, &mut point) };

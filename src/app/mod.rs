@@ -728,6 +728,8 @@ impl Bars {
         // Dock even if the foreground window and its bounds are unchanged.
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.invalidate_dock_scene();
+            renderer.invalidate_about_scene();
+            renderer.invalidate_launchpad_scene();
         }
         self.dock_foreground_frame =
             platform::overlapping_window_frame(platform::foreground(), self.layout.bottom);
@@ -743,6 +745,7 @@ impl Bars {
         self.update_theme_from_desktop()?;
         self.draw()?;
         self.relayout_panel()?;
+        self.draw_about()?;
         self.resize_launchpad()
     }
 

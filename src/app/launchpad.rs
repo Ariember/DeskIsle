@@ -188,11 +188,12 @@ impl Bars {
     /// of live acrylic while the launchpad remains open.
     pub(super) fn refresh_launchpad_desktop(&mut self) -> Result<()> {
         if let Some(pad) = &mut self.launchpad
-            && pad.background.is_some_and(|bg| {
-                bg.wallpaper || self.settings.enabled(Appearance(LaunchpadDynamic))
-            })
+            && pad.background.is_some_and(|bg| bg.wallpaper || bg.dynamic)
         {
             pad.background = None;
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.invalidate_launchpad_scene();
+            }
             self.draw_launchpad()?;
         }
         Ok(())

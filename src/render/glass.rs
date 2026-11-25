@@ -219,7 +219,7 @@ pub(super) struct GlassSpec {
     pub rim: f32,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Background {
     Wallpaper(u64),
     BehindWindow,
@@ -1458,6 +1458,89 @@ mod tests {
                 assert_eq!(shown.spec.strength, strength);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop for behind-window sampling"]
+    fn floating_glass_surfaces_sample_behind_window() -> Result<()> {
+        use crate::machine::{Form, Machine};
+        use crate::render::Renderer;
+        use crate::ui::{about::AboutLayout, launchpad::LaunchpadLayout};
+
+        let _winrt = WinRtGuard::init()?;
+        let top = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 0, 0, 480, 40)?;
+        let dock = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 40, 160, 180, 56)?;
+        let about = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 80, 80, 280, 320)?;
+        let label = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 100, 120, 96, 28)?;
+        let pad = TestWindow::new(WS_EX_NOREDIRECTIONBITMAP, 0, 40, 480, 320)?;
+        let settings = Settings::default();
+        let mut renderer = Renderer::new(top.0, dock.0, false, &settings)?;
+        renderer.set_transparency(true);
+
+        let machine = Machine {
+            name: "DeskIsle".into(),
+            model: None,
+            form: Form::Laptop,
+            cpu: None,
+            gpu: None,
+            memory: None,
+            os: None,
+        };
+        let about_layout = AboutLayout::new(&machine, 96, None, |text, size, bold| {
+            renderer.measure(text, size, bold)
+        });
+        renderer.draw_about(about.0, &about_layout, 96, true)?;
+        let about_shown = renderer
+            .about
+            .as_ref()
+            .and_then(|v| v.glass.as_ref())
+            .and_then(|s| s.current)
+            .expect("about glass");
+        assert_eq!(about_shown.background, Background::BehindWindow);
+        renderer.invalidate_about_scene();
+        assert!(
+            renderer
+                .about
+                .as_ref()
+                .and_then(|v| v.glass.as_ref())
+                .is_some_and(|s| s.current.is_none())
+        );
+
+        let label_rect = Rect {
+            x: 100,
+            y: 120,
+            width: 96,
+            height: 28,
+        };
+        let label_view = renderer.draw_label(label.0, label_rect, 96, "Editor", None)?;
+        let label_shown = label_view
+            .glass()
+            .and_then(|s| s.current)
+            .expect("label glass");
+        assert_eq!(label_shown.background, Background::BehindWindow);
+        drop(label_view);
+
+        let pad_layout = LaunchpadLayout::new(480, 320, 260, 96, &[], "", 0);
+        renderer.draw_launchpad(pad.0, &pad_layout, &[], "", None, true)?;
+        let pad_shown = renderer
+            .launchpad
+            .as_ref()
+            .and_then(|v| v.glass.as_ref())
+            .and_then(|s| s.current)
+            .expect("launchpad glass");
+        assert_eq!(pad_shown.background, Background::BehindWindow);
+        renderer.invalidate_launchpad_scene();
+        assert!(
+            renderer
+                .launchpad
+                .as_ref()
+                .and_then(|v| v.glass.as_ref())
+                .is_some_and(|s| s.current.is_none())
+        );
+
+        renderer.close_about();
+        renderer.close_launchpad();
         Ok(())
     }
 }

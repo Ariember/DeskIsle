@@ -33,7 +33,7 @@ const DEEPEN: f32 = 0.26;
 
 pub(super) struct LaunchpadView {
     hwnd: HWND,
-    glass: Option<super::glass::GlassSurface>,
+    pub(super) glass: Option<super::glass::GlassSurface>,
     bar: Bar,
     highlight: IDCompositionVisual2,
     fade: IDCompositionEffectGroup,
@@ -169,7 +169,7 @@ impl Renderer {
         if let (Some(engine), Some(surface)) = (&self.glass, &mut view.glass) {
             live_glass = want_live
                 && surface
-                    .update(
+                    .update_behind(
                         engine,
                         super::glass::GlassSpec {
                             x: 0.,
@@ -370,6 +370,12 @@ impl Renderer {
     pub fn close_launchpad(&mut self) {
         if self.launchpad.take().is_some() {
             let _ = unsafe { self.device.Commit() };
+        }
+    }
+
+    pub fn invalidate_launchpad_scene(&mut self) {
+        if let Some(glass) = self.launchpad.as_mut().and_then(|view| view.glass.as_mut()) {
+            glass.invalidate_scene();
         }
     }
 
