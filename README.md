@@ -82,7 +82,9 @@ DeskIsle 是面向 Windows 11 的桌面工具，在主屏提供仿 macOS 的半�
 
 ### 下载发布版
 
-在 [GitHub Releases](https://github.com/Ariember/DeskIsle/releases) 下载最新版本的 `deskisle.exe`，放到任意目录后直接运行，无需安装。发布版未做代码签名，首次运行时 Windows SmartScreen 可能提示，确认来源后选择“仍要运行”。
+在 [GitHub Releases](https://github.com/Ariember/DeskIsle/releases) 下载最新版本的 `deskisle.exe`，放到任意目录后直接运行，无需安装。发布版未做代码签名，首次运行时 SmartScreen 可能提示发布者未知。
+
+如果 Windows 安全中心报告具体威胁或隔离了文件，请保留隔离，在“病毒和威胁防护”中更新安全情报，再从同一发布页重新下载并扫描。可用 `Get-FileHash .\deskisle.exe -Algorithm SHA256` 对照该版本下载项旁的 SHA-256。若仍有检出，请在项目 issue 中提供版本、威胁名称和安全情报版本，以便维护者向 Microsoft 提交复核。
 
 支持自动更新的 x64 版本会在启动后检查稳定版，持续运行时每 24 小时再检查一次。发现新版时，选择“是”会下载、校验更新文件，并从原位置重启 DeskIsle。选择“否”可继续使用当前版本。自动更新需要对程序所在目录有写入权限，设置和固定项保存在原来的用户目录。
 
@@ -206,7 +208,7 @@ cargo test --locked
 
 向 `main` 提交 PR 或推送代码时，GitHub Actions 会在 Windows x64 上运行格式检查、Clippy、测试和 Release 构建。需要交互式桌面的测试仍由开发者在本机运行。
 
-发布新版本时，更新 `Cargo.toml` 的 `[package].version`，运行 `cargo check` 同步 `Cargo.lock`，将两者一起合入 `main`。检查通过后，工作流会为尚未发布的版本在本次提交上创建 `v<版本号>` 标签和 GitHub Release，生成发布说明，并附上 `deskisle.exe`。已发布的版本会跳过，带预发布标识的版本（如 `0.2.0-beta.1`）会标记为预发布。
+发布新版本时，更新 `Cargo.toml` 的 `[package].version`，运行 `cargo check` 同步 `Cargo.lock`，将两者一起合入 `main`。工作流在发布前更新 Microsoft Defender 安全情报并扫描待上传的 `deskisle.exe`，检出威胁或检查失败会中止发布。通过后，工作流在本次提交上创建 `v<版本号>` 标签和 GitHub Release，生成发布说明，并附上该文件。已发布的版本会跳过，带预发布标识的版本（如 `0.2.0-beta.1`）会标记为预发布。
 
 </details>
 

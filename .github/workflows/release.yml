@@ -87,6 +87,16 @@ jobs:
             if ($commit.sha -ne $env:GITHUB_SHA) { throw "Tag $tag points to a different commit." }
           }
 
+          $asset = (Get-Item -LiteralPath 'deskisle.exe').FullName
+          $defender = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          & $defender -SignatureUpdate -MMPC
+          if ($LASTEXITCODE -ne 0) { throw "Defender signature update failed ($LASTEXITCODE)." }
+          $definitions = (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion
+          Write-Host "Scanning $tag SHA-256 $((Get-FileHash -LiteralPath $asset).Hash) with Defender $definitions"
+          # This custom scan ignores runner path exclusions and reports detections without remediation.
+          & $defender -Scan -ScanType 3 -File $asset -DisableRemediation
+          if ($LASTEXITCODE -ne 0) { throw "Defender detected a threat or could not scan the release ($LASTEXITCODE)." }
+
           $options = @('--target', $env:GITHUB_SHA, '--generate-notes')
           if (($env:VERSION -split '\+')[0].Contains('-')) { $options += '--prerelease' }
-          gh release create $tag deskisle.exe @options
+          gh release create $tag $asset @options
