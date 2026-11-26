@@ -1372,7 +1372,7 @@ pub fn confirm_power(owner: HWND, restart: bool) -> Result<bool> {
 
 pub fn confirm_update(owner: HWND, version: &str) -> Result<bool> {
     let text = HSTRING::from(format!(
-        "发现 DeskIsle {version}（当前版本 {}）。现在下载并重启 DeskIsle 吗？",
+        "发现 DeskIsle {version}（当前版本 {}）。现在下载安装包，为当前用户安装新版并重启 DeskIsle 吗？",
         env!("CARGO_PKG_VERSION")
     ));
     let answer = unsafe {

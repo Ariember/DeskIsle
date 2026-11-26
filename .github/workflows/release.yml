@@ -39,14 +39,24 @@ jobs:
       - name: Run tests
         run: cargo +stable test --locked
 
-      - name: Build release executable
-        run: cargo +stable build --release --locked
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Build Windows installer
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: ./scripts/package-windows.ps1
+
+      - name: Test install, reinstall and uninstall
+        run: |
+          $release = 'target/x86_64-pc-windows-msvc/release'
+          ./scripts/test-installer.ps1 -Installer "$release/DeskIsle-Setup-x64.exe" -Executable "$release/deskisle.exe"
 
       - uses: actions/upload-artifact@v7
         if: github.event_name == 'push'
         with:
           name: deskisle-windows-x64
-          path: target/release/deskisle.exe
+          path: target/x86_64-pc-windows-msvc/release/DeskIsle-Setup-x64.exe
           if-no-files-found: error
 
   release:
@@ -87,7 +97,7 @@ jobs:
             if ($commit.sha -ne $env:GITHUB_SHA) { throw "Tag $tag points to a different commit." }
           }
 
-          $asset = (Get-Item -LiteralPath 'deskisle.exe').FullName
+          $asset = (Get-Item -LiteralPath 'DeskIsle-Setup-x64.exe').FullName
           $defender = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
           & $defender -SignatureUpdate -MMPC
           if ($LASTEXITCODE -ne 0) { throw "Defender signature update failed ($LASTEXITCODE)." }

@@ -15,31 +15,23 @@ use windows::core::GUID;
 const INSTALL_SCRIPT: &str = include_str!("update/install.ps1");
 
 pub struct StagedUpdate {
-    exe: PathBuf,
     directory: PathBuf,
     payload: PathBuf,
     handed_off: bool,
 }
 
 pub fn stage() -> Result<StagedUpdate, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序：{e}"))?;
-    StagedUpdate::beside(exe)
+    let id = GUID::new().map_err(|e| e.to_string())?;
+    let directory = std::env::temp_dir().join(format!("deskisle-update-{id:?}"));
+    fs::create_dir(&directory).map_err(|e| format!("无法暂存安装包：{e}"))?;
+    Ok(StagedUpdate {
+        payload: directory.join("DeskIsle-Setup-x64.exe"),
+        directory,
+        handed_off: false,
+    })
 }
 
 impl StagedUpdate {
-    fn beside(exe: PathBuf) -> Result<Self, String> {
-        let parent = exe.parent().ok_or("无法定位程序目录")?;
-        let id = GUID::new().map_err(|e| e.to_string())?;
-        let directory = parent.join(format!(".deskisle-update-{id:?}"));
-        fs::create_dir(&directory).map_err(|e| format!("无法在程序目录中暂存更新：{e}"))?;
-        Ok(Self {
-            exe,
-            payload: directory.join("deskisle.exe"),
-            directory,
-            handed_off: false,
-        })
-    }
-
     pub fn path(&self) -> &Path {
         &self.payload
     }
@@ -99,8 +91,7 @@ fn helper_command(stage: &StagedUpdate, entry: &'static str) -> Result<Command, 
     command
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(format!("{INSTALL_SCRIPT}\n{entry}"))
-        .env("DESKISLE_UPDATE_EXE", &stage.exe)
-        .env("DESKISLE_UPDATE_DIR", &stage.directory)
+        .env("DESKISLE_UPDATE_PACKAGE", stage.path())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW.0);
@@ -111,22 +102,28 @@ fn helper_command(stage: &StagedUpdate, entry: &'static str) -> Result<Command, 
 mod tests {
     use super::*;
 
-    // A console utility blocked on stdin stands in for the running Dock, so
-    // these tests exercise real executable sharing, shutdown and process launch.
-    fn run_update(valid: bool) {
-        let root =
-            std::env::temp_dir().join(format!("便携 [A&B] '{}'", GUID::new().unwrap().to_u128()));
+    fn run_update(setup_succeeds: bool) {
+        let root = std::env::temp_dir().join(format!(
+            "DeskIsle [A&B] '{}'",
+            GUID::new().unwrap().to_u128()
+        ));
         fs::create_dir(&root).unwrap();
-        let exe = root.join("my dock.exe");
-        let system = system_directory().unwrap();
-        let old = fs::read(system.join("findstr.exe")).unwrap();
-        let new = if valid {
-            fs::read(system.join("whoami.exe")).unwrap()
+        let target = root.join("deskisle.cmd");
+        let launched = root.join("launched.txt");
+        fs::write(&target, "@echo old>launched.txt\r\n").unwrap();
+
+        // A batch fixture implements the installer's /S contract and leaves a
+        // launch marker through the app it installs. No real profile is changed.
+        let mut stage = stage().unwrap();
+        stage.payload.set_extension("cmd");
+        let setup = if setup_succeeds {
+            "@if not \"%1\"==\"/S\" exit /b 2\r\n@echo @echo new ^>launched.txt > \"%DESKISLE_TEST_TARGET%\"\r\n"
         } else {
-            b"invalid executable".to_vec()
+            "@exit /b 23\r\n"
         };
-        fs::write(&exe, &old).unwrap();
-        let mut parent = Command::new(&exe)
+        fs::write(stage.path(), setup).unwrap();
+
+        let mut parent = Command::new(system_directory().unwrap().join("findstr.exe"))
             .arg(".")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -134,48 +131,59 @@ mod tests {
             .creation_flags(CREATE_NO_WINDOW.0)
             .spawn()
             .unwrap();
-        let stage = StagedUpdate::beside(exe.clone()).unwrap();
-        fs::write(stage.path(), &new).unwrap();
-        let mut helper = helper_command(&stage, "Invoke-DeskIsleUpdate")
-            .unwrap()
-            .env("DESKISLE_UPDATE_PID", parent.id().to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut helper = helper_command(
+            &stage,
+            "$target = $env:DESKISLE_TEST_TARGET\nInvoke-DeskIsleUpdate",
+        )
+        .unwrap()
+        .env("DESKISLE_TEST_TARGET", &target)
+        .env("DESKISLE_UPDATE_PID", parent.id().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
         let mut ready = String::new();
         BufReader::new(helper.stdout.take().unwrap())
             .read_line(&mut ready)
             .unwrap();
         assert_eq!(ready.trim(), "ready");
-        assert_eq!(fs::read(&exe).unwrap(), old);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "@echo old>launched.txt\r\n"
+        );
         drop(parent.stdin.take());
         parent.wait().unwrap();
         let result = helper.wait_with_output().unwrap();
         assert_eq!(
             result.status.success(),
-            valid,
+            setup_succeeds,
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert_eq!(fs::read(&exe).unwrap(), if valid { new } else { old });
         assert!(!stage.directory.exists());
-        // The relaunched fixture exits on its own, releasing its image mapping.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while let Err(e) = fs::remove_file(&exe) {
-            assert!(std::time::Instant::now() < deadline, "{e}");
-            std::thread::sleep(Duration::from_millis(25));
+        if setup_succeeds {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !fs::read_to_string(&launched).is_ok_and(|s| s.trim() == "new") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "updated app did not start"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        } else {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("23"));
+            assert!(!launched.exists());
         }
-        fs::remove_dir(root).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn replaces_the_running_portable_exe_after_exit() {
+    fn runs_setup_after_exit_and_launches_the_installed_app() {
         run_update(true);
     }
 
     #[test]
-    fn restores_the_original_when_the_download_cannot_start() {
+    fn reports_setup_failure_without_launching_the_app() {
         run_update(false);
     }
 }

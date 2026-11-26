@@ -111,8 +111,8 @@ impl GithubRelease {
         let asset = self
             .assets
             .into_iter()
-            .find(|asset| asset.name == "deskisle.exe" && asset.state == "uploaded")
-            .ok_or("此版本缺少 deskisle.exe 发布文件。")?;
+            .find(|asset| asset.name == "DeskIsle-Setup-x64.exe" && asset.state == "uploaded")
+            .ok_or("此版本缺少 Windows x64 安装包。")?;
         if !(1..=MAX_ASSET_SIZE).contains(&asset.size) {
             return Err("更新文件大小无效。".into());
         }
@@ -238,7 +238,7 @@ mod tests {
             prerelease: false,
             assets: vec![Asset {
                 id: 23,
-                name: "deskisle.exe".into(),
+                name: "DeskIsle-Setup-x64.exe".into(),
                 state: "uploaded".into(),
                 size: 3,
                 digest: Some(format!("sha256:{:x}", Sha256::digest(b"abc"))),
@@ -274,7 +274,7 @@ mod tests {
         release.assets[0].digest = None;
         assert!(release.update_for(&current).is_err());
         let mut release = fixture("v0.10.0");
-        release.assets[0].name = "setup.exe".into();
+        release.assets[0].name = "deskisle.exe".into();
         assert!(release.update_for(&current).is_err());
     }
 

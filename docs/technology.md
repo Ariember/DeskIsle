@@ -17,13 +17,15 @@ Dock 悬停预览通过现有的 `windows` 依赖调用 DWM 缩略图接口，�
 
 ## 插件接入
 
-DeskIsle 采用进程外发布协议。插件通过命令行或本地文件提交 UTF-8 JSON，宿主使用已有的 serde 校验文档，并按扩展点名称和版本分派数据。插件可自行选择语言和第三方依赖。桌面卡片沿用 DirectComposition；主程序继续分发单个可执行文件。接入方式见[插件协议 v1](plugins.md)。
+DeskIsle 采用进程外发布协议。插件通过命令行或本地文件提交 UTF-8 JSON，宿主使用已有的 serde 校验文档，并按扩展点名称和版本分派数据。插件可自行选择语言和第三方依赖。桌面卡片沿用 DirectComposition。接入方式见[插件协议 v1](plugins.md)。
 
 插件市场使用独立项目维护静态 JSON 索引和声明式卡片包。默认通过 GitHub Releases API 查询最新稳定标签，用 GitHub 原始文件服务读取该标签的索引和包。宿主也支持显式指定 HTTPS 索引或本地索引。安装器复用已有的 `ureq`、`sha2` 和插件协议校验器，按索引校验包内容后保存。
 
-## 自动更新
+## 安装与自动更新
 
-Windows x64 继续分发单个可执行文件。后台线程通过 `ureq` 和 TLS 访问 GitHub Releases API，用 `serde_json` 读取资产元数据、`semver` 比较标签、`sha2` 校验下载内容。程序将安装脚本嵌入可执行文件，由系统自带的 Windows PowerShell 在旧进程退出后调用 `File.Replace` 并保留备份，直到 Windows 成功创建新版进程。安装需要程序目录可写，且系统允许启动 Windows PowerShell。
+Windows x64 使用 NSIS 3 将 Release 构建打包为 `DeskIsle-Setup-x64.exe`。安装包管理当前用户的程序目录、开始菜单快捷方式和 Windows 卸载项，安装和更新均无需管理员权限。程序和用户配置分开存放，卸载后可在重新安装时继续使用原设置。
+
+后台线程通过 `ureq` 和 TLS 访问 GitHub Releases API，用 `serde_json` 读取资产元数据、`semver` 比较标签、`sha2` 校验下载的安装包。用户确认更新后，辅助进程等待主程序退出，再运行同一份安装包，成功后启动新版。
 
 ## 资源监控采样
 
