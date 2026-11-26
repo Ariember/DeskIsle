@@ -695,12 +695,14 @@ pub struct ProjectLink {
     pub title: &'static str,
     pub action: Action,
     pub row: Area,
-    pub button: Area,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AboutPage {
-    pub heading: Area,
+    pub compact: bool,
+    pub icon: Area,
+    pub name: Area,
+    pub version: Area,
     pub check_button: Area,
     pub check_label: &'static str,
     pub links: [ProjectLink; 2],
@@ -708,12 +710,30 @@ pub struct AboutPage {
 
 impl AboutPage {
     fn new(view: Area) -> Self {
-        // Leave both link rows visible even at the minimum panel height.
-        let row_height = 44.;
-        let heading_bottom = (view.top + 92.).min(view.bottom - 2. * row_height);
-        let heading = Area {
-            bottom: heading_bottom,
-            ..view
+        let center = (view.left + view.right) / 2.;
+        let half_width = ((view.right - view.left) / 2.).min(182.);
+        let (left, right) = (center - half_width, center + half_width);
+        let height = view.bottom - view.top;
+        // Stack the identity above the links when possible. At minimum height
+        // the identity and update button share a line so all actions still fit.
+        let compact = height < 310.;
+        let row_height = if compact { 36. } else { 46. };
+        let links_offset = if compact { 72. } else { 218. };
+        let top = view.top + (height - links_offset - 2. * row_height) / 2.;
+        let (icon, name, version, check_button) = if compact {
+            (
+                Area::new(left, top + 6., left + 48., top + 54.),
+                Area::new(left + 62., top, right - 108., top + 34.),
+                Area::new(left + 62., top + 34., right - 108., top + 59.),
+                Area::new(right - 96., top + 14., right, top + 46.),
+            )
+        } else {
+            (
+                Area::new(center - 36., top, center + 36., top + 72.),
+                Area::new(left, top + 82., right, top + 124.),
+                Area::new(left, top + 124., right, top + 150.),
+                Area::new(center - 52., top + 160., center + 52., top + 192.),
+            )
         };
         let links = [
             ("GitHub 项目主页", env!("CARGO_PKG_REPOSITORY")),
@@ -724,29 +744,18 @@ impl AboutPage {
         ];
         let links = std::array::from_fn(|i| {
             let (title, uri) = links[i];
-            let top = heading_bottom + i as f32 * row_height;
-            let row = Area::new(view.left, top, view.right, top + row_height);
-            let button = Area::new(
-                row.right - 88.,
-                row.middle() - CONTROL_HEIGHT / 2.,
-                row.right - CONTROL_INSET,
-                row.middle() + CONTROL_HEIGHT / 2.,
-            );
+            let top = top + links_offset + i as f32 * row_height;
             ProjectLink {
                 title,
                 action: Action::Open(uri),
-                row,
-                button,
+                row: Area::new(left, top, right, top + row_height),
             }
         });
-        let check_button = Area::new(
-            heading.right - 108.,
-            heading.middle() - CONTROL_HEIGHT / 2.,
-            heading.right - CONTROL_INSET,
-            heading.middle() + CONTROL_HEIGHT / 2.,
-        );
         Self {
-            heading,
+            compact,
+            icon,
+            name,
+            version,
             check_button,
             check_label: "检查更新",
             links,
@@ -754,12 +763,9 @@ impl AboutPage {
     }
 
     /// Buttons in the same order in which Tab reaches them.
-    pub fn buttons(&self) -> impl Iterator<Item = (Area, &'static str, Action)> {
-        std::iter::once((self.check_button, self.check_label, Action::CheckUpdates)).chain(
-            self.links
-                .iter()
-                .map(|link| (link.button, "打开", link.action)),
-        )
+    pub fn buttons(&self) -> impl Iterator<Item = (Area, Action)> {
+        std::iter::once((self.check_button, Action::CheckUpdates))
+            .chain(self.links.iter().map(|link| (link.row, link.action)))
     }
 }
 
@@ -918,7 +924,7 @@ impl PanelState {
                     return if nav == Nav::Activate {
                         about
                             .buttons()
-                            .map(|(_, _, action)| action)
+                            .map(|(_, action)| action)
                             .chain([Action::Quit])
                             .nth(focused?)
                     } else {
@@ -1258,11 +1264,7 @@ impl PanelLayout {
             }),
             about: (section == Section::About).then(|| AboutPage::new(view)),
             footer_button: Area::new(
-                if section == Section::About {
-                    view.left
-                } else {
-                    view.right - RESET_WIDTH
-                },
+                view.right - RESET_WIDTH,
                 reset_top,
                 view.right,
                 reset_top + CONTROL_HEIGHT,
@@ -1380,8 +1382,8 @@ impl PanelLayout {
         if let Some(about) = &self.about {
             return about
                 .buttons()
-                .find(|(area, _, _)| area.contains(x, y))
-                .map(|(_, _, action)| action);
+                .find(|(area, _)| area.contains(x, y))
+                .map(|(_, action)| action);
         }
         if !self.view.contains(x, y) {
             return None;
@@ -1946,45 +1948,65 @@ mod tests {
     }
 
     #[test]
-    fn about_actions_work_with_pointer_and_keyboard_on_short_panels() {
+    fn about_actions_work_with_pointer_and_keyboard_at_both_sizes() {
         let settings = Settings::default();
         for dpi in [96, 120, 144, 192] {
-            let work = work((MIN_HEIGHT * dpi as f32 / 96.) as i32);
-            let mut state = PanelState::default();
-            let layout = PanelLayout::new(&mut state, &settings, dpi, work);
-            let (page, (tab, _)) = layout
-                .nav
-                .iter()
-                .enumerate()
-                .find(|(_, (_, section))| *section == Section::About)
-                .unwrap();
-            let (x, y) = center(*tab, layout.scale);
-            assert!(tab.bottom <= layout.height);
-            assert_eq!(layout.hit(x, y), Some(Action::Page(page)));
-            state.open_page(page);
-            let layout = PanelLayout::new(&mut state, &settings, dpi, work);
-            let about = layout.about.as_ref().unwrap();
-            for (area, expected) in [
-                (about.check_button, Action::CheckUpdates),
-                (
-                    about.links[0].button,
-                    Action::Open("https://github.com/Ariember/DeskIsle"),
-                ),
-                (
-                    about.links[1].button,
-                    Action::Open("https://github.com/Ariember/DeskIsle/releases"),
-                ),
-                (layout.footer_button, Action::Quit),
-            ] {
-                assert!(area.top >= layout.view.top && area.bottom <= layout.height);
-                let (x, y) = center(area, layout.scale);
-                assert_eq!(layout.hit(x, y), Some(expected));
-                state.key(Nav::Next, &layout);
-                let focused = PanelLayout::new(&mut state, &settings, dpi, work);
-                assert_eq!(state.key(Nav::Activate, &focused), Some(expected));
-                assert_eq!(state.key(Nav::Increase, &focused), None);
+            for (width, height) in [(MIN_WIDTH, MIN_HEIGHT), (WIDTH, HEIGHT)] {
+                let scale = dpi as f32 / 96.;
+                let work = Rect {
+                    width: (width * scale) as i32,
+                    ..work((height * scale) as i32)
+                };
+                let mut state = PanelState::default();
+                let layout = PanelLayout::new(&mut state, &settings, dpi, work);
+                let (page, (tab, _)) = layout
+                    .nav
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (_, section))| *section == Section::About)
+                    .unwrap();
+                let (x, y) = center(*tab, layout.scale);
+                assert!(tab.bottom <= layout.height);
+                assert_eq!(layout.hit(x, y), Some(Action::Page(page)));
+                state.open_page(page);
+                let layout = PanelLayout::new(&mut state, &settings, dpi, work);
+                let about = layout.about.as_ref().unwrap();
+                for link in &about.links {
+                    let y = (link.row.middle() * layout.scale).round() as i32;
+                    for x in [link.row.left + 1., link.row.right - 1.] {
+                        assert_eq!(
+                            layout.hit((x * layout.scale).round() as i32, y),
+                            Some(link.action)
+                        );
+                    }
+                }
+                let footer_y = (layout.footer_button.middle() * layout.scale).round() as i32;
+                assert_eq!(
+                    layout.hit((layout.view.left * layout.scale) as i32, footer_y),
+                    None
+                );
+                for (area, expected) in [
+                    (about.check_button, Action::CheckUpdates),
+                    (
+                        about.links[0].row,
+                        Action::Open("https://github.com/Ariember/DeskIsle"),
+                    ),
+                    (
+                        about.links[1].row,
+                        Action::Open("https://github.com/Ariember/DeskIsle/releases"),
+                    ),
+                    (layout.footer_button, Action::Quit),
+                ] {
+                    assert!(area.top >= layout.view.top && area.bottom <= layout.height);
+                    let (x, y) = center(area, layout.scale);
+                    assert_eq!(layout.hit(x, y), Some(expected));
+                    state.key(Nav::Next, &layout);
+                    let focused = PanelLayout::new(&mut state, &settings, dpi, work);
+                    assert_eq!(state.key(Nav::Activate, &focused), Some(expected));
+                    assert_eq!(state.key(Nav::Increase, &focused), None);
+                }
+                assert_eq!(state.key(Nav::Close, &layout), Some(Action::Close));
             }
-            assert_eq!(state.key(Nav::Close, &layout), Some(Action::Close));
         }
     }
 

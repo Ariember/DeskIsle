@@ -1589,128 +1589,146 @@ impl Renderer {
         layout: &PanelLayout,
         about: &panel::AboutPage,
     ) -> Result<()> {
-        let h = about.heading;
-        let mid = h.middle();
-        let x = h.left + 26.;
-        // The ring and island from the status bar mark.
-        c.stroke(x - 16., mid - 16., x + 16., mid + 16., 16., t.accent, 1.)?;
-        c.round(x - 5., mid - 5., x + 5., mid + 5., 5., t.accent)?;
-        self.label(
+        // Use the proportions and colors of the project's app icon.
+        let a = about.icon;
+        let size = a.right - a.left;
+        let x = (a.left + a.right) / 2.;
+        let y = a.middle();
+        c.shadow(a, size * 0.23, 3., 0.10)?;
+        c.gradient_stops(
+            a.left,
+            a.top,
+            a.right,
+            a.bottom,
+            size * 0.23,
+            &[
+                (0., ((91, 140, 255), 1.)),
+                (0.55, ((122, 92, 250), 1.)),
+                (1., ((34, 193, 195), 1.)),
+            ],
+        )?;
+        c.ring(x, y, size * 0.25, size * 0.075, WHITE)?;
+        let dot = size * 0.092;
+        c.round(x - dot, y - dot, x + dot, y + dot, dot, WHITE)?;
+
+        let align = if about.compact {
+            DWRITE_TEXT_ALIGNMENT_LEADING
+        } else {
+            DWRITE_TEXT_ALIGNMENT_CENTER
+        };
+        self.label_aligned(
             c,
             "DeskIsle",
-            Area::new(h.left + 58., h.top, about.check_button.left - 8., mid + 3.),
-            20.,
+            about.name,
+            if about.compact { 20. } else { 28. },
             true,
             c.p.ink,
             1.,
+            align,
         )?;
-        self.label(
+        self.label_aligned(
             c,
             concat!("版本 ", env!("CARGO_PKG_VERSION")),
-            Area::new(
-                h.left + 58.,
-                mid + 2.,
-                about.check_button.left - 8.,
-                h.bottom,
-            ),
+            about.version,
             13.,
             false,
             c.p.muted,
             1.,
+            align,
+        )?;
+
+        let check = about.check_button;
+        self.accent_button(c, t, check, 8., layout.hover == Some(Action::CheckUpdates))?;
+        self.label_aligned(
+            c,
+            about.check_label,
+            check,
+            13.,
+            true,
+            c.p.on_accent,
+            1.,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
         )?;
 
         let [first, last] = &about.links;
-        let group = Area {
-            bottom: last.row.bottom,
-            ..first.row
-        };
-        c.fill(
-            group.left,
-            group.top,
-            group.right,
-            group.bottom,
-            GROUP_RADIUS,
-            c.p.line,
-            t.group,
-        )?;
+        let (left, right) = (first.row.left, first.row.right);
+        let (top, bottom) = (first.row.top, last.row.bottom);
+        c.fill(left, top, right, bottom, GROUP_RADIUS, c.p.line, t.group)?;
         c.stroke(
-            group.left,
-            group.top,
-            group.right,
-            group.bottom,
+            left,
+            top,
+            right,
+            bottom,
             GROUP_RADIUS,
             c.p.line,
             t.group_rim,
         )?;
         c.fill(
-            group.left + 16.,
+            left + 16.,
             last.row.top,
-            group.right - 16.,
+            right - 16.,
             last.row.top + 1. / c.scale,
             0.,
             c.p.line,
             t.separator,
         )?;
         for link in &about.links {
-            let label = Area {
-                left: link.row.left + 16.,
-                right: link.button.left - 8.,
-                ..link.row
-            };
-            self.label(c, link.title, label, 13., false, c.p.ink, 1.)?;
-        }
-        for (index, (button, title, action)) in about.buttons().enumerate() {
-            self.button_face(c, t, button, 6., layout.hover == Some(action))?;
-            if layout.focus == Some(index) {
-                c.stroke(
-                    button.left,
-                    button.top,
-                    button.right,
-                    button.bottom,
-                    6.,
-                    t.accent,
-                    1.,
+            let row = link.row;
+            if layout.hover == Some(link.action) {
+                c.fill(
+                    left + 2.,
+                    row.top + 2.,
+                    right - 2.,
+                    row.bottom - 2.,
+                    8.,
+                    c.p.line,
+                    0.06,
                 )?;
             }
-            self.label_aligned(
+            self.label(
                 c,
-                title,
-                button,
+                link.title,
+                Area {
+                    left: left + 16.,
+                    right: right - 40.,
+                    ..row
+                },
                 13.,
                 false,
                 c.p.ink,
                 1.,
-                DWRITE_TEXT_ALIGNMENT_CENTER,
             )?;
+            c.symbol(Symbol::Open, right - 22., row.middle(), 15., c.p.muted, 1.)?;
         }
-        let q = layout.footer_button;
-        let accent = if layout.hover == Some(Action::Quit) {
-            mix(t.accent, BLACK, 0.1)
-        } else {
-            t.accent
-        };
-        c.round(q.left, q.top, q.right, q.bottom, 6., accent)?;
-        if layout.focus == Some(about.buttons().count()) {
-            c.stroke(
-                q.left - 2.,
-                q.top - 2.,
-                q.right + 2.,
-                q.bottom + 2.,
+
+        let quit = layout.footer_button;
+        self.button_face(c, t, quit, 6., layout.hover == Some(Action::Quit))?;
+        self.label_aligned(
+            c,
+            "退出程序",
+            quit,
+            13.,
+            false,
+            c.p.ink,
+            1.,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+        )?;
+        if let Some((area, _)) = layout
+            .focus
+            .and_then(|index| about.buttons().chain([(quit, Action::Quit)]).nth(index))
+        {
+            c.stroke_dip(
+                area.left - 1.,
+                area.top - 1.,
+                area.right + 1.,
+                area.bottom + 1.,
                 8.,
+                2.,
                 t.accent,
                 1.,
             )?;
         }
-        self.label_aligned(
-            c,
-            "退出程序",
-            q,
-            13.,
-            false,
-            WHITE,
-            1.,
-            DWRITE_TEXT_ALIGNMENT_CENTER,
-        )
+        Ok(())
     }
 
     fn paint_row(
