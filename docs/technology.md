@@ -27,6 +27,8 @@ Windows x64 使用 NSIS 3 将 Release 构建打包为 `DeskIsle-Setup-x64.exe`�
 
 后台线程通过 `ureq` 和 TLS 访问 GitHub Releases API，用 `serde_json` 读取资产元数据、`semver` 比较标签、`sha2` 校验下载的安装包。用户确认更新后，辅助进程等待主程序退出，再运行同一份安装包，成功后启动新版。
 
+应用内的更新提示沿用 Direct2D 和 DirectWrite 绘制。主程序退出后，安装辅助进程使用 Windows PowerShell 自带的 .NET Framework WPF 界面组件显示安装错误，使用户在 Dock 已关闭时仍可查看失败原因。
+
 ## 资源监控采样
 
 DeskIsle 以普通用户权限在后台读取整机指标。单处理器组使用 `GetSystemTimes` 的连续读数计算 CPU 忙碌时间比例，多处理器组使用 PDH 的整机 CPU 计数器。内存使用 `GlobalMemoryStatusEx`，磁盘活动取物理磁盘总计数器的空闲时间补数。PDH 使用英文计数器路径，由系统处理本地化名称。速率类指标取得基线和下一次读数后才显示百分比。

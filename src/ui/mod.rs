@@ -10,3 +10,4 @@ pub mod menu;
 pub mod panel;
 pub mod preview;
 pub mod system;
+pub mod update_prompt;

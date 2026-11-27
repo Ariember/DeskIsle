@@ -14,6 +14,7 @@ mod preview;
 mod settings;
 mod system;
 mod tray_drag;
+mod update_prompt;
 mod updates;
 
 use std::collections::BTreeSet;
@@ -50,6 +51,7 @@ struct Bars {
     panel: Option<settings::Panel>,
     /// Released after the renderer, like the panel.
     about: Option<about::About>,
+    update_prompt: Option<update_prompt::UpdatePrompt>,
     launchpad: Option<launchpad::Launchpad>,
     tray: TrayHost,
     appbar: AppBar,
@@ -247,6 +249,7 @@ pub(crate) fn run() -> Result<()> {
         renderer,
         panel: None,
         about: None,
+        update_prompt: None,
         launchpad: None,
         appbar,
         tray,
@@ -314,7 +317,7 @@ pub(crate) fn run() -> Result<()> {
     bars.refresh_desktop_cards()?;
     // Applications answer at once; the loop below receives their icons.
     bars.tray.request_icons()?;
-    bars.check_for_updates(false);
+    bars.check_for_updates(false)?;
     loop {
         match platform::next_event()? {
             Event::Quit => return Ok(()),
@@ -351,7 +354,7 @@ pub(crate) fn run() -> Result<()> {
                 bars.refresh()?;
             }
             Event::Clock => {
-                bars.check_for_updates(false);
+                bars.check_for_updates(false)?;
                 let time = platform::clock(bars.top.0)?;
                 let old_color = bars.top_window_color;
                 bars.refresh_top_window(true);
@@ -575,6 +578,7 @@ pub(crate) fn run() -> Result<()> {
             Event::Menu(_) if bars.bar_menu()? => return Ok(()),
             Event::Launchpad(input) => bars.launchpad_event(input)?,
             Event::About(input) => bars.about_event(input)?,
+            Event::UpdatePrompt(input) => bars.update_prompt_event(input)?,
             Event::Preview(input) => bars.preview_event(input)?,
             event @ (Event::PanelPress(..)
             | Event::PanelCancel
@@ -1034,6 +1038,7 @@ impl Bars {
         self.paint_preview()?;
         self.paint_panel()?;
         self.paint_about()?;
+        self.paint_update_prompt()?;
         self.paint_desktop_cards()?;
         self.paint_launchpad()
     }

@@ -187,6 +187,10 @@ impl Bars {
             AboutEvent::Click(x, y) => about.layout.hit(x, y),
             AboutEvent::Key(AboutKey::Enter) => Some(AboutHit::More),
             AboutEvent::Key(AboutKey::Escape) | AboutEvent::Close => Some(AboutHit::Close),
+            AboutEvent::Scroll(_)
+            | AboutEvent::Key(AboutKey::Tab | AboutKey::Up | AboutKey::Down | AboutKey::Copy) => {
+                None
+            }
         };
         match action {
             Some(AboutHit::Close) => self.close_about(),

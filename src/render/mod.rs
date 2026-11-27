@@ -11,6 +11,7 @@ mod metrics;
 mod panel;
 mod preview;
 mod prism;
+mod update_prompt;
 
 use std::{
     path::{Path, PathBuf},
@@ -116,6 +117,7 @@ pub struct Renderer {
     menu: Option<MenuView>,
     panel: Option<PanelView>,
     about: Option<AboutView>,
+    update_prompt: Option<(HWND, Bar)>,
     cards: Option<cards::CardView>,
     launchpad: Option<launchpad::LaunchpadView>,
     palette: Palette,
@@ -460,6 +462,7 @@ impl Renderer {
                 menu: None,
                 panel: None,
                 about: None,
+                update_prompt: None,
                 cards: None,
                 launchpad: None,
                 palette: Palette::new(dark, settings),

@@ -185,6 +185,7 @@ impl Bars {
         self.retheme_about(dark, repalette)?;
         if repalette {
             self.label = None;
+            self.retheme_update_prompt(dark)?;
             self.retheme_preview(dark)?;
             self.refresh_desktop_cards()?;
             self.draw_launchpad()?;
@@ -407,7 +408,7 @@ impl Bars {
                 return Ok(false);
             }
             Some(Action::Quit) => return Ok(true),
-            Some(Action::CheckUpdates) => self.check_for_updates(true),
+            Some(Action::CheckUpdates) => self.check_for_updates(true)?,
             Some(Action::PluginTab(tab)) => panel.state.set_plugin_tab(tab),
             Some(
                 action
@@ -593,6 +594,7 @@ impl Bars {
         }
         if self.settings.get(Key::InterfaceScale) != previous.get(Key::InterfaceScale) {
             self.refresh_about_appearance()?;
+            self.refresh_update_prompt_scale()?;
         }
         if dock_visibility_changed {
             self.sync_dock_visibility(true)?;

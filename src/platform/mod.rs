@@ -663,6 +663,7 @@ pub enum Event {
     PanelClose,
     Launchpad(launchpad::LaunchpadEvent),
     About(about::AboutEvent),
+    UpdatePrompt(about::AboutEvent),
     Preview(preview::PreviewEvent),
     CardPage(i32),
     Quit,
@@ -819,6 +820,7 @@ fn queue(hwnd: HWND, event: Event) {
                     | Event::PanelKey(_)
                     | Event::Launchpad(_)
                     | Event::About(_)
+                    | Event::UpdatePrompt(_)
                     | Event::Preview(_)
                     | Event::CardPage(_)
             )
@@ -1160,15 +1162,19 @@ impl PanelWindow {
 
     /// The work area of the monitor showing the panel.
     pub fn work_area(&self) -> Result<Rect> {
-        unsafe {
-            let monitor = MonitorFromWindow(self.0, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            GetMonitorInfoW(monitor, &mut info).ok()?;
-            Ok(to_rect(info.rcWork))
-        }
+        window_work_area(self.0)
+    }
+}
+
+pub fn window_work_area(hwnd: HWND) -> Result<Rect> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info).ok()?;
+        Ok(to_rect(info.rcWork))
     }
 }
 
@@ -1368,43 +1374,6 @@ pub fn confirm_power(owner: HWND, restart: bool) -> Result<bool> {
     } else {
         Ok(answer == IDYES)
     }
-}
-
-pub fn confirm_update(owner: HWND, version: &str) -> Result<bool> {
-    let text = HSTRING::from(format!(
-        "发现 DeskIsle {version}（当前版本 {}）。现在下载安装包，为当前用户安装新版并重启 DeskIsle 吗？",
-        env!("CARGO_PKG_VERSION")
-    ));
-    let answer = unsafe {
-        MessageBoxW(
-            Some(owner),
-            PCWSTR(text.as_ptr()),
-            w!("DeskIsle 更新"),
-            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
-        )
-    };
-    if answer.0 == 0 {
-        Err(Error::from_thread())
-    } else {
-        Ok(answer == IDYES)
-    }
-}
-
-pub fn show_update_status(owner: HWND, message: &str, failed: bool) {
-    let text = HSTRING::from(message);
-    let icon = if failed {
-        MB_ICONERROR
-    } else {
-        MB_ICONINFORMATION
-    };
-    unsafe {
-        MessageBoxW(
-            Some(owner),
-            PCWSTR(text.as_ptr()),
-            w!("DeskIsle 更新"),
-            MB_OK | icon,
-        )
-    };
 }
 
 /// A maximized window's frame can extend outside the monitor while its client area

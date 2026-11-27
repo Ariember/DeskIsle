@@ -7,6 +7,7 @@ use super::Bars;
 use crate::integrations::updates::{self, Release};
 use crate::platform::{self, update::StagedUpdate};
 use crate::settings::Key;
+use crate::ui::update_prompt::Prompt;
 use windows::core::Result;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -125,16 +126,15 @@ impl Bars {
         })
     }
 
-    pub(super) fn check_for_updates(&mut self, manual: bool) {
+    pub(super) fn check_for_updates(&mut self, manual: bool) -> Result<()> {
+        if self.bring_update_prompt_forward(manual) {
+            return Ok(());
+        }
         if !cfg!(target_arch = "x86_64") {
             if manual {
-                platform::show_update_status(
-                    self.settings_owner(),
-                    "当前仅提供 Windows x64 的自动更新。",
-                    false,
-                );
+                self.show_update_prompt(Prompt::Unsupported, None)?;
             }
-            return;
+            return Ok(());
         }
         if !self.updates.request_check(
             manual,
@@ -142,25 +142,35 @@ impl Bars {
             self.fullscreen,
             Instant::now(),
         ) {
-            return;
+            return Ok(());
         }
+        self.start_update_job(manual, || {
+            spawn(updates::check).map(|worker| Job::Check { manual, worker })
+        })
+    }
+
+    pub(super) fn start_update_download(&mut self, release: Release) -> Result<()> {
+        self.start_update_job(true, || download(release))
+    }
+
+    fn start_update_job(
+        &mut self,
+        show_errors: bool,
+        start: impl FnOnce() -> std::result::Result<Job, String>,
+    ) -> Result<()> {
         let start = platform::update_timer(self.top.0, true)
             .map_err(|error| error.to_string())
-            .and_then(|()| spawn(updates::check));
+            .and_then(|()| start());
         match start {
-            Ok(worker) => {
-                self.updates.job = Some(Job::Check { manual, worker });
-                if let Err(error) = self.relayout_panel() {
-                    platform::report_error(Some(self.settings_owner()), &error);
-                }
-            }
+            Ok(job) => self.updates.job = Some(job),
             Err(error) => {
                 let _ = platform::update_timer(self.top.0, false);
-                if manual {
-                    platform::show_update_status(self.settings_owner(), &error, true);
+                if show_errors {
+                    self.show_update_prompt(Prompt::Failed(error), None)?;
                 }
             }
         }
+        self.relayout_panel()
     }
 
     /// Returns true once the helper is ready for the normal shutdown sequence.
@@ -168,7 +178,6 @@ impl Bars {
         if !self.updates.job.as_ref().is_some_and(Job::finished) {
             return Ok(false);
         }
-        let owner = self.settings_owner();
         let next = match self.updates.job.take().expect("finished update job") {
             Job::Check { manual, worker } => match finish(worker) {
                 Ok(Some(_)) if !manual && self.fullscreen => {
@@ -177,14 +186,14 @@ impl Bars {
                     Ok(None)
                 }
                 Ok(Some(release)) if manual || self.settings.enabled(Key::AutoCheckUpdates) => {
-                    match platform::confirm_update(owner, &release.version) {
-                        Ok(true) => download(release).map(Some),
-                        Ok(false) => Ok(None),
-                        Err(error) => Err(format!("无法显示更新提示：{error}")),
-                    }
+                    self.show_update_prompt(
+                        Prompt::Available(release.version.clone()),
+                        Some(release),
+                    )?;
+                    Ok(None)
                 }
                 Ok(None) if manual => {
-                    platform::show_update_status(owner, "已是最新版本。", false);
+                    self.show_update_prompt(Prompt::Current, None)?;
                     Ok(None)
                 }
                 Err(error) if manual => Err(format!("检查更新失败：{error}")),
@@ -201,7 +210,7 @@ impl Bars {
         };
         match next {
             Ok(job) => self.updates.job = job,
-            Err(error) => platform::show_update_status(owner, &error, true),
+            Err(error) => self.show_update_prompt(Prompt::Failed(error), None)?,
         }
         if self.updates.job.is_none() {
             platform::update_timer(self.top.0, false)?;

@@ -186,4 +186,33 @@ mod tests {
     fn reports_setup_failure_without_launching_the_app() {
         run_update(false);
     }
+
+    #[test]
+    fn helper_failure_card_displays_the_error_and_closes() {
+        let stage = stage().unwrap();
+        let result = helper_command(
+            &stage,
+            r#"
+$detail = '安装包退出 <&> 23。'
+$window = New-UpdateFailureWindow $detail
+if ($window.WindowStyle -ne 'None' -or $window.FindName('Detail').Text -cne $detail) {
+    throw 'Missing failure detail in the custom card'
+}
+$closed = [Collections.Generic.List[bool]]::new()
+$window.Add_Closed({ $closed.Add($true) })
+$button = $window.FindName('Dismiss')
+$button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+if ($closed.Count -ne 1) { throw 'Dismiss did not close the card' }
+"#,
+        )
+        .unwrap()
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
