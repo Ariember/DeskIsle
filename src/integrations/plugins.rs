@@ -27,7 +27,7 @@ pub(crate) struct LocalPlugin {
 }
 
 /// Inspects every `.json` publication in `dir` in plugin ID order for the management panel.
-pub(crate) fn list_installed(dir: &Path) -> io::Result<Vec<LocalPlugin>> {
+pub(crate) fn list_installed(dir: &Path, magpie: Option<&[Card]>) -> io::Result<Vec<LocalPlugin>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -71,7 +71,7 @@ pub(crate) fn list_installed(dir: &Path) -> io::Result<Vec<LocalPlugin>> {
             });
             continue;
         }
-        match read_document(&path) {
+        match read_document(&path, || magpie.map(<[Card]>::to_vec)) {
             Ok(plugin) => {
                 let mut cards = 0;
                 let mut setup_cards = 0;
@@ -122,7 +122,7 @@ pub(crate) fn list_installed(dir: &Path) -> io::Result<Vec<LocalPlugin>> {
 }
 
 /// Load completed publications in plugin ID order, preserving each author's card order.
-pub(crate) fn load_cards(dir: &Path) -> Vec<Card> {
+pub(crate) fn load_cards(dir: &Path, mut magpie: impl FnMut() -> Option<Vec<Card>>) -> Vec<Card> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Vec::new(),
@@ -157,7 +157,7 @@ pub(crate) fn load_cards(dir: &Path) -> Vec<Card> {
             cards.push(error_card("插件文件", "文件名不符合插件 ID 规范"));
             continue;
         };
-        match read_document(&path) {
+        match read_document(&path, &mut magpie) {
             Ok(plugin) => {
                 for contribution in plugin.contributions {
                     match contribution {
@@ -180,12 +180,23 @@ fn error_card(title: &str, detail: &str) -> Card {
     Card::simple(title, "暂不可用", detail, CardState::Error)
 }
 
-fn read_document(path: &Path) -> io::Result<Publication> {
+fn read_document(
+    path: &Path,
+    magpie: impl FnOnce() -> Option<Vec<Card>>,
+) -> io::Result<Publication> {
     let file = File::open(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_DOCUMENT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    plugins::parse(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+    let mut publication =
+        plugins::parse(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    if path.file_stem().and_then(|id| id.to_str()) == Some("magpie-usage")
+        && publication.name == "Magpie 数据面板"
+        && let Some(cards) = magpie()
+    {
+        publication.contributions = vec![Contribution::DesktopCards(cards)];
+    }
+    Ok(publication)
 }
 
 pub(crate) fn validate(id: &str, bytes: &[u8]) -> io::Result<Publication> {
@@ -219,6 +230,11 @@ pub(super) fn publish_checked(
 pub(crate) fn remove(dir: &Path, id: &str) -> io::Result<()> {
     check_id(id)?;
     let path = dir.join(format!("{id}.json"));
+    if id == "magpie-usage" && path.is_file() && crate::platform::cards::external_magpie_active() {
+        return Err(io::Error::other(
+            "请先停止正在写入卡片的外部 Magpie 发布器，再移除插件",
+        ));
+    }
     match fs::remove_file(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         result => result,
@@ -251,6 +267,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn magpie_live_cards_follow_the_installation_without_overwriting_it() {
+        let dir =
+            std::env::temp_dir().join(format!("deskisle-magpie-overlay-{}", std::process::id()));
+        let source = r#"{"protocol":1,"name":"Magpie 数据面板","version":"1.1.0","contributions":[{"point":"desktop.cards","version":2,"data":{"cards":[{"title":"Magpie","value":"等待同步","state":"setup"}]}}]}"#.as_bytes();
+        let read_live = || Some(vec![Card::simple("Magpie", "已连接", "", CardState::Ready)]);
+        let unexpected = || panic!("must not query an uninstalled or unrelated plugin");
+        publish(&dir, "other", source).unwrap();
+        assert_eq!(load_cards(&dir, unexpected)[0].value, "等待同步");
+        publish(&dir, "magpie-usage", source).unwrap();
+        let cards = load_cards(&dir, read_live);
+        assert_eq!(cards[0].value, "已连接");
+        assert_eq!(cards[1].value, "等待同步");
+        let installed = list_installed(&dir, Some(&cards[..1])).unwrap();
+        assert!(matches!(
+            installed[0].status,
+            LocalPluginStatus::Ready {
+                setup_cards: 0,
+                error_cards: 0,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(dir.join("magpie-usage.json")).unwrap(), source);
+        assert_eq!(load_cards(&dir, || None)[0].value, "等待同步");
+        // External tools may withdraw a publication directly via the file protocol.
+        fs::remove_file(dir.join("magpie-usage.json")).unwrap();
+        assert_eq!(load_cards(&dir, unexpected).len(), 1);
+        fs::remove_file(dir.join("other.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn publication_replacement_failure_isolation_and_withdrawal() {
         let workspace = std::env::temp_dir().join(format!(
             "deskisle-cards-{}-{:?}",
@@ -261,7 +308,7 @@ mod tests {
         let dir = workspace.join("plugins");
         let multiple = br#"{"protocol":1,"name":"Test","version":"1.0.0","contributions":[{"point":"desktop.cards","version":1,"data":{"cards":[{"title":"one","value":"1"},{"title":"two","value":"2"}]}}]}"#;
         let empty = br#"{"protocol":1,"name":"Test","version":"1.0.0","contributions":[]}"#;
-        assert!(load_cards(&dir).is_empty());
+        assert!(load_cards(&dir, || None).is_empty());
         publish(&dir, "b", multiple).unwrap();
         publish(&dir, "a", empty).unwrap();
         assert!(publish(&dir, "b", b"invalid").is_err());
@@ -273,13 +320,13 @@ mod tests {
             br#"{"protocol":1,"name":"Test","version":"1.0.0","contributions":[{"point":"desktop.cards","version":1,"data":{"cards":[{"title":"first","value":"3"}]}}]}"#,
         )
         .unwrap();
-        let cards = load_cards(&dir);
+        let cards = load_cards(&dir, || None);
         assert_eq!(
             cards.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
             ["first", "a-b", "one", "two"]
         );
         assert_eq!(cards[1].state, CardState::Error);
-        let listed = list_installed(&dir).unwrap();
+        let listed = list_installed(&dir, None).unwrap();
         assert_eq!(
             listed.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             ["a", "a-b", "b"]
@@ -299,7 +346,7 @@ mod tests {
         remove(&dir, "b").unwrap();
         remove(&dir, "b").unwrap();
         publish(&dir, "a", empty).unwrap();
-        assert_eq!(load_cards(&dir), vec![cards[1].clone()]);
+        assert_eq!(load_cards(&dir, || None), vec![cards[1].clone()]);
         remove(&dir, "a").unwrap();
         remove(&dir, "a-b").unwrap();
         fs::remove_file(dir.join("hidden.tmp")).unwrap();

@@ -308,7 +308,7 @@ mod tests {
         fs::write(&package, document).unwrap();
         market.install("example", &installed).unwrap();
         assert!(market.entries[0].is_installed(&installed).unwrap());
-        assert_eq!(plugins::load_cards(&installed)[0].value, "Ready");
+        assert_eq!(plugins::load_cards(&installed, || None)[0].value, "Ready");
         let mut newer = entry.clone();
         newer["version"] = json!("2.0.0");
         let market = write_index(json!([newer])).unwrap();

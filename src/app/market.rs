@@ -9,6 +9,7 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, Result};
 
 use super::Bars;
+use crate::cards::Card;
 use crate::integrations::market::Market;
 use crate::integrations::plugins::{self, LocalPlugin, LocalPluginStatus};
 use crate::platform;
@@ -60,7 +61,7 @@ pub(super) struct PluginMarket {
 }
 
 impl PluginMarket {
-    fn start(&mut self, job: Job) -> io::Result<()> {
+    fn start(&mut self, job: Job, magpie: Option<Vec<Card>>) -> io::Result<()> {
         let catalog = self.catalog.clone();
         let active_job = job.clone();
         self.worker = Some(
@@ -70,7 +71,7 @@ impl PluginMarket {
                     let directory = storage::plugins_directory().map_err(io::Error::other)?;
                     match active_job {
                         Job::ScanLocal => {
-                            let local = plugins::list_installed(&directory)?;
+                            let local = plugins::list_installed(&directory, magpie.as_deref())?;
                             let (installed, installed_ids, items) =
                                 reconcile(&directory, &local, catalog.as_deref());
                             Ok(Completion {
@@ -82,7 +83,7 @@ impl PluginMarket {
                         }
                         Job::Browse => {
                             let market = Arc::new(Market::load()?);
-                            let local = plugins::list_installed(&directory)?;
+                            let local = plugins::list_installed(&directory, magpie.as_deref())?;
                             let (installed, installed_ids, items) =
                                 reconcile(&directory, &local, Some(&market));
                             Ok(Completion {
@@ -99,7 +100,7 @@ impl PluginMarket {
                                 io::Error::new(io::ErrorKind::NotFound, "未找到所选插件")
                             })?;
                             catalog.install(&entry.id, &directory)?;
-                            let local = plugins::list_installed(&directory)?;
+                            let local = plugins::list_installed(&directory, magpie.as_deref())?;
                             let (installed, installed_ids, items) =
                                 reconcile(&directory, &local, Some(&catalog));
                             Ok(Completion {
@@ -111,7 +112,7 @@ impl PluginMarket {
                         }
                         Job::Remove(id, _) => {
                             plugins::remove(&directory, &id)?;
-                            let local = plugins::list_installed(&directory)?;
+                            let local = plugins::list_installed(&directory, magpie.as_deref())?;
                             let (installed, installed_ids, items) =
                                 reconcile(&directory, &local, catalog.as_deref());
                             Ok(Completion {
@@ -312,7 +313,10 @@ impl Bars {
         let report_failure = job != Job::ScanLocal;
         let result = platform::market_timer(self.top.0, true).and_then(|()| {
             self.market
-                .start(job)
+                .start(
+                    job,
+                    self.card_reader.as_ref().and_then(|r| r.magpie_cards()),
+                )
                 .map_err(|e| Error::new(E_FAIL, format!("无法启动插件任务：{e}")))
         });
         if let Err(error) = result {
@@ -376,7 +380,10 @@ impl Bars {
             },
         }
         if let Some(next) = self.market.queued.take() {
-            if let Err(error) = self.market.start(next) {
+            if let Err(error) = self.market.start(
+                next,
+                self.card_reader.as_ref().and_then(|r| r.magpie_cards()),
+            ) {
                 let _ = platform::market_timer(self.top.0, false);
                 platform::report_error(
                     Some(self.settings_owner()),
@@ -420,7 +427,7 @@ mod tests {
         .unwrap();
         let market = Market::test_with_entries(dir.join("index.json"), entries);
 
-        let local = plugins::list_installed(&dir).unwrap();
+        let local = plugins::list_installed(&dir, None).unwrap();
         let (installed, ids, items) = reconcile(&dir, &local, Some(&market));
         let items = items.unwrap();
         assert_eq!(ids, ["alpha", "beta", "corrupt"]);

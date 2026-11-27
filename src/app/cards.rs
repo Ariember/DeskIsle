@@ -2,13 +2,14 @@
 
 use super::Bars;
 use crate::cards::{Card, CardState};
-use crate::integrations::plugins::load_cards;
+use crate::integrations::{magpie, plugins::load_cards};
 use crate::platform;
 use crate::render::is_device_lost;
 use crate::settings::Key;
 use crate::storage;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::core::{Error, Result};
 
@@ -16,11 +17,72 @@ struct Snapshot {
     owner: Option<usize>,
     dirty: bool,
     cards: Vec<Card>,
+    magpie: Option<Vec<Card>>,
 }
 
 struct Shared {
     snapshot: Mutex<Snapshot>,
     stop: Condvar,
+}
+
+/// Owned by one card reader. A retired reader drops its results; the bounded
+/// gateway request never owns the window or writes into the plugin directory.
+struct MagpiePoll {
+    request: Option<JoinHandle<Vec<Card>>>,
+    next: Instant,
+    cards: Vec<Card>,
+}
+
+impl MagpiePoll {
+    fn new(now: Instant) -> Self {
+        Self {
+            request: None,
+            next: now,
+            cards: vec![Card::simple(
+                "Magpie 数据面板",
+                "正在连接",
+                "正在查询本机 Magpie 网关",
+                CardState::Setup,
+            )],
+        }
+    }
+
+    fn refresh(
+        &mut self,
+        now: Instant,
+        query: impl FnOnce() -> Vec<Card> + Send + 'static,
+    ) -> Vec<Card> {
+        let retry = Duration::from_secs(15);
+        if self.request.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.cards = self.request.take().unwrap().join().unwrap_or_else(|_| {
+                vec![Card::simple(
+                    "Magpie 数据面板",
+                    "同步失败",
+                    "稍后自动重试",
+                    CardState::Error,
+                )]
+            });
+            self.next = now + retry;
+        }
+        if self.request.is_none() && now >= self.next {
+            match std::thread::Builder::new()
+                .name("DeskIsle Magpie".into())
+                .spawn(query)
+            {
+                Ok(request) => self.request = Some(request),
+                Err(_) => {
+                    self.cards = vec![Card::simple(
+                        "Magpie 数据面板",
+                        "无法启动查询",
+                        "稍后自动重试",
+                        CardState::Error,
+                    )];
+                    self.next = now + retry;
+                }
+            }
+        }
+        self.cards.clone()
+    }
 }
 
 pub(super) struct CardReader(Arc<Shared>);
@@ -32,6 +94,7 @@ impl CardReader {
                 owner: Some(hwnd.0 as usize),
                 dirty: false,
                 cards: Vec::new(),
+                magpie: None,
             }),
             stop: Condvar::new(),
         });
@@ -39,10 +102,20 @@ impl CardReader {
         std::thread::Builder::new()
             .name("DeskIsle desktop cards".into())
             .spawn(move || {
+                let mut poll = None;
                 loop {
                     reader.snapshot.lock().expect("card reader").dirty = false;
+                    let mut live = None;
                     let cards = match storage::plugins_directory() {
-                        Ok(directory) => load_cards(&directory),
+                        Ok(directory) => load_cards(&directory, || {
+                            if platform::cards::external_magpie_active() {
+                                return None;
+                            }
+                            let now = Instant::now();
+                            let poll = poll.get_or_insert_with(|| MagpiePoll::new(now));
+                            live = Some(poll.refresh(now, magpie::read_cards));
+                            live.clone()
+                        }),
                         Err(_) => vec![Card::simple(
                             "桌面卡片",
                             "目录不可用",
@@ -50,8 +123,12 @@ impl CardReader {
                             CardState::Error,
                         )],
                     };
+                    if live.is_none() {
+                        poll = None;
+                    }
                     let mut snapshot = reader.snapshot.lock().expect("card reader");
                     let Some(owner) = snapshot.owner else { return };
+                    snapshot.magpie = live;
                     // Drop clears owner under the same lock before the HWND can be destroyed.
                     if snapshot.cards != cards && platform::notify_cards(HWND(owner as _)).is_ok() {
                         snapshot.cards = cards;
@@ -69,6 +146,10 @@ impl CardReader {
             })
             .map_err(|e| Error::new(E_FAIL, format!("无法启动桌面卡片读取线程：{e}")))?;
         Ok(Self(shared))
+    }
+
+    pub(super) fn magpie_cards(&self) -> Option<Vec<Card>> {
+        self.0.snapshot.lock().expect("card reader").magpie.clone()
     }
 
     pub(super) fn wake(&self) {
@@ -125,5 +206,50 @@ impl Bars {
             self.monitor.work,
             self.monitor.dpi,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn magpie_publishes_completed_queries_and_retries_after_the_interval() {
+        let now = Instant::now();
+        let mut poll = MagpiePoll::new(now);
+        let (finish, gate) = mpsc::channel();
+        let query = move || {
+            gate.recv().unwrap();
+            vec![Card::simple("Magpie", "离线", "", CardState::Error)]
+        };
+        assert_eq!(poll.refresh(now, query)[0].state, CardState::Setup);
+        assert_eq!(
+            poll.refresh(now, || panic!("duplicate query"))[0].state,
+            CardState::Setup
+        );
+        finish.send(()).unwrap();
+        wait_for_query(&poll);
+        assert_eq!(
+            poll.refresh(now, || panic!("early retry"))[0].state,
+            CardState::Error
+        );
+        let later = now + Duration::from_secs(15);
+        poll.refresh(later, || {
+            vec![Card::simple("Magpie", "已恢复", "", CardState::Ready)]
+        });
+        wait_for_query(&poll);
+        assert_eq!(
+            poll.refresh(later, || panic!("early retry"))[0].value,
+            "已恢复"
+        );
+    }
+
+    fn wait_for_query(poll: &MagpiePoll) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !poll.request.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
     }
 }

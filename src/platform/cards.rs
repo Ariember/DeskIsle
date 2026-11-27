@@ -13,6 +13,26 @@ use windows::core::{Error, Owned, PCWSTR, Result, w};
 
 const CLASS: PCWSTR = w!("DeskIsle.Cards");
 
+/// The standalone publisher owns this mutex while writing its snapshots.
+pub(crate) fn external_magpie_active() -> bool {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    // Open without creating so a manual publisher can start at any time.
+    unsafe {
+        match OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            w!("Local\\DeskIsle-magpie-usage-Publisher"),
+        ) {
+            Ok(handle) => {
+                drop(Owned::new(handle));
+                true
+            }
+            Err(err) => err.code() != ERROR_FILE_NOT_FOUND.to_hresult(),
+        }
+    }
+}
+
 pub(super) fn register_class(instance: HINSTANCE, cursor: HCURSOR) -> Result<()> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
