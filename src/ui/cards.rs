@@ -223,6 +223,7 @@ mod tests {
     #[test]
     fn rich_card_grows_to_fit_blocks_and_pages_cleanly() {
         let rich = Card {
+            white_surface: true,
             title: "Magpie 数据面板".into(),
             value: "$158.1".into(),
             detail: "4251 次请求 · 34 会话".into(),

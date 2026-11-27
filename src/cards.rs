@@ -81,6 +81,9 @@ pub(crate) enum CardBlock {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Card {
+    /// Selected by the host from the installed plugin ID.
+    #[serde(skip)]
+    pub white_surface: bool,
     pub title: String,
     pub value: String,
     #[serde(default)]
@@ -103,6 +106,7 @@ impl Card {
         state: CardState,
     ) -> Self {
         Self {
+            white_surface: false,
             title: title.into(),
             value: value.into(),
             detail: detail.into(),

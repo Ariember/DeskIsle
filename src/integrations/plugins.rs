@@ -157,6 +157,7 @@ pub(crate) fn load_cards(dir: &Path, mut magpie: impl FnMut() -> Option<Vec<Card
             cards.push(error_card("插件文件", "文件名不符合插件 ID 规范"));
             continue;
         };
+        let first_card = cards.len();
         match read_document(&path, &mut magpie) {
             Ok(plugin) => {
                 for contribution in plugin.contributions {
@@ -168,6 +169,11 @@ pub(crate) fn load_cards(dir: &Path, mut magpie: impl FnMut() -> Option<Vec<Card
             // A plugin can withdraw its cards between enumeration and opening.
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => cards.push(error_card(id, &e.to_string())),
+        }
+        if id == "magpie-usage" {
+            for card in &mut cards[first_card..] {
+                card.white_surface = true;
+            }
         }
     }
     if incomplete {
@@ -277,6 +283,8 @@ mod tests {
         assert_eq!(load_cards(&dir, unexpected)[0].value, "等待同步");
         publish(&dir, "magpie-usage", source).unwrap();
         let cards = load_cards(&dir, read_live);
+        assert!(cards[0].white_surface);
+        assert!(!cards[1].white_surface);
         assert_eq!(cards[0].value, "已连接");
         assert_eq!(cards[1].value, "等待同步");
         let installed = list_installed(&dir, Some(&cards[..1])).unwrap();
@@ -289,7 +297,9 @@ mod tests {
             }
         ));
         assert_eq!(fs::read(dir.join("magpie-usage.json")).unwrap(), source);
-        assert_eq!(load_cards(&dir, || None)[0].value, "等待同步");
+        let on_disk = load_cards(&dir, || None);
+        assert!(on_disk[0].white_surface);
+        assert_eq!(on_disk[0].value, "等待同步");
         // External tools may withdraw a publication directly via the file protocol.
         fs::remove_file(dir.join("magpie-usage.json")).unwrap();
         assert_eq!(load_cards(&dir, unexpected).len(), 1);

@@ -37,7 +37,10 @@ pub(super) struct CardView {
     painted: Option<PaintKey>,
 }
 
-fn tone_rgb(tone: CardTone, palette: &Palette) -> Rgb {
+fn tone_rgb(tone: CardTone, palette: &Palette, white_surface: bool) -> Rgb {
+    if white_surface {
+        return palette.accent;
+    }
     match (tone, palette.dark) {
         (CardTone::Accent, _) => palette.accent,
         (CardTone::Neutral, true) => (176, 184, 198),
@@ -58,6 +61,12 @@ fn tone_rgb(tone: CardTone, palette: &Palette) -> Rgb {
 fn lighten((r, g, b): Rgb, amount: f32) -> Rgb {
     let mix = |c: u8| (f32::from(c) + (255. - f32::from(c)) * amount).round() as u8;
     (mix(r), mix(g), mix(b))
+}
+
+fn flat_box(c: &Canvas, area: Area, radius: f32, background: Rgb) -> Result<()> {
+    let (l, t, r, b) = (area.left, area.top, area.right, area.bottom);
+    c.fill(l, t, r, b, radius, background, 1.)?;
+    c.stroke(l, t, r, b, radius, (219, 219, 219), 1.)
 }
 
 fn estimate_pill_width(text: &str) -> f32 {
@@ -102,11 +111,17 @@ impl Renderer {
             return Ok(());
         }
 
+        let nav_on_white = layout.navigation.is_some_and(|nav| {
+            layout.tiles.iter().zip(visible).any(|(tile, card)| {
+                card.white_surface && nav.y >= tile.y && nav.y < tile.y + tile.height
+            })
+        });
         let tile_samples: Vec<Option<Backdrop>> = layout
             .tiles
             .iter()
-            .map(|tile| {
-                if !self.transparency {
+            .zip(visible)
+            .map(|(tile, card)| {
+                if !self.transparency || card.white_surface {
                     return None;
                 }
                 Backdrop::wallpaper(Rect {
@@ -119,7 +134,7 @@ impl Renderer {
             })
             .collect();
         let nav_sample = layout.navigation.and_then(|nav| {
-            if !self.transparency {
+            if !self.transparency || nav_on_white {
                 return None;
             }
             Backdrop::wallpaper(Rect {
@@ -142,28 +157,21 @@ impl Renderer {
                 for ((tile, card), sample) in
                     layout.tiles.iter().zip(visible).zip(tile_samples.iter())
                 {
-                    let y = tile.y as f32 / c.scale;
-                    let h = tile.height as f32 / c.scale;
-                    let tile_p = self.paint_card_shell(
-                        c,
-                        Area::new(0., y, w, y + h),
-                        CARD_RADIUS_DIP,
-                        sample.as_ref(),
-                        strength,
-                        card.state,
-                    )?;
                     let nav_overlap = layout
                         .navigation
                         .filter(|n| n.y >= tile.y && n.y < tile.y + tile.height)
                         .map(|n| n.x as f32 / c.scale - 6.);
-                    if card.is_rich() {
-                        self.draw_rich_card(c, &tile_p, card, y, w, h, nav_overlap)?;
-                    } else {
-                        self.draw_simple_card(c, &tile_p, card, y, w, h, nav_overlap)?;
-                    }
+                    self.paint_card_tile(c, *tile, card, sample.as_ref(), strength, nav_overlap)?;
                 }
                 if let Some(nav) = layout.navigation {
-                    self.draw_card_navigation(c, layout, nav, w, nav_sample.as_ref(), strength)?;
+                    self.draw_card_navigation(
+                        c,
+                        layout,
+                        nav,
+                        w,
+                        nav_sample.as_ref(),
+                        nav_on_white,
+                    )?;
                 }
                 Ok(())
             },
@@ -183,6 +191,44 @@ impl Renderer {
             self.transparency,
         ));
         Ok(())
+    }
+
+    fn paint_card_tile(
+        &self,
+        c: &Canvas,
+        tile: Rect,
+        card: &Card,
+        sample: Option<&Backdrop>,
+        strength: i32,
+        nav_overlap: Option<f32>,
+    ) -> Result<()> {
+        let y = tile.y as f32 / c.scale;
+        let w = tile.width as f32 / c.scale;
+        let h = tile.height as f32 / c.scale;
+        let area = Area::new(0., y, w, y + h);
+        let palette = if card.white_surface {
+            self.paint_white_shell(c, area, CARD_RADIUS_DIP)?
+        } else {
+            self.paint_card_shell(c, area, CARD_RADIUS_DIP, sample, strength, card.state)?
+        };
+        if card.is_rich() {
+            self.draw_rich_card(c, &palette, card, y, w, h, nav_overlap)
+        } else {
+            self.draw_simple_card(c, &palette, card, y, w, h, nav_overlap)
+        }
+    }
+
+    fn paint_white_shell(&self, c: &Canvas, area: Area, radius: f32) -> Result<Palette> {
+        flat_box(c, area, radius, (255, 255, 255))?;
+        Ok(Palette {
+            dark: false,
+            ink: (28, 28, 28),
+            muted: (96, 96, 96),
+            accent: (66, 66, 66),
+            danger: (50, 50, 50),
+            line: (40, 40, 40),
+            ..self.palette
+        })
     }
 
     fn paint_card_shell(
@@ -299,13 +345,17 @@ impl Renderer {
             CardState::Error => (Symbol::Info, p.danger),
         };
         let icon_area = Area::new(15., y + 13., 41., y + 39.);
-        c.liquid_pill(
-            icon_area,
-            8.5,
-            tone,
-            if p.dark { 0.24 } else { 0.16 },
-            if p.dark { 0.34 } else { 0.28 },
-        )?;
+        if card.white_surface {
+            flat_box(c, icon_area, 8.5, (246, 246, 246))?;
+        } else {
+            c.liquid_pill(
+                icon_area,
+                8.5,
+                tone,
+                if p.dark { 0.24 } else { 0.16 },
+                if p.dark { 0.34 } else { 0.28 },
+            )?;
+        }
         c.symbol(icon, 28., y + 26., 14.5, tone, 1.)?;
 
         let mut title_end = nav_overlap.unwrap_or(w - 15.);
@@ -313,14 +363,18 @@ impl Renderer {
             let pill_w = estimate_pill_width(&card.badge).min((w - 130.).max(54.));
             let pill_left = w - 15. - pill_w;
             let pill_area = Area::new(pill_left, y + 16., w - 15., y + 36.);
-            let pill_tint = if p.dark { (255, 255, 255) } else { p.accent };
-            c.liquid_pill(
-                pill_area,
-                10.,
-                pill_tint,
-                if p.dark { 0.12 } else { 0.11 },
-                if p.dark { 0.22 } else { 0.24 },
-            )?;
+            if card.white_surface {
+                flat_box(c, pill_area, 10., (250, 250, 250))?;
+            } else {
+                let pill_tint = if p.dark { (255, 255, 255) } else { p.accent };
+                c.liquid_pill(
+                    pill_area,
+                    10.,
+                    pill_tint,
+                    if p.dark { 0.12 } else { 0.11 },
+                    if p.dark { 0.22 } else { 0.24 },
+                )?;
+            }
             c.draw_text(
                 &self.write,
                 &card.badge,
@@ -445,7 +499,8 @@ impl Renderer {
                 if idx > 0 {
                     cursor += RICH_BLOCK_GAP_DIP as f32;
                 }
-                cursor = self.draw_card_block(c, p, block, left, right, cursor)?;
+                cursor =
+                    self.draw_card_block(c, p, block, (left, right), cursor, card.white_surface)?;
             }
         }
 
@@ -477,9 +532,9 @@ impl Renderer {
         c: &Canvas,
         p: &Palette,
         block: &CardBlock,
-        left: f32,
-        right: f32,
+        (left, right): (f32, f32),
         mut cursor: f32,
+        white_surface: bool,
     ) -> Result<f32> {
         let inner_w = right - left;
         match block {
@@ -520,14 +575,19 @@ impl Renderer {
                     for (col, item) in row_items.iter().enumerate() {
                         let x0 = left + col as f32 * (cell_w + col_gap);
                         let x1 = x0 + cell_w;
-                        let dot_color = tone_rgb(item.tone, p);
-                        c.liquid_pill(
-                            Area::new(x0, cursor, x1, cursor + row_h),
-                            11.,
-                            (255, 255, 255),
-                            if p.dark { 0.08 } else { 0.50 },
-                            if p.dark { 0.16 } else { 0.42 },
-                        )?;
+                        let dot_color = tone_rgb(item.tone, p, white_surface);
+                        let cell = Area::new(x0, cursor, x1, cursor + row_h);
+                        if white_surface {
+                            flat_box(c, cell, 11., (248, 248, 248))?;
+                        } else {
+                            c.liquid_pill(
+                                cell,
+                                11.,
+                                (255, 255, 255),
+                                if p.dark { 0.08 } else { 0.50 },
+                                if p.dark { 0.16 } else { 0.42 },
+                            )?;
+                        }
                         c.fill(
                             x1 - 15.,
                             cursor + 9.5,
@@ -647,7 +707,7 @@ impl Renderer {
                     c.clipped_round(left, bar_y, right, bar_y + bar_h, bar_r, || {
                         let mut x = left;
                         for (item, seg_w) in active.iter().zip(widths) {
-                            let rgb = tone_rgb(item.tone, p);
+                            let rgb = tone_rgb(item.tone, p, white_surface);
                             c.gradient(
                                 x,
                                 bar_y,
@@ -674,7 +734,7 @@ impl Renderer {
                     for (col, item) in slice.iter().enumerate() {
                         let x0 = left + col as f32 * col_w;
                         let x1 = x0 + col_w - 4.;
-                        let dot_color = tone_rgb(item.tone, p);
+                        let dot_color = tone_rgb(item.tone, p, white_surface);
                         c.fill(x0, cursor + 5., x0 + 6., cursor + 11., 3., dot_color, 0.98)?;
                         let label = if item.value.is_empty() {
                             format!("{} {}%", item.label, item.share)
@@ -721,7 +781,7 @@ impl Renderer {
                     if idx > 0 {
                         cursor += RICH_METER_ROW_GAP_DIP as f32;
                     }
-                    let rgb = tone_rgb(item.tone, p);
+                    let rgb = tone_rgb(item.tone, p, white_surface);
                     c.fill(left, cursor + 5.5, left + 6., cursor + 11.5, 3., rgb, 0.98)?;
                     let val_w = 60.;
                     let detail_w = if item.detail.is_empty() { 0. } else { 96. };
@@ -805,13 +865,24 @@ impl Renderer {
         nav: Rect,
         w: f32,
         sample: Option<&Backdrop>,
-        strength: i32,
+        white_surface: bool,
     ) -> Result<()> {
         let x = nav.x as f32 / c.scale;
         let y = nav.y as f32 / c.scale;
         let h = nav.height as f32 / c.scale;
         let area = Area::new(x, y, w, y + h);
-        let nav_p = self.paint_card_shell(c, area, h / 2., sample, strength, CardState::Ready)?;
+        let nav_p = if white_surface {
+            self.paint_white_shell(c, area, h / 2.)?
+        } else {
+            self.paint_card_shell(
+                c,
+                area,
+                h / 2.,
+                sample,
+                self.appearance.get(Key::Backdrop),
+                CardState::Ready,
+            )?
+        };
         let mid = y + h / 2.;
         c.symbol(
             Symbol::ChevronLeft,
@@ -877,3 +948,6 @@ impl Renderer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod white_surface_tests;
