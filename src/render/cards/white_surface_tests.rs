@@ -75,7 +75,8 @@ fn magpie_stays_white_and_legible_over_dark_wallpaper() -> Result<()> {
             let ink = (top * scale..bottom * scale)
                 .flat_map(|y| {
                     let row = &pixels[y as usize * stride..][..stride];
-                    row[(left * scale * 4) as usize..(right * scale * 4) as usize].chunks_exact(4)
+                    let (pixels, _) = row.as_chunks::<4>();
+                    &pixels[(left * scale) as usize..(right * scale) as usize]
                 })
                 .filter(|p| p[3] == 255 && p[..3].iter().all(|&v| v < 95))
                 .count();
