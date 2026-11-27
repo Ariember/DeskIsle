@@ -72,7 +72,7 @@ impl Market {
     pub(crate) fn test_with_entries(path: PathBuf, entries: Vec<MarketEntry>) -> Self {
         Self {
             source: Source::File(path),
-            label: "官方市场 v1.0.0".into(),
+            label: "官方市场 · main".into(),
             entries,
         }
     }
@@ -89,7 +89,7 @@ impl Market {
                 };
                 (source, label)
             }
-            None => Source::latest_release()?,
+            None => Source::main_index()?,
         };
         Self::from_labeled_source(source, label)
     }
@@ -181,34 +181,23 @@ impl Source {
         Ok(Self::Https(uri))
     }
 
-    fn latest_release() -> io::Result<(Self, String)> {
-        let api = format!("https://api.github.com/repos/{MARKET_REPOSITORY}/releases/latest");
-        let bytes = fetch_json(&api, MAX_INDEX_BYTES, "application/vnd.github+json")?;
-        Self::release_index(&bytes)
+    fn main_index() -> io::Result<(Self, String)> {
+        let api = format!("https://api.github.com/repos/{MARKET_REPOSITORY}/commits/main");
+        let bytes = fetch(&api, 128, "application/vnd.github.sha")?;
+        Self::commit_index(&bytes)
     }
 
-    fn release_index(bytes: &[u8]) -> io::Result<(Self, String)> {
-        #[derive(Deserialize)]
-        struct Release {
-            tag_name: String,
-            draft: bool,
-            prerelease: bool,
-        }
-        let release: Release =
-            serde_json::from_slice(bytes).map_err(|_| invalid("GitHub 市场发布信息格式无效"))?;
-        let version = release
-            .tag_name
-            .strip_prefix('v')
-            .and_then(|tag| Version::parse(tag).ok())
-            .ok_or_else(|| invalid("市场发布标签需要采用 v 加语义化版本号"))?;
-        if release.draft || release.prerelease || !version.pre.is_empty() {
-            return Err(invalid("市场发布版本需要是已公开的稳定版"));
-        }
+    fn commit_index(bytes: &[u8]) -> io::Result<(Self, String)> {
+        let commit = std::str::from_utf8(bytes)
+            .ok()
+            .map(str::trim_end)
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| invalid("GitHub 返回的市场提交号无效"))?;
         let url =
-            format!("https://raw.githubusercontent.com/{MARKET_REPOSITORY}/v{version}/index.json");
+            format!("https://raw.githubusercontent.com/{MARKET_REPOSITORY}/{commit}/index.json");
         Ok((
             Self::configured(url.into())?,
-            format!("官方市场 v{version}"),
+            format!("官方市场 · {}", &commit[..7]),
         ))
     }
 
@@ -246,12 +235,12 @@ impl Source {
                 }
                 Ok(bytes)
             }
-            Self::Https(uri) => fetch_json(&uri.to_string(), limit, "application/json"),
+            Self::Https(uri) => fetch(&uri.to_string(), limit, "application/json"),
         }
     }
 }
 
-fn fetch_json(url: &str, limit: usize, accept: &str) -> io::Result<Vec<u8>> {
+fn fetch(url: &str, limit: usize, accept: &str) -> io::Result<Vec<u8>> {
     let agent: Agent = Agent::config_builder()
         .https_only(true)
         .max_redirects(0)
@@ -332,36 +321,26 @@ mod tests {
     }
 
     #[test]
-    fn official_market_installs_from_the_release_that_was_browsed() {
-        let release = |tag: &str, draft, prerelease| {
-            Source::release_index(
-                &serde_json::to_vec(&json!({
-                    "tag_name":tag, "draft":draft, "prerelease":prerelease
-                }))
-                .unwrap(),
-            )
-        };
-        let (source, label) = release("v2.0.1", false, false).unwrap();
-        assert_eq!(label, "官方市场 v2.0.1");
+    fn official_market_installs_from_the_commit_that_was_browsed() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let (source, label) = Source::commit_index(format!("{commit}\n").as_bytes()).unwrap();
+        assert_eq!(label, "官方市场 · 0123456");
         let Source::Https(ref index) = source else {
             panic!()
         };
-        assert_eq!(
-            index.to_string(),
-            "https://raw.githubusercontent.com/Ariember/DeskIsle-PluginMarket/v2.0.1/index.json"
-        );
+        let root =
+            format!("https://raw.githubusercontent.com/Ariember/DeskIsle-PluginMarket/{commit}");
+        assert_eq!(index.to_string(), format!("{root}/index.json"));
         let Source::Https(package) = source.package("card-one").unwrap() else {
             panic!()
         };
         assert_eq!(
             package.to_string(),
-            "https://raw.githubusercontent.com/Ariember/DeskIsle-PluginMarket/v2.0.1/packages/card-one.json"
+            format!("{root}/packages/card-one.json")
         );
-        for tag in ["main", "2.0.1", "v2.0.1/../main", "v2.0.1-beta.1"] {
-            assert!(release(tag, false, false).is_err());
+        for invalid in ["main", &commit[..39], &commit.replace('a', "/")] {
+            assert!(Source::commit_index(invalid.as_bytes()).is_err());
         }
-        assert!(release("v2.0.1", true, false).is_err());
-        assert!(release("v2.0.1", false, true).is_err());
     }
 
     #[test]

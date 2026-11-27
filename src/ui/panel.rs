@@ -482,11 +482,11 @@ impl PluginsPage {
             );
             let mut body_top = header.bottom + 4.;
             let source_label = if view.busy == Some(Action::BrowseMarket) {
-                "正在同步最新稳定版索引…".into()
+                "正在同步市场索引…".into()
             } else if let Some(source) = &view.source {
                 format!("{source} · SHA-256 校验")
             } else {
-                "GitHub 稳定版索引".into()
+                "GitHub 仓库索引".into()
             };
             let error_banner = (view.error.is_some() && !view.items.is_empty()).then(|| {
                 let banner = Area::new(viewport.left, body_top, viewport.right, body_top + 42.);

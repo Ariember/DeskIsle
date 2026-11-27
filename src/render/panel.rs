@@ -1321,16 +1321,13 @@ impl Renderer {
                         .map_or(g.right - 16., |(btn, _)| btn.left - 12.);
                     let (heading, detail): (&str, &str) =
                         if plugins.view.busy == Some(Action::BrowseMarket) {
-                            (
-                                "正在连接插件市场…",
-                                "正在查询最新稳定发布标签并读取桌面卡片索引",
-                            )
+                            ("正在连接插件市场…", "正在读取桌面卡片索引")
                         } else if let Some(err) = &plugins.view.error {
                             ("无法连接插件市场", err.as_str())
                         } else if !plugins.view.loaded {
                             (
                                 "探索桌面卡片插件",
-                                "浏览官方稳定版市场提供的桌面磁贴卡片，一键下载并自动核验完整性",
+                                "浏览官方市场提供的桌面磁贴卡片，一键下载并自动核验完整性",
                             )
                         } else {
                             (
@@ -2463,7 +2460,7 @@ mod render_tests {
                 removable: true,
             }]
             .into(),
-            source: Some("官方市场 v1.1.0".into()),
+            source: Some("官方市场 · 0123456".into()),
             loaded: true,
             items: [
                 MarketItem {

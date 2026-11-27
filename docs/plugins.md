@@ -111,7 +111,7 @@ ID 由命令参数指定，在文件接口中对应文件名。选用稳定的�
 
 市场使用 `index.json` 列出包，每个条目对应索引旁的 `packages/<id>.json`。宿主先校验索引，再按条目的 SHA-256、名称、版本和当前宿主支持的扩展点校验包。校验或下载失败时会返回错误，已有卡片可继续使用。
 
-管理面板和命令行默认向 GitHub 查询 `Ariember/DeskIsle-PluginMarket` 的最新稳定 Release，按其 `v<SemVer>` 标签读取仓库根目录的索引。点击安装时，宿主从刚才浏览的标签读取卡片包，因此市场在浏览后发布新版也不会改变这次安装的内容。[市场发布页](https://github.com/Ariember/DeskIsle-PluginMarket/releases)
+管理面板每次浏览或刷新时，都会读取市场仓库 `main` 当前提交的索引。点击安装时，宿主从同一提交读取插件包。命令行也使用这个市场源。维护者将索引和包一起合入 `main` 后，用户下次刷新即可看到变更。[市场仓库](https://github.com/Ariember/DeskIsle-PluginMarket)
 
 要测试本地改动或使用自建市场，在启动 DeskIsle 前将 `DESKISLE_MARKET_INDEX` 设为本地索引文件路径或完整的 HTTPS 索引 URL。设置后直接读取指定索引。在线托管时，索引和包的地址均需直接返回文件内容及 HTTP 200。下面的 PowerShell 示例从两个项目的父目录运行。
 
